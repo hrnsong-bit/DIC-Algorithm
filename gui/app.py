@@ -31,7 +31,7 @@ class SpeckleQualityGUI:
         self.controller.set_views(self.canvas_view, self.param_panel)
         
         # DIC 컨트롤러 (DICTab 생성 후!)
-        self.dic_controller = DICController(self.dic_tab, self.controller)
+        self.dic_controller = DICController(self.dic_tab, self.state, self.controller)
         
         self._connect_controller()
         self._start_periodic_check()
@@ -275,7 +275,39 @@ class SpeckleQualityGUI:
         self.controller.on_state_changed = self._on_state_changed
         self.controller.on_progress = self._on_progress
         self.controller.on_batch_complete = self._on_batch_complete
-    
+        
+        # 로딩 콜백 추가
+        self.controller.on_loading_progress = self._on_loading_progress
+        self.controller.on_loading_complete = self._on_loading_complete
+
+    def _on_loading_progress(self, current: int, total: int, filename: str):
+        """이미지 로딩 진행률"""
+        self.root.after(0, lambda: self._update_loading_ui(current, total, filename))
+
+    def _update_loading_ui(self, current: int, total: int, filename: str):
+        """로딩 UI 업데이트"""
+        self.progress_var.set(f"로딩: {current}/{total}")
+        self.progress_bar['value'] = (current / total) * 100
+        self._update_file_list()  # 파일 목록 업데이트
+
+    def _on_loading_complete(self, total_loaded: int):
+        """로딩 완료"""
+        self.root.after(0, lambda: self._show_loading_complete(total_loaded))
+
+    def _show_loading_complete(self, total_loaded: int):
+        """로딩 완료 메시지"""
+        self.progress_var.set(f"로드 완료: {total_loaded}개")
+        self._update_all_ui()
+        
+        # 메모리 사용량 표시
+        memory_mb = self.state.memory_usage_mb
+        messagebox.showinfo(
+            "로딩 완료",
+            f"이미지 로드 완료!\n\n"
+            f"로드된 파일: {total_loaded}개\n"
+            f"메모리 사용: {memory_mb:.1f}MB"
+        )
+
     def _start_periodic_check(self):
         """주기적 상태 확인 시작"""
         self._check_batch_state()

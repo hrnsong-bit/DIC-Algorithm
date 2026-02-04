@@ -2,21 +2,14 @@
 FFT-CC (FFT-based Cross Correlation) 초기 추정 모듈
 
 고속 정수 픽셀 변위 추정을 위한 FFT 기반 정규화 상호상관
-
-Features:
-- Numba 병렬화로 멀티코어 완전 활용 (GIL 없음)
-- 청크 기반 처리로 메모리 최적화
-- Zero-mean Normalized Cross Correlation (ZNCC)
-
-References:
-- Lewis (1995) "Fast Normalized Cross-Correlation"
-- Jiang et al. (2015) "Path-independent digital image correlation"
 """
 
 import numpy as np
 import cv2
-from typing import Tuple, Optional, Callable
-from numba import jit, prange
+from typing import Tuple, Optional, Callable, List, Dict
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 import time
 
 from .results import MatchResult, FFTCCResult
@@ -29,71 +22,87 @@ def compute_fft_cc(ref_image: np.ndarray,
                    search_range: int = 50,
                    zncc_threshold: float = 0.6,
                    roi: Optional[Tuple[int, int, int, int]] = None,
-                   use_numba: bool = True,
+                   n_workers: Optional[int] = None,
                    progress_callback: Optional[Callable[[int, int], None]] = None) -> FFTCCResult:
     """
-    FFT-CC 기반 전체 필드 초기 변위 추정
-    
-    Args:
-        ref_image: 기준 이미지
-        def_image: 변형 이미지
-        subset_size: subset 크기 (홀수, 기본 21)
-        spacing: POI 간격 (기본 10)
-        search_range: 탐색 범위 ±pixels (기본 50)
-        zncc_threshold: ZNCC 임계값 (기본 0.6)
-        roi: 관심 영역 (x, y, w, h), None이면 전체
-        use_numba: True면 Numba 병렬화 (빠름), False면 OpenCV (호환성)
-        progress_callback: 진행 콜백 (current, total)
-    
-    Returns:
-        FFTCCResult 객체
+    FFT-CC 기반 전체 필드 초기 변위 추정 (단일 이미지 쌍)
     """
     start_time = time.time()
     
     # 전처리
-    ref_gray, def_gray = _preprocess_images(ref_image, def_image)
+    ref_gray = _to_gray(ref_image).astype(np.float32)
+    def_gray = _to_gray(def_image).astype(np.float32)
     
     # ROI 처리
-    ref_roi, def_extended, roi_offset = _apply_roi(
-        ref_gray, def_gray, roi, search_range
-    )
+    ref_roi, def_extended, roi_offset = _apply_roi(ref_gray, def_gray, roi, search_range)
     
     # POI 그리드 생성
-    points_y, points_x = _generate_poi_grid(
-        ref_roi.shape, subset_size, spacing
-    )
+    points_y, points_x = _generate_poi_grid(ref_roi.shape, subset_size, spacing)
     
     n_points = len(points_y)
-    
     if n_points == 0:
         return _empty_result(subset_size, search_range, spacing)
     
     if progress_callback:
         progress_callback(0, n_points)
     
-    if use_numba:
-        # Numba 완전 병렬 처리 (GIL 없음, 가장 빠름)
-        disp_u, disp_v, zncc_values = _compute_zncc_numba_parallel(
-            ref_roi, def_extended,
-            points_y, points_x,
-            subset_size, search_range, roi_offset
-        )
-    else:
-        # OpenCV 순차 처리 (호환성용)
-        disp_u, disp_v, zncc_values = _compute_zncc_opencv(
-            ref_roi, def_extended,
-            points_y, points_x,
-            subset_size, search_range, roi_offset,
-            progress_callback
-        )
+    if n_workers is None:
+        n_workers = max(1, os.cpu_count() - 1)
+    
+    # 결과 배열
+    disp_u = np.zeros(n_points, dtype=np.int32)
+    disp_v = np.zeros(n_points, dtype=np.int32)
+    zncc_values = np.zeros(n_points, dtype=np.float64)
+    
+    half = subset_size // 2
+    ox, oy = roi_offset
+    def_h, def_w = def_extended.shape
+    
+    def process_poi(idx: int) -> Tuple[int, int, int, float]:
+        py, px = points_y[idx], points_x[idx]
+        
+        template = ref_roi[py - half:py + half + 1, px - half:px + half + 1]
+        
+        sy1 = max(0, py + oy - search_range)
+        sy2 = min(def_h, py + oy + search_range + subset_size)
+        sx1 = max(0, px + ox - search_range)
+        sx2 = min(def_w, px + ox + search_range + subset_size)
+        
+        search_win = def_extended[sy1:sy2, sx1:sx2]
+        
+        if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
+            return idx, 0, 0, 0.0
+        
+        result = cv2.matchTemplate(search_win, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        
+        best_x, best_y = max_loc
+        du = (sx1 + best_x + half) - (px + ox)
+        dv = (sy1 + best_y + half) - (py + oy)
+        
+        return idx, du, dv, float(max_val)
+    
+    # 병렬 처리
+    completed = 0
+    update_interval = max(1, n_points // 50)
+    
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(process_poi, i): i for i in range(n_points)}
+        
+        for future in as_completed(futures):
+            idx, du, dv, zncc = future.result()
+            disp_u[idx] = du
+            disp_v[idx] = dv
+            zncc_values[idx] = zncc
+            
+            completed += 1
+            if progress_callback and completed % update_interval == 0:
+                progress_callback(completed, n_points)
     
     if progress_callback:
         progress_callback(n_points, n_points)
     
-    # 유효성 판정
     valid_mask = zncc_values >= zncc_threshold
-    
-    # 불량 포인트 목록
     invalid_points = _collect_invalid_points(
         points_y, points_x, disp_u, disp_v, zncc_values, valid_mask, zncc_threshold
     )
@@ -115,187 +124,208 @@ def compute_fft_cc(ref_image: np.ndarray,
     )
 
 
-@jit(nopython=True, parallel=True, cache=True)
-def _compute_zncc_numba_parallel(ref_roi: np.ndarray,
-                                  def_extended: np.ndarray,
-                                  points_y: np.ndarray,
-                                  points_x: np.ndarray,
-                                  subset_size: int,
-                                  search_range: int,
-                                  roi_offset: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compute_fft_cc_batch_cached(
+    ref_image: np.ndarray,
+    def_file_paths: List[Path],
+    get_image_func: Callable[[Path], Optional[np.ndarray]],
+    subset_size: int = 21,
+    spacing: int = 10,
+    search_range: int = 50,
+    zncc_threshold: float = 0.6,
+    roi: Optional[Tuple[int, int, int, int]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None
+) -> Dict[str, FFTCCResult]:
     """
-    Numba 완전 병렬 ZNCC 계산
+    캐시된 이미지를 사용한 배치 FFT-CC 분석
     
-    GIL 없이 모든 CPU 코어 활용 - OpenCV보다 5~10배 빠름
+    최적화 포인트:
+    - 이미지가 이미 메모리에 있으므로 로드 시간 = 0
+    - Reference 처리 한 번만
+    - 템플릿 사전 추출
+    - ThreadPool 재사용
+    
+    Args:
+        ref_image: 기준 이미지
+        def_file_paths: 변형 이미지 경로 리스트
+        get_image_func: 캐시에서 이미지 가져오는 함수 (Path -> np.ndarray)
+        progress_callback: (current_file, total_files, filename) 콜백
+        should_stop: 중단 여부 확인 함수
+    
+    Returns:
+        {파일명: FFTCCResult} 딕셔너리
     """
-    n_points = len(points_y)
+    results = {}
+    
+    if not def_file_paths:
+        return results
+    
+    # ===== 사전 처리 (한 번만) =====
+    ref_gray = _to_gray(ref_image).astype(np.float32)
+    
+    # ROI 처리
+    if roi is not None:
+        rx, ry, rw, rh = roi
+        ref_roi = ref_gray[ry:ry+rh, rx:rx+rw]
+    else:
+        ref_roi = ref_gray
+        rx, ry = 0, 0
+    
+    # POI 그리드 생성
+    h, w = ref_roi.shape
     half = subset_size // 2
-    n_pixels = subset_size * subset_size
-    ox, oy = roi_offset
-    def_h, def_w = def_extended.shape
+    margin = half + 1
     
-    disp_u = np.zeros(n_points, dtype=np.int32)
-    disp_v = np.zeros(n_points, dtype=np.int32)
-    zncc_values = np.zeros(n_points, dtype=np.float64)
+    y_coords = np.arange(margin, h - margin, spacing)
+    x_coords = np.arange(margin, w - margin, spacing)
     
-    for idx in prange(n_points):
-        py = points_y[idx]
-        px = points_x[idx]
-        
-        # Template 범위
-        t_y1, t_y2 = py - half, py + half + 1
-        t_x1, t_x2 = px - half, px + half + 1
-        
-        # Search window 범위
-        sy1 = py + oy - search_range
-        if sy1 < 0:
-            sy1 = 0
-        sy2 = py + oy + search_range + subset_size
-        if sy2 > def_h:
-            sy2 = def_h
-        sx1 = px + ox - search_range
-        if sx1 < 0:
-            sx1 = 0
-        sx2 = px + ox + search_range + subset_size
-        if sx2 > def_w:
-            sx2 = def_w
-        
-        search_h = sy2 - sy1
-        search_w = sx2 - sx1
-        
-        if search_h < subset_size or search_w < subset_size:
-            zncc_values[idx] = 0.0
-            continue
-        
-        # Template 통계 계산
-        t_sum = 0.0
-        for i in range(t_y1, t_y2):
-            for j in range(t_x1, t_x2):
-                t_sum += ref_roi[i, j]
-        t_mean = t_sum / n_pixels
-        
-        t_var = 0.0
-        for i in range(t_y1, t_y2):
-            for j in range(t_x1, t_x2):
-                diff = ref_roi[i, j] - t_mean
-                t_var += diff * diff
-        t_std = np.sqrt(t_var)
-        
-        if t_std < 1e-10:
-            zncc_values[idx] = 0.0
-            continue
-        
-        # 슬라이딩 윈도우 탐색
-        best_zncc = -2.0
-        best_x = 0
-        best_y = 0
-        
-        valid_y = search_h - subset_size + 1
-        valid_x = search_w - subset_size + 1
-        
-        for wy in range(valid_y):
-            for wx in range(valid_x):
-                # Window 통계 계산
-                w_sum = 0.0
-                for i in range(subset_size):
-                    for j in range(subset_size):
-                        w_sum += def_extended[sy1 + wy + i, sx1 + wx + j]
-                w_mean = w_sum / n_pixels
-                
-                w_var = 0.0
-                for i in range(subset_size):
-                    for j in range(subset_size):
-                        diff = def_extended[sy1 + wy + i, sx1 + wx + j] - w_mean
-                        w_var += diff * diff
-                w_std = np.sqrt(w_var)
-                
-                if w_std < 1e-10:
-                    continue
-                
-                # ZNCC 계산
-                cross = 0.0
-                for i in range(subset_size):
-                    for j in range(subset_size):
-                        t_val = ref_roi[t_y1 + i, t_x1 + j] - t_mean
-                        w_val = def_extended[sy1 + wy + i, sx1 + wx + j] - w_mean
-                        cross += t_val * w_val
-                
-                zncc_val = cross / (t_std * w_std)
-                
-                if zncc_val > best_zncc:
-                    best_zncc = zncc_val
-                    best_x = wx
-                    best_y = wy
-        
-        # 변위 계산
-        disp_u[idx] = (sx1 + best_x + half) - (px + ox)
-        disp_v[idx] = (sy1 + best_y + half) - (py + oy)
-        zncc_values[idx] = best_zncc
+    if len(y_coords) == 0 or len(x_coords) == 0:
+        return results
     
-    return disp_u, disp_v, zncc_values
-
-
-def _compute_zncc_opencv(ref_roi: np.ndarray,
-                          def_extended: np.ndarray,
-                          points_y: np.ndarray,
-                          points_x: np.ndarray,
-                          subset_size: int,
-                          search_range: int,
-                          roi_offset: Tuple[int, int],
-                          progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    OpenCV matchTemplate 사용 (순차 처리, 호환성용)
-    """
+    yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
+    points_y = yy.ravel().astype(np.int64)
+    points_x = xx.ravel().astype(np.int64)
     n_points = len(points_y)
-    half = subset_size // 2
-    ox, oy = roi_offset
-    def_h, def_w = def_extended.shape
     
-    disp_u = np.zeros(n_points, dtype=np.int32)
-    disp_v = np.zeros(n_points, dtype=np.int32)
-    zncc_values = np.zeros(n_points, dtype=np.float64)
-    
+    # 템플릿 사전 추출 (핵심 최적화!)
+    templates = []
     for idx in range(n_points):
         py, px = points_y[idx], points_x[idx]
-        
-        template = ref_roi[py - half:py + half + 1, px - half:px + half + 1]
-        
-        sy1 = max(0, py + oy - search_range)
-        sy2 = min(def_h, py + oy + search_range + subset_size)
-        sx1 = max(0, px + ox - search_range)
-        sx2 = min(def_w, px + ox + search_range + subset_size)
-        
-        search_win = def_extended[sy1:sy2, sx1:sx2]
-        
-        if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
-            continue
-        
-        template_f32 = template.astype(np.float32)
-        search_f32 = search_win.astype(np.float32)
-        
-        result = cv2.matchTemplate(search_f32, template_f32, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        
-        best_x, best_y = max_loc
-        disp_u[idx] = (sx1 + best_x + half) - (px + ox)
-        disp_v[idx] = (sy1 + best_y + half) - (py + oy)
-        zncc_values[idx] = max_val
-        
-        if progress_callback and idx % max(1, n_points // 20) == 0:
-            progress_callback(idx + 1, n_points)
+        template = ref_roi[py - half:py + half + 1, px - half:px + half + 1].copy()
+        templates.append(template)
     
-    return disp_u, disp_v, zncc_values
+    print(f"[DEBUG] 캐시 배치: {n_points} POI, {len(def_file_paths)} 파일")
+    print(f"[DEBUG] 템플릿 {n_points}개 사전 추출 완료")
+    
+    # ===== 배치 처리 =====
+    n_workers = max(1, os.cpu_count() - 1)
+    total_files = len(def_file_paths)
+    
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        
+        for file_idx, def_path in enumerate(def_file_paths):
+            # 중단 체크
+            if should_stop and should_stop():
+                print(f"[DEBUG] 사용자 중단")
+                break
+            
+            filename = def_path.name
+            start_time = time.time()
+            
+            if progress_callback:
+                progress_callback(file_idx, total_files, filename)
+            
+            # 캐시에서 이미지 가져오기 (로드 시간 = 0)
+            def_image = get_image_func(def_path)
+            if def_image is None:
+                print(f"[WARN] 캐시에 없음: {filename}")
+                continue
+            
+            # 전처리
+            def_gray = _to_gray(def_image).astype(np.float32)
+            
+            # ROI 영역 + search_range 확장
+            if roi is not None:
+                y1 = max(0, ry - search_range)
+                y2 = min(def_gray.shape[0], ry + rh + search_range)
+                x1 = max(0, rx - search_range)
+                x2 = min(def_gray.shape[1], rx + rw + search_range)
+                def_extended = def_gray[y1:y2, x1:x2]
+                ox, oy = rx - x1, ry - y1
+            else:
+                def_extended = def_gray
+                ox, oy = 0, 0
+            
+            def_h, def_w = def_extended.shape
+            
+            # 결과 배열
+            disp_u = np.zeros(n_points, dtype=np.int32)
+            disp_v = np.zeros(n_points, dtype=np.int32)
+            zncc_values = np.zeros(n_points, dtype=np.float64)
+            
+            # POI 처리 함수 (클로저로 현재 상태 캡처)
+            def make_process_poi(def_ext, offset_x, offset_y, d_h, d_w):
+                def process_poi(idx: int) -> Tuple[int, int, int, float]:
+                    py, px = points_y[idx], points_x[idx]
+                    template = templates[idx]
+                    
+                    sy1 = max(0, py + offset_y - search_range)
+                    sy2 = min(d_h, py + offset_y + search_range + subset_size)
+                    sx1 = max(0, px + offset_x - search_range)
+                    sx2 = min(d_w, px + offset_x + search_range + subset_size)
+                    
+                    search_win = def_ext[sy1:sy2, sx1:sx2]
+                    
+                    if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
+                        return idx, 0, 0, 0.0
+                    
+                    result = cv2.matchTemplate(search_win, template, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                    
+                    best_x, best_y = max_loc
+                    du = (sx1 + best_x + half) - (px + offset_x)
+                    dv = (sy1 + best_y + half) - (py + offset_y)
+                    
+                    return idx, du, dv, float(max_val)
+                return process_poi
+            
+            process_poi = make_process_poi(def_extended, ox, oy, def_h, def_w)
+            
+            # 병렬 처리
+            futures = [executor.submit(process_poi, i) for i in range(n_points)]
+            
+            for future in as_completed(futures):
+                idx, du, dv, zncc = future.result()
+                disp_u[idx] = du
+                disp_v[idx] = dv
+                zncc_values[idx] = zncc
+            
+            # 결과 생성
+            valid_mask = zncc_values >= zncc_threshold
+            
+            invalid_points = []
+            for idx in np.where(~valid_mask)[0]:
+                invalid_points.append(MatchResult(
+                    ref_y=int(points_y[idx]),
+                    ref_x=int(points_x[idx]),
+                    disp_u=int(disp_u[idx]),
+                    disp_v=int(disp_v[idx]),
+                    zncc=float(zncc_values[idx]),
+                    valid=False,
+                    flag='low_zncc'
+                ))
+            
+            processing_time = time.time() - start_time
+            
+            results[filename] = FFTCCResult(
+                points_y=points_y.copy(),
+                points_x=points_x.copy(),
+                disp_u=disp_u.copy(),
+                disp_v=disp_v.copy(),
+                zncc_values=zncc_values.copy(),
+                valid_mask=valid_mask.copy(),
+                invalid_points=invalid_points,
+                subset_size=subset_size,
+                search_range=search_range,
+                spacing=spacing,
+                processing_time=processing_time
+            )
+    
+    if progress_callback:
+        progress_callback(total_files, total_files, "완료")
+    
+    return results
 
 
-def _preprocess_images(ref: np.ndarray, 
-                       defm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """이미지 전처리"""
-    if len(ref.shape) == 3:
-        ref = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
-    if len(defm.shape) == 3:
-        defm = cv2.cvtColor(defm, cv2.COLOR_BGR2GRAY)
-    
-    return ref.astype(np.float64), defm.astype(np.float64)
+# ===== 유틸리티 함수 =====
+
+def _to_gray(img: np.ndarray) -> np.ndarray:
+    """그레이스케일 변환"""
+    if img is None:
+        raise ValueError("이미지가 None입니다")
+    if len(img.shape) == 3:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return img
 
 
 def _apply_roi(ref: np.ndarray, 
@@ -309,7 +339,6 @@ def _apply_roi(ref: np.ndarray,
     x, y, w, h = roi
     ref_roi = ref[y:y+h, x:x+w]
     
-    # def_image는 search_range만큼 확장
     y1 = max(0, y - search_range)
     y2 = min(defm.shape[0], y + h + search_range)
     x1 = max(0, x - search_range)
@@ -383,82 +412,8 @@ def _empty_result(subset_size: int, search_range: int, spacing: int) -> FFTCCRes
 
 
 def warmup_fft_cc():
-    """
-    JIT 컴파일 워밍업
-    
-    첫 실행 시 Numba JIT 컴파일로 2-3초 소요
-    이후 캐시되어 즉시 실행
-    """
-    print("[INFO] FFT-CC Numba 워밍업 중...")
-    
-    # 작은 더미 데이터로 JIT 컴파일 트리거
-    dummy_ref = np.random.rand(100, 100).astype(np.float64)
-    dummy_def = np.random.rand(150, 150).astype(np.float64)
-    dummy_py = np.array([30, 40, 50, 60], dtype=np.int64)
-    dummy_px = np.array([30, 40, 50, 60], dtype=np.int64)
-    
-    _compute_zncc_numba_parallel(
-        dummy_ref, dummy_def, 
-        dummy_py, dummy_px,
-        21, 30, (25, 25)
-    )
-    
-    print("[INFO] FFT-CC Numba 워밍업 완료")
-
-
-# ===== 유틸리티 함수 =====
-
-def benchmark_fft_cc(ref_image: np.ndarray,
-                     def_image: np.ndarray,
-                     subset_size: int = 21,
-                     spacing: int = 10,
-                     search_range: int = 50,
-                     roi: Optional[Tuple[int, int, int, int]] = None) -> dict:
-    """
-    Numba vs OpenCV 성능 비교
-    
-    Returns:
-        {'numba_time': float, 'opencv_time': float, 'speedup': float}
-    """
-    # Numba 워밍업
-    warmup_fft_cc()
-    
-    # Numba 측정
-    start = time.time()
-    result_numba = compute_fft_cc(
-        ref_image, def_image,
-        subset_size=subset_size,
-        spacing=spacing,
-        search_range=search_range,
-        roi=roi,
-        use_numba=True
-    )
-    numba_time = time.time() - start
-    
-    # OpenCV 측정
-    start = time.time()
-    result_opencv = compute_fft_cc(
-        ref_image, def_image,
-        subset_size=subset_size,
-        spacing=spacing,
-        search_range=search_range,
-        roi=roi,
-        use_numba=False
-    )
-    opencv_time = time.time() - start
-    
-    speedup = opencv_time / numba_time if numba_time > 0 else 0
-    
-    print(f"\n===== FFT-CC 벤치마크 =====")
-    print(f"POI 수: {result_numba.n_points}")
-    print(f"Numba 병렬: {numba_time:.3f}초")
-    print(f"OpenCV 순차: {opencv_time:.3f}초")
-    print(f"속도 향상: {speedup:.1f}배")
-    print(f"============================\n")
-    
-    return {
-        'numba_time': numba_time,
-        'opencv_time': opencv_time,
-        'speedup': speedup,
-        'n_points': result_numba.n_points
-    }
+    """워밍업"""
+    print("[INFO] FFT-CC 워밍업 중...")
+    dummy = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
+    compute_fft_cc(dummy, dummy, subset_size=21, spacing=30, search_range=20, n_workers=2)
+    print("[INFO] FFT-CC 워밍업 완료")

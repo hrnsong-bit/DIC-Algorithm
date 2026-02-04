@@ -9,16 +9,18 @@ from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox
 
 from speckle.core.initial_guess import (
-    compute_fft_cc, warmup_fft_cc, 
+    compute_fft_cc, compute_fft_cc_batch_cached, warmup_fft_cc, 
     validate_displacement_field,
     FFTCCResult, ValidationResult
 )
 from speckle.io import load_image, get_image_files
 
+from ..models.app_state import AppState
+
 
 @dataclass
 class DICState:
-    """DIC 분석 상태"""
+    """DIC 분석 전용 상태"""
     ref_image: Optional[np.ndarray] = None
     ref_path: Optional[Path] = None
     def_image: Optional[np.ndarray] = None
@@ -45,10 +47,11 @@ class DICState:
 class DICController:
     """DIC 분석 컨트롤러"""
     
-    def __init__(self, view, main_controller=None):
+    def __init__(self, view, app_state: AppState, main_controller=None):
         self.view = view
+        self.app_state = app_state  # 공유 상태 (이미지 캐시)
         self.main_controller = main_controller
-        self.state = DICState()
+        self.state = DICState()  # DIC 전용 상태
         
         self._setup_callbacks()
         self._setup_canvas_callbacks()
@@ -73,31 +76,27 @@ class DICController:
         self.view.set_callback('set_zoom_1to1', self.set_zoom_1to1)
     
     def _setup_canvas_callbacks(self):
-        """캔버스 콜백 설정 (줌/팬)"""
+        """캔버스 콜백 설정"""
         self.view.canvas_view.on_zoom = self._handle_zoom
         self.view.canvas_view.on_pan = self._handle_pan
         self.view.canvas_view.on_roi_draw = self._handle_roi_draw
     
     def _handle_zoom(self, factor: float):
-        """줌 처리"""
         new_zoom = max(0.1, min(5.0, self.state.zoom_level * factor))
         self.state.zoom_level = new_zoom
         self._refresh_display()
         self.view.zoom_label.configure(text=f"{int(new_zoom * 100)}%")
     
     def _handle_pan(self, dx: int, dy: int):
-        """팬 처리"""
         ox, oy = self.state.pan_offset
         self.state.pan_offset = (ox + dx, oy + dy)
         self._refresh_display()
     
     def _handle_roi_draw(self, roi: tuple):
-        """ROI 그리기"""
         self.state.roi = roi
         self._refresh_display()
     
     def _warmup(self):
-        """FFT 워밍업"""
         try:
             warmup_fft_cc()
         except Exception:
@@ -120,12 +119,17 @@ class DICController:
     def _load_reference(self, path: Path):
         """Reference 이미지 로드"""
         try:
-            img = load_image(path)
-            self.state.ref_image = img
-            self.state.ref_path = path
-            self.view.update_reference_label(path.name)
-            self._display_image(img)
-            self.fit_to_canvas()
+            # 먼저 캐시에서 찾기
+            img = self.app_state.get_image(path.name)
+            if img is None:
+                img = load_image(path)
+            
+            if img is not None:
+                self.state.ref_image = img
+                self.state.ref_path = path
+                self.view.update_reference_label(path.name)
+                self._display_image(img)
+                self.fit_to_canvas()
         except Exception as e:
             messagebox.showerror("오류", f"이미지 로드 실패: {e}")
     
@@ -144,11 +148,16 @@ class DICController:
     def _load_deformed(self, path: Path):
         """Deformed 이미지 로드"""
         try:
-            img = load_image(path)
-            self.state.def_image = img
-            self.state.def_path = path
-            self.view.update_deformed_label(path.name)
-            self._display_image(img)
+            # 먼저 캐시에서 찾기
+            img = self.app_state.get_image(path.name)
+            if img is None:
+                img = load_image(path)
+            
+            if img is not None:
+                self.state.def_image = img
+                self.state.def_path = path
+                self.view.update_deformed_label(path.name)
+                self._display_image(img)
         except Exception as e:
             messagebox.showerror("오류", f"이미지 로드 실패: {e}")
     
@@ -170,15 +179,12 @@ class DICController:
             self.state.sequence_files = files
             self.state.current_index = 0
             
-            # 첫 이미지를 Reference로 설정
             self._load_reference(files[0])
             
-            # 두 번째 이미지를 Deformed로 설정
             if len(files) > 1:
                 self._load_deformed(files[1])
                 self.state.current_index = 1
             
-            # UI 업데이트
             self.view.update_sequence_label(f"{folder.name} ({len(files)} files)")
             self.view.update_file_list(files, self.state.current_index)
             
@@ -197,14 +203,12 @@ class DICController:
             self._load_deformed(path)
             self.view.set_current_index(index)
             
-            # 해당 인덱스의 결과가 있으면 표시
             if path.name in self.state.batch_results:
                 result = self.state.batch_results[path.name]
                 self.state.fft_cc_result = result
                 self._refresh_display()
                 self._update_result_ui(result)
             else:
-                # 결과 없으면 초기화
                 self.state.fft_cc_result = None
                 self._refresh_display()
     
@@ -229,30 +233,77 @@ class DICController:
         
         self.view.update_result_text(text)
     
-    # ===== 동기화 =====
+    # ===== 동기화 (핵심 수정) =====
     
     def sync_from_quality_tab(self):
-        """품질평가 탭에서 파라미터 동기화"""
-        if self.main_controller is None:
-            messagebox.showinfo("정보", "품질평가 탭과 연결되지 않았습니다.")
+        """품질평가 탭에서 동기화 (캐시 사용)"""
+        # 이미지 캐시 확인
+        if not self.app_state.has_images():
+            messagebox.showinfo("정보", "품질평가 탭에서 폴더를 먼저 열어주세요.")
             return
         
+        # 로딩 중이면 경고
+        if self.app_state.loading_state.is_loading:
+            result = messagebox.askyesno(
+                "로딩 중",
+                f"이미지 로딩 중입니다.\n"
+                f"({self.app_state.loading_state.loaded_files}/{self.app_state.loading_state.total_files})\n\n"
+                f"로드된 이미지만 사용하시겠습니까?"
+            )
+            if not result:
+                return
+        
         try:
-            quality_params = self.main_controller.get_current_parameters()
+            # 파일 목록 동기화
+            self.state.sequence_files = self.app_state.file_paths
+            self.state.sequence_folder = self.app_state.folder_path
             
-            params = {
-                'subset_size': quality_params.get('subset_size', 21),
-                'spacing': quality_params.get('spacing', 10)
-            }
+            # 첫 이미지를 Reference로
+            if self.app_state.file_list:
+                ref_name = self.app_state.file_list[0]
+                ref_img = self.app_state.get_image(ref_name)
+                if ref_img is not None:
+                    self.state.ref_image = ref_img
+                    self.state.ref_path = self.app_state.file_paths[0] if self.app_state.file_paths else None
+                    self.view.update_reference_label(ref_name)
             
-            roi = self.main_controller.get_roi()
-            if roi:
-                self.state.roi = roi
-                print(f"[DEBUG] ROI 동기화: {roi}")
+            # 두 번째 이미지를 Deformed로
+            if len(self.app_state.file_list) > 1:
+                def_name = self.app_state.file_list[1]
+                def_img = self.app_state.get_image(def_name)
+                if def_img is not None:
+                    self.state.def_image = def_img
+                    self.state.def_path = self.app_state.file_paths[1] if len(self.app_state.file_paths) > 1 else None
+                    self.state.current_index = 1
+                    self.view.update_deformed_label(def_name)
             
-            self.view.set_parameters(params)
-            self._refresh_display()  # ROI 표시 업데이트
-            messagebox.showinfo("동기화 완료", f"품질평가 탭의 파라미터를 가져왔습니다.\nROI: {roi}")
+            # ROI 동기화
+            self.state.roi = self.app_state.roi
+            
+            # 파라미터 동기화
+            if self.main_controller:
+                quality_params = self.main_controller.get_current_parameters()
+                params = {
+                    'subset_size': quality_params.get('subset_size', 21),
+                    'spacing': quality_params.get('spacing', 10)
+                }
+                self.view.set_parameters(params)
+            
+            # UI 업데이트
+            self.view.update_sequence_label(
+                f"{self.app_state.folder_path.name if self.app_state.folder_path else ''} "
+                f"({len(self.app_state.images)}/{len(self.app_state.file_list)} loaded)"
+            )
+            self.view.update_file_list(self.state.sequence_files, self.state.current_index)
+            self._refresh_display()
+            
+            messagebox.showinfo(
+                "동기화 완료", 
+                f"품질평가 탭에서 동기화 완료!\n\n"
+                f"이미지: {len(self.app_state.images)}장 (캐시됨)\n"
+                f"메모리: {self.app_state.memory_usage_mb:.1f}MB\n"
+                f"ROI: {self.state.roi}"
+            )
             
         except Exception as e:
             messagebox.showerror("오류", f"동기화 실패: {e}")
@@ -260,7 +311,7 @@ class DICController:
     # ===== 분석 =====
     
     def run_fft_cc(self, params: Dict[str, Any]):
-        """FFT-CC 분석 실행"""
+        """FFT-CC 분석 실행 (단일)"""
         if self.state.ref_image is None or self.state.def_image is None:
             messagebox.showwarning("경고", "Reference와 Deformed 이미지를 모두 선택해주세요.")
             return
@@ -272,7 +323,6 @@ class DICController:
         self.state.should_stop = False
         self.view.set_analysis_state(True)
         
-        # 현재 ROI 출력
         print(f"[DEBUG] 분석 시작 - ROI: {self.state.roi}")
         
         def worker():
@@ -331,81 +381,98 @@ class DICController:
         thread.start()
     
     def _show_error(self, msg: str):
-        """에러 메시지 표시"""
         messagebox.showerror("오류", f"분석 실패: {msg}")
     
     def run_batch_fft_cc(self, params: Dict[str, Any]):
-        """전체 시퀀스 배치 분석"""
-        if not self.state.sequence_files or len(self.state.sequence_files) < 2:
-            messagebox.showwarning("경고", "시퀀스 폴더를 먼저 선택해주세요.")
-            return
+        """전체 시퀀스 배치 분석 (캐시 사용 최적화 버전)"""
+        # 캐시 사용 가능 여부 확인
+        use_cache = self.app_state.has_images() and len(self.app_state.images) > 1
         
+        if use_cache:
+            self._run_batch_cached(params)
+        else:
+            self._run_batch_streaming(params)
+    
+    def _run_batch_cached(self, params: Dict[str, Any]):
+        """캐시된 이미지로 배치 분석 (가장 빠름)"""
         if self.state.is_running:
             return
+        
+        # 로딩 중이면 경고
+        if self.app_state.loading_state.is_loading:
+            result = messagebox.askyesno(
+                "로딩 중",
+                f"이미지 로딩 중입니다.\n"
+                f"({self.app_state.loading_state.loaded_files}/{self.app_state.loading_state.total_files})\n\n"
+                f"로드된 이미지만 분석하시겠습니까?"
+            )
+            if not result:
+                return
         
         self.state.is_running = True
         self.state.should_stop = False
         self.state.batch_results.clear()
         self.view.set_analysis_state(True)
         
-        print(f"[DEBUG] 배치 분석 시작 - ROI: {self.state.roi}")
+        print(f"[DEBUG] 캐시 배치 분석 시작")
+        print(f"[DEBUG] 캐시된 이미지: {len(self.app_state.images)}장")
+        print(f"[DEBUG] 메모리 사용: {self.app_state.memory_usage_mb:.1f}MB")
+        print(f"[DEBUG] ROI: {self.state.roi}")
         
         def worker():
             error_msg = None
-            last_result = None
             
             try:
-                files = self.state.sequence_files
-                total_files = len(files) - 1
+                # 분석할 파일 목록 (Reference 제외, 캐시에 있는 것만)
+                all_files = self.state.sequence_files[1:] if self.state.sequence_files else self.app_state.file_paths[1:]
+                cached_files = [f for f in all_files if f.name in self.app_state.images]
                 
-                print(f"[DEBUG] 배치 시작: {total_files} 파일")
+                if not cached_files:
+                    raise ValueError("분석할 캐시된 이미지가 없습니다.")
                 
-                for i, def_path in enumerate(files[1:], start=1):
+                total_files = len(cached_files)
+                print(f"[DEBUG] 분석 대상: {total_files}개 파일")
+                
+                # 캐시에서 이미지 가져오는 함수
+                def get_cached_image(path: Path) -> Optional[np.ndarray]:
+                    return self.app_state.get_image(path.name)
+                
+                # 진행 콜백
+                def progress_callback(current, total, filename):
                     if self.state.should_stop:
-                        print(f"[DEBUG] 사용자 중단")
-                        break
+                        raise InterruptedError("사용자 중단")
                     
-                    print(f"[DEBUG] 처리 중: {i}/{total_files} - {def_path.name}")
-                    
-                    idx = i
-                    self.view.after(0, lambda idx=idx: self.view.set_current_index(idx))
-                    
-                    def_img = load_image(def_path)
-                    
-                    if def_img is None:
-                        print(f"[DEBUG] 이미지 로드 실패: {def_path}")
-                        continue
-                    
-                    # 클로저 문제 해결을 위해 변수 캡처
-                    current_i = i
-                    current_name = def_path.name
-                    
-                    def progress_callback(current, total):
-                        if self.state.should_stop:
-                            raise InterruptedError("사용자 중단")
-                        file_progress = (current_i - 1) / total_files
-                        point_progress = (current / total) / total_files
-                        overall = (file_progress + point_progress) * 100
-                        self.view.after(0, lambda o=overall, fn=current_name, fi=current_i, tf=total_files: 
-                                        self.view.update_progress(o, f"파일 {fi}/{tf}: {fn}"))
-                    
-                    result = compute_fft_cc(
-                        self.state.ref_image,
-                        def_img,
-                        subset_size=params['subset_size'],
-                        spacing=params['spacing'],
-                        search_range=params['search_range'],
-                        zncc_threshold=params['zncc_threshold'],
-                        roi=self.state.roi,
-                        progress_callback=progress_callback
-                    )
-                    
-                    print(f"[DEBUG] 결과: {result.n_points} POI, {result.n_valid} valid")
-                    
-                    self.state.batch_results[def_path.name] = result
-                    last_result = result
+                    progress = (current / total) * 100 if total > 0 else 0
+                    self.view.after(0, lambda p=progress, c=current, t=total, fn=filename:
+                                   self.view.update_progress(p, f"분석 중 {c}/{t}: {fn}"))
+                    self.view.after(0, lambda idx=current: self.view.set_current_index(idx))
                 
-                print(f"[DEBUG] 배치 완료: {len(self.state.batch_results)} 결과 저장됨")
+                # 중단 체크 함수
+                def should_stop():
+                    return self.state.should_stop
+                
+                # 배치 분석 실행 (캐시 버전)
+                results = compute_fft_cc_batch_cached(
+                    ref_image=self.state.ref_image,
+                    def_file_paths=cached_files,
+                    get_image_func=get_cached_image,
+                    subset_size=params['subset_size'],
+                    spacing=params['spacing'],
+                    search_range=params['search_range'],
+                    zncc_threshold=params['zncc_threshold'],
+                    roi=self.state.roi,
+                    progress_callback=progress_callback,
+                    should_stop=should_stop
+                )
+                
+                self.state.batch_results = results
+                
+                print(f"[DEBUG] 배치 완료: {len(results)} 결과")
+                
+                # 마지막 결과 표시
+                if results:
+                    last_key = list(results.keys())[-1]
+                    self.state.fft_cc_result = results[last_key]
                 
             except InterruptedError:
                 self.view.after(0, lambda: self.view.update_progress(0, "중단됨"))
@@ -420,9 +487,83 @@ class DICController:
                 if error_msg:
                     self.view.after(0, lambda msg=error_msg: self._show_error(msg))
                 else:
-                    # 마지막 결과 표시
-                    if last_result:
-                        self.state.fft_cc_result = last_result
+                    self.view.after(0, self._on_batch_complete)
+                
+                self.view.after(0, lambda: self.view.set_analysis_state(False))
+        
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+    
+    def _run_batch_streaming(self, params: Dict[str, Any]):
+        """스트리밍 배치 분석 (캐시 없을 때 폴백)"""
+        if not self.state.sequence_files or len(self.state.sequence_files) < 2:
+            messagebox.showwarning("경고", "시퀀스 폴더를 먼저 선택해주세요.")
+            return
+        
+        if self.state.is_running:
+            return
+        
+        self.state.is_running = True
+        self.state.should_stop = False
+        self.state.batch_results.clear()
+        self.view.set_analysis_state(True)
+        
+        print(f"[DEBUG] 스트리밍 배치 분석 시작 (캐시 미사용)")
+        
+        def worker():
+            error_msg = None
+            
+            try:
+                files = self.state.sequence_files[1:]
+                total_files = len(files)
+                
+                # 이미지를 하나씩 로드하며 분석
+                for file_idx, def_path in enumerate(files):
+                    if self.state.should_stop:
+                        break
+                    
+                    filename = def_path.name
+                    
+                    # 진행률 업데이트
+                    progress = (file_idx / total_files) * 100
+                    self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
+                                   self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
+                    
+                    # 이미지 로드
+                    def_image = load_image(def_path)
+                    if def_image is None:
+                        continue
+                    
+                    # 분석
+                    result = compute_fft_cc(
+                        self.state.ref_image,
+                        def_image,
+                        subset_size=params['subset_size'],
+                        spacing=params['spacing'],
+                        search_range=params['search_range'],
+                        zncc_threshold=params['zncc_threshold'],
+                        roi=self.state.roi
+                    )
+                    
+                    self.state.batch_results[filename] = result
+                    
+                    # 메모리 해제
+                    del def_image
+                
+                if self.state.batch_results:
+                    last_key = list(self.state.batch_results.keys())[-1]
+                    self.state.fft_cc_result = self.state.batch_results[last_key]
+                
+            except Exception as ex:
+                error_msg = str(ex)
+                import traceback
+                traceback.print_exc()
+            finally:
+                self.state.is_running = False
+                
+                if error_msg:
+                    self.view.after(0, lambda msg=error_msg: self._show_error(msg))
+                else:
                     self.view.after(0, self._on_batch_complete)
                 
                 self.view.after(0, lambda: self.view.set_analysis_state(False))
@@ -438,10 +579,8 @@ class DICController:
         """분석 완료 처리"""
         self.view.update_progress(100, "완료")
         self._display_result(result)
-        
         self._update_result_ui(result)
         
-        # 검증 결과
         valid_text = f"""이상치 비율: {validation.outlier_ratio * 100:.1f}%
 불연속 영역: {validation.discontinuity_ratio * 100:.1f}%
 전체 유효: {'예' if validation.is_valid else '아니오'}
@@ -451,25 +590,33 @@ class DICController:
     
     def _on_batch_complete(self):
         """배치 분석 완료"""
-        self.view.update_progress(100, f"완료: {len(self.state.batch_results)} 파일 처리됨")
+        n_results = len(self.state.batch_results)
+        self.view.update_progress(100, f"완료: {n_results} 파일 처리됨")
         self._refresh_display()
-        messagebox.showinfo("완료", f"배치 분석 완료\n처리된 파일: {len(self.state.batch_results)}")
+        
+        # 총 처리 시간 계산
+        total_time = sum(r.processing_time for r in self.state.batch_results.values())
+        avg_time = total_time / n_results if n_results > 0 else 0
+        
+        messagebox.showinfo(
+            "배치 분석 완료", 
+            f"처리된 파일: {n_results}개\n"
+            f"총 소요 시간: {total_time:.1f}초\n"
+            f"평균 처리 시간: {avg_time:.2f}초/파일"
+        )
     
-    # ===== 표시 =====
+    # ===== 표시 (기존과 동일) =====
     
     def _display_image(self, img: np.ndarray):
-        """이미지 표시"""
         if img is None:
             return
         self._refresh_display()
     
     def _refresh_display(self):
-        """현재 상태로 디스플레이 갱신"""
         img = self.state.def_image if self.state.def_image is not None else self.state.ref_image
         if img is None:
             return
         
-        # 결과가 있으면 오버레이 적용
         if self.state.fft_cc_result is not None:
             display_img = self._create_overlay_image(img)
         else:
@@ -486,12 +633,10 @@ class DICController:
         )
     
     def _create_overlay_image(self, base_img: np.ndarray) -> np.ndarray:
-        """결과 오버레이 이미지 생성"""
         result = self.state.fft_cc_result
         if result is None:
             return base_img
         
-        # 컬러 이미지로 변환
         if len(base_img.shape) == 2:
             display_img = cv2.cvtColor(base_img, cv2.COLOR_GRAY2BGR)
         else:
@@ -500,7 +645,6 @@ class DICController:
         mode = self.view.display_mode_var.get()
         scale = self.view.vector_scale_var.get()
         
-        # ROI 오프셋 계산
         offset_x = 0
         offset_y = 0
         if self.state.roi is not None:
@@ -520,7 +664,6 @@ class DICController:
     
     def _draw_vectors(self, img: np.ndarray, result: FFTCCResult, scale: float,
                       offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """변위 벡터 그리기"""
         if result.n_points == 0:
             return img
         
@@ -530,28 +673,23 @@ class DICController:
             if not result.valid_mask[idx]:
                 continue
             
-            # ROI 오프셋 적용
             x = int(result.points_x[idx]) + offset_x
             y = int(result.points_y[idx]) + offset_y
             u = result.disp_u[idx]
             v = result.disp_v[idx]
             
-            # 이미지 범위 확인
             if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
                 continue
             
-            # 벡터 끝점 계산 (스케일 적용)
             end_x = int(x + u * scale * 5)
             end_y = int(y + v * scale * 5)
             
-            # 변위 크기에 따른 색상
             magnitude = np.sqrt(u*u + v*v)
             ratio = min(magnitude / max_mag, 1.0) if max_mag > 0 else 0
             
             hue = int((1 - ratio) * 120)
             color = self._hsv_to_bgr(hue, 255, 255)
             
-            # 화살표 그리기
             cv2.arrowedLine(img, (x, y), (end_x, end_y), color, 1, tipLength=0.3)
             cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
         
@@ -559,7 +697,6 @@ class DICController:
     
     def _draw_magnitude(self, img: np.ndarray, result: FFTCCResult,
                         offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """변위 크기 컬러맵 그리기"""
         if result.n_points == 0:
             return img
         
@@ -581,12 +718,10 @@ class DICController:
                 cv2.circle(img, (x, y), 4, (128, 128, 128), -1)
         
         img = self._draw_colorbar(img, 0, max_mag, "Displacement (px)")
-        
         return img
     
     def _draw_zncc_map(self, img: np.ndarray, result: FFTCCResult,
                        offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """ZNCC 맵 그리기"""
         if result.n_points == 0:
             return img
         
@@ -607,12 +742,10 @@ class DICController:
             cv2.circle(img, (x, y), 4, (b, g, r), -1)
         
         img = self._draw_colorbar(img, 0, 1, "ZNCC")
-        
         return img
     
     def _draw_invalid_points(self, img: np.ndarray, result: FFTCCResult,
                              offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """불량 포인트 강조 표시"""
         if result.n_points == 0:
             return img
         
@@ -627,79 +760,55 @@ class DICController:
                 cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
             else:
                 cv2.circle(img, (x, y), 6, (0, 0, 255), -1)
-                cv2.drawMarker(img, (x, y), (255, 255, 255), 
-                              cv2.MARKER_CROSS, 10, 2)
+                cv2.drawMarker(img, (x, y), (255, 255, 255), cv2.MARKER_CROSS, 10, 2)
         
         return img
     
     def _hsv_to_bgr(self, h: int, s: int, v: int) -> tuple:
-        """HSV to BGR 변환"""
         hsv = np.uint8([[[h, s, v]]])
         bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
         return int(bgr[0, 0, 0]), int(bgr[0, 0, 1]), int(bgr[0, 0, 2])
     
     def _magnitude_to_color(self, norm_value: float) -> tuple:
-        """정규화된 값을 JET 컬러맵 색상으로 변환"""
         if norm_value < 0.25:
-            r = 0
-            g = int(255 * (norm_value / 0.25))
-            b = 255
+            r, g, b = 0, int(255 * (norm_value / 0.25)), 255
         elif norm_value < 0.5:
-            r = 0
-            g = 255
-            b = int(255 * (1 - (norm_value - 0.25) / 0.25))
+            r, g, b = 0, 255, int(255 * (1 - (norm_value - 0.25) / 0.25))
         elif norm_value < 0.75:
-            r = int(255 * ((norm_value - 0.5) / 0.25))
-            g = 255
-            b = 0
+            r, g, b = int(255 * ((norm_value - 0.5) / 0.25)), 255, 0
         else:
-            r = 255
-            g = int(255 * (1 - (norm_value - 0.75) / 0.25))
-            b = 0
-        
+            r, g, b = 255, int(255 * (1 - (norm_value - 0.75) / 0.25)), 0
         return (b, g, r)
     
     def _draw_colorbar(self, img: np.ndarray, min_val: float, max_val: float, label: str) -> np.ndarray:
-        """컬러바 그리기"""
         h, w = img.shape[:2]
-        
-        bar_width = 20
-        bar_height = 150
-        margin = 10
-        
-        x_start = w - bar_width - margin
-        y_start = margin
+        bar_width, bar_height, margin = 20, 150, 10
+        x_start, y_start = w - bar_width - margin, margin
         
         cv2.rectangle(img, (x_start - 5, y_start - 5), 
-                     (x_start + bar_width + 40, y_start + bar_height + 25),
-                     (40, 40, 40), -1)
+                     (x_start + bar_width + 40, y_start + bar_height + 25), (40, 40, 40), -1)
         
         for i in range(bar_height):
             norm_val = 1 - (i / bar_height)
             color = self._magnitude_to_color(norm_val)
-            cv2.line(img, (x_start, y_start + i), 
-                    (x_start + bar_width, y_start + i), color, 1)
+            cv2.line(img, (x_start, y_start + i), (x_start + bar_width, y_start + i), color, 1)
         
         cv2.putText(img, f"{max_val:.1f}", (x_start + bar_width + 5, y_start + 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
         cv2.putText(img, f"{min_val:.1f}", (x_start + bar_width + 5, y_start + bar_height),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-        
         return img
     
     def _display_result(self, result: FFTCCResult):
-        """결과 오버레이 표시"""
         self.state.fft_cc_result = result
         self._refresh_display()
     
     def update_display(self, mode: str, scale: float):
-        """표시 모드 업데이트"""
         self._refresh_display()
-
+    
     # ===== 줌/캔버스 =====
     
     def fit_to_canvas(self):
-        """캔버스에 맞추기"""
         img = self.state.def_image if self.state.def_image is not None else self.state.ref_image
         if img is not None:
             zoom = self.view.canvas_view.fit_to_canvas(img.shape[:2])
@@ -709,24 +818,20 @@ class DICController:
             self.view.zoom_label.configure(text=f"{int(zoom * 100)}%")
     
     def zoom_in(self):
-        """줌 인"""
         self._handle_zoom(1.2)
     
     def zoom_out(self):
-        """줌 아웃"""
         self._handle_zoom(0.8)
     
     def set_zoom_1to1(self):
-        """1:1 줌"""
         self.state.zoom_level = 1.0
         self.state.pan_offset = (0, 0)
         self._refresh_display()
         self.view.zoom_label.configure(text="100%")
-
+    
     # ===== 내보내기 =====
     
     def export_csv(self):
-        """결과 CSV 내보내기"""
         if self.state.fft_cc_result is None:
             messagebox.showwarning("경고", "내보낼 결과가 없습니다.")
             return
@@ -743,12 +848,15 @@ class DICController:
                 with open(path, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
                     writer.writerow(['x', 'y', 'u', 'v', 'zncc', 'valid'])
-                    for pt in result.points:
-                        writer.writerow([pt.x, pt.y, pt.u, pt.v, pt.zncc, pt.is_valid])
+                    for i in range(result.n_points):
+                        writer.writerow([
+                            result.points_x[i], result.points_y[i],
+                            result.disp_u[i], result.disp_v[i],
+                            result.zncc_values[i], result.valid_mask[i]
+                        ])
                 messagebox.showinfo("완료", "CSV 저장 완료")
             except Exception as e:
                 messagebox.showerror("오류", f"저장 실패: {e}")
     
     def export_image(self):
-        """결과 이미지 내보내기"""
         messagebox.showinfo("정보", "이미지 내보내기 기능은 추후 구현 예정입니다.")

@@ -3,10 +3,11 @@
 import threading
 from queue import Queue
 from pathlib import Path
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable, Dict, List
 from tkinter import filedialog, messagebox
 
-from speckle import SpeckleQualityAssessor, load_image, load_folder, ResultExporter
+from speckle import SpeckleQualityAssessor, load_image, ResultExporter
+from speckle.io import get_image_files
 from speckle.utils.logger import logger
 
 from ..models.app_state import AppState
@@ -21,6 +22,7 @@ class MainController:
         self.state = state
         self.assessor = SpeckleQualityAssessor()
         self._result_queue: Queue = Queue()
+        self._loading_thread: Optional[threading.Thread] = None
         
         # 뷰 참조 (나중에 설정)
         self.canvas_view: Optional[CanvasView] = None
@@ -30,6 +32,8 @@ class MainController:
         self.on_state_changed: Optional[Callable[[], None]] = None
         self.on_progress: Optional[Callable[[int, int, str], None]] = None
         self.on_batch_complete: Optional[Callable[[], None]] = None
+        self.on_loading_progress: Optional[Callable[[int, int, str], None]] = None  # 추가
+        self.on_loading_complete: Optional[Callable[[int], None]] = None  # 추가
     
     def set_views(self, canvas_view: CanvasView, param_panel: ParamPanel):
         """뷰 연결"""
@@ -57,6 +61,7 @@ class MainController:
                 self.state.current_file = Path(path).name
                 self.state.images = {self.state.current_file: image}
                 self.state.file_list = [self.state.current_file]
+                self.state.file_paths = [Path(path)]
                 self.state.current_index = 0
                 
                 if self.canvas_view:
@@ -69,27 +74,99 @@ class MainController:
                 messagebox.showerror("오류", "이미지를 로드할 수 없습니다.")
     
     def open_folder(self):
-        """폴더 열기"""
+        """폴더 열기 (백그라운드 로드)"""
         path = filedialog.askdirectory()
         if path:
-            self.state.clear()
-            self.state.folder_path = Path(path)
-            self.state.images = load_folder(path)
+            self._load_folder_background(Path(path))
+    
+    def _load_folder_background(self, folder_path: Path):
+        """백그라운드에서 폴더 로드"""
+        # 기존 로딩 중지
+        if self._loading_thread and self._loading_thread.is_alive():
+            self.state.stop_loading()
+            self._loading_thread.join(timeout=1.0)
+        
+        # 상태 초기화
+        self.state.clear()
+        self.state.folder_path = folder_path
+        
+        # 파일 목록 가져오기
+        file_paths = get_image_files(folder_path)
+        if not file_paths:
+            messagebox.showwarning("경고", "이미지가 없습니다.")
+            return
+        
+        self.state.file_paths = file_paths
+        self.state.file_list = [p.name for p in file_paths]
+        self.state.loading_state.total_files = len(file_paths)
+        self.state.loading_state.is_loading = True
+        
+        logger.info(f"폴더 로드 시작: {folder_path}, {len(file_paths)}개 이미지")
+        
+        # 백그라운드 스레드에서 로드
+        self._loading_thread = threading.Thread(
+            target=self._load_images_worker,
+            args=(file_paths,),
+            daemon=True
+        )
+        self._loading_thread.start()
+    
+    def _load_images_worker(self, file_paths: List[Path]):
+        """이미지 로드 워커 (백그라운드 스레드)"""
+        loaded = 0
+        first_image_shown = False
+        
+        for i, path in enumerate(file_paths):
+            # 중단 체크
+            if self.state.should_stop_loading():
+                logger.info(f"로딩 중단됨: {loaded}/{len(file_paths)}")
+                break
             
-            if self.state.images:
-                self.state.file_list = list(self.state.images.keys())
-                self.state.current_index = 0
-                self.state.current_file = self.state.file_list[0]
-                self.state.current_image = self.state.images[self.state.current_file]
-                
-                if self.canvas_view:
-                    zoom = self.canvas_view.fit_to_canvas(self.state.current_image.shape[:2])
-                    self.state.zoom_level = zoom
-                
-                logger.info(f"폴더 로드: {path}, {len(self.state.images)}개 이미지")
-                self._notify_state_changed()
-            else:
-                messagebox.showwarning("경고", "이미지가 없습니다.")
+            try:
+                image = load_image(path)
+                if image is not None:
+                    self.state.set_image(path.name, image)
+                    loaded += 1
+                    
+                    # 첫 이미지 표시
+                    if not first_image_shown:
+                        self.state.current_index = 0
+                        self.state.current_file = path.name
+                        self.state.current_image = image
+                        first_image_shown = True
+                        
+                        # UI 업데이트 (메인 스레드에서)
+                        if self.on_state_changed:
+                            self.on_state_changed()
+                    
+            except Exception as e:
+                logger.warning(f"로드 실패: {path.name} - {e}")
+            
+            # 진행 상태 업데이트
+            self.state.loading_state.loaded_files = loaded
+            self.state.loading_state.current_file = path.name
+            
+            # 진행률 콜백
+            if self.on_loading_progress:
+                self.on_loading_progress(i + 1, len(file_paths), path.name)
+        
+        # 로딩 완료
+        self.state.loading_state.is_loading = False
+        
+        logger.info(f"폴더 로드 완료: {loaded}개 이미지, {self.state.memory_usage_mb:.1f}MB")
+        
+        if self.on_loading_complete:
+            self.on_loading_complete(loaded)
+    
+    def is_loading(self) -> bool:
+        """로딩 중인지 확인"""
+        return self.state.loading_state.is_loading
+    
+    def get_loading_progress(self) -> float:
+        """로딩 진행률 반환"""
+        return self.state.loading_state.progress
+    
+    # ===== 기존 메서드들 (변경 없음) =====
     
     def evaluate_current(self):
         """현재 이미지 평가"""
@@ -110,11 +187,22 @@ class MainController:
             messagebox.showwarning("경고", "이미지를 먼저 로드하세요.")
             return
         
+        # 로딩 중이면 경고
+        if self.state.loading_state.is_loading:
+            result = messagebox.askyesno(
+                "로딩 중",
+                f"아직 이미지 로딩 중입니다.\n"
+                f"({self.state.loading_state.loaded_files}/{self.state.loading_state.total_files})\n\n"
+                f"로드된 이미지만 평가하시겠습니까?"
+            )
+            if not result:
+                return
+        
         self._update_assessor()
         self.state.batch_running = True
         self.state.batch_stop_requested = False
         
-        logger.info(f"배치 평가 시작: {self.state.total_images}개")
+        logger.info(f"배치 평가 시작: {len(self.state.images)}개")
         
         thread = threading.Thread(target=self._run_batch, daemon=True)
         thread.start()
@@ -127,9 +215,11 @@ class MainController:
     
     def _run_batch(self):
         """배치 실행 (워커 스레드)"""
-        total = self.state.total_images
+        # 로드된 이미지만 평가
+        loaded_files = [f for f in self.state.file_list if f in self.state.images]
+        total = len(loaded_files)
         
-        for idx, filename in enumerate(self.state.file_list):
+        for idx, filename in enumerate(loaded_files):
             if self.state.batch_stop_requested:
                 logger.info(f"배치 처리 중지됨: {idx}/{total}")
                 break
@@ -138,9 +228,10 @@ class MainController:
                 self.on_progress(idx + 1, total, filename)
             
             try:
-                image = self.state.images[filename]
-                report = self.assessor.evaluate(image, self.state.roi)
-                self.state.set_report(filename, report)
+                image = self.state.get_image(filename)
+                if image is not None:
+                    report = self.assessor.evaluate(image, self.state.roi)
+                    self.state.set_report(filename, report)
             except Exception as e:
                 logger.exception(f"평가 오류 ({filename})")
         
@@ -256,7 +347,7 @@ class MainController:
             'max_subset': max_subset
         }
     
-    # ===== 내보내기 기능 =====
+    # ===== 내보내기 기능 (변경 없음) =====
     
     def export_results(self, export_type: str = 'all', include_images: bool = False) -> Optional[Dict[str, Path]]:
         """결과 내보내기"""
