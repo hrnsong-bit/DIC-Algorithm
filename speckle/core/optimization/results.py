@@ -1,9 +1,11 @@
+# speckle/core/optimization/results.py
+
 """
 IC-GN 최적화 결과 데이터 클래스
 """
 
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -25,17 +27,26 @@ class ICGNResult:
     disp_vx: np.ndarray  # ∂v/∂x
     disp_vy: np.ndarray  # ∂v/∂y
     
+    # 2차 변형 gradient (Quadratic shape function)
+    disp_uxx: Optional[np.ndarray] = None  # ∂²u/∂x²
+    disp_uxy: Optional[np.ndarray] = None  # ∂²u/∂x∂y
+    disp_uyy: Optional[np.ndarray] = None  # ∂²u/∂y²
+    disp_vxx: Optional[np.ndarray] = None  # ∂²v/∂x²
+    disp_vxy: Optional[np.ndarray] = None  # ∂²v/∂x∂y
+    disp_vyy: Optional[np.ndarray] = None  # ∂²v/∂y²
+    
     # 품질 지표
-    zncc_values: np.ndarray
-    iterations: np.ndarray
-    converged: np.ndarray
-    valid_mask: np.ndarray
+    zncc_values: np.ndarray = None
+    iterations: np.ndarray = None
+    converged: np.ndarray = None
+    valid_mask: np.ndarray = None
     
     # 메타데이터
-    subset_size: int
-    max_iterations: int
-    convergence_threshold: float
+    subset_size: int = 21
+    max_iterations: int = 50
+    convergence_threshold: float = 0.001
     processing_time: float = 0.0
+    shape_function: str = 'affine'  # 'affine' or 'quadratic'
     
     @property
     def n_points(self) -> int:
@@ -66,3 +77,7 @@ class ICGNResult:
         if self.n_valid == 0:
             return 0.0
         return float(np.mean(self.zncc_values[self.valid_mask]))
+    
+    @property
+    def is_quadratic(self) -> bool:
+        return self.shape_function == 'quadratic'

@@ -1,22 +1,12 @@
-"""
-IC-GN 최적화 모듈
-"""
+# speckle/core/optimization/__init__.py
 
 from .icgn import compute_icgn
 from .results import ICGNResult
-from .interpolation import ImageInterpolator, create_interpolator
+from .interpolation import create_interpolator, ImageInterpolator
 from .shape_function import (
-    generate_local_coordinates,
-    warp_affine,
-    warp_quadratic,
     warp,
-    update_warp_inverse_compositional_affine,
-    update_warp_inverse_compositional_quadratic,
-    update_warp_inverse_compositional,
-    compute_steepest_descent_affine,
-    compute_steepest_descent_quadratic,
     compute_steepest_descent,
-    compute_hessian,
+    update_warp_inverse_compositional,
     get_initial_params,
     get_num_params
 )
@@ -24,19 +14,11 @@ from .shape_function import (
 __all__ = [
     'compute_icgn',
     'ICGNResult',
-    'ImageInterpolator',
     'create_interpolator',
-    'generate_local_coordinates',
-    'warp_affine',
-    'warp_quadratic',
+    'ImageInterpolator',
     'warp',
-    'update_warp_inverse_compositional_affine',
-    'update_warp_inverse_compositional_quadratic',
-    'update_warp_inverse_compositional',
-    'compute_steepest_descent_affine',
-    'compute_steepest_descent_quadratic',
     'compute_steepest_descent',
-    'compute_hessian',
+    'update_warp_inverse_compositional',
     'get_initial_params',
     'get_num_params'
 ]
