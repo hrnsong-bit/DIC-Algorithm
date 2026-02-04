@@ -250,20 +250,6 @@ class DICTab(ttk.Frame):
                            variable=self.display_mode_var,
                            command=self._update_display).pack(anchor=tk.W)
         
-        # 벡터 스케일
-        ttk.Label(display_frame, text="벡터 스케일:").pack(anchor=tk.W, pady=(10, 0))
-        self.vector_scale_var = tk.DoubleVar(value=1.0)
-        scale_frame = ttk.Frame(display_frame)
-        scale_frame.pack(fill=tk.X)
-        
-        self.vector_scale = ttk.Scale(scale_frame, from_=0.1, to=5.0,
-                                       variable=self.vector_scale_var,
-                                       command=lambda v: self._update_display())
-        self.vector_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        self.scale_label = ttk.Label(scale_frame, text="1.0x", width=5)
-        self.scale_label.pack(side=tk.RIGHT)
-        
         # === 결과 정보 ===
         result_frame = ttk.LabelFrame(right_frame, text="분석 결과", padding=10)
         result_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -361,9 +347,8 @@ class DICTab(ttk.Frame):
     
     def _update_display(self):
         """표시 업데이트"""
-        scale = self.vector_scale_var.get()
-        self.scale_label.configure(text=f"{scale:.1f}x")
-        self._call('update_display', self.display_mode_var.get(), scale)
+        self._call('update_display', self.display_mode_var.get())
+
     
     def _fit_to_canvas(self):
         """캔버스에 맞추기"""

@@ -285,7 +285,7 @@ class DICController:
                 quality_params = self.main_controller.get_current_parameters()
                 params = {
                     'subset_size': quality_params.get('subset_size', 21),
-                    'spacing': quality_params.get('spacing', 10)
+                    'spacing': quality_params.get('spacing', 16)
                 }
                 self.view.set_parameters(params)
             
@@ -643,7 +643,7 @@ class DICController:
             display_img = base_img.copy()
         
         mode = self.view.display_mode_var.get()
-        scale = self.view.vector_scale_var.get()
+        # scale = self.view.vector_scale_var.get()  ← 이 줄 삭제
         
         offset_x = 0
         offset_y = 0
@@ -652,7 +652,7 @@ class DICController:
             offset_y = self.state.roi[1]
         
         if mode == "vectors":
-            display_img = self._draw_vectors(display_img, result, scale, offset_x, offset_y)
+            display_img = self._draw_vectors(display_img, result, offset_x, offset_y)  # scale 제거
         elif mode == "magnitude":
             display_img = self._draw_magnitude(display_img, result, offset_x, offset_y)
         elif mode == "zncc":
@@ -661,13 +661,16 @@ class DICController:
             display_img = self._draw_invalid_points(display_img, result, offset_x, offset_y)
         
         return display_img
-    
-    def _draw_vectors(self, img: np.ndarray, result: FFTCCResult, scale: float,
-                      offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
+
+    def _draw_vectors(self, img: np.ndarray, result: FFTCCResult,
+                    offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
+        """변위 벡터 시각화 (자동 스케일)"""
         if result.n_points == 0:
             return img
         
-        max_mag = max(np.max(np.abs(result.disp_u)), np.max(np.abs(result.disp_v)), 1)
+        # 자동 스케일: 최대 화살표 길이가 30px이 되도록
+        max_disp = max(np.max(np.abs(result.disp_u)), np.max(np.abs(result.disp_v)), 1)
+        auto_scale = 30.0 / max_disp
         
         for idx in range(result.n_points):
             if not result.valid_mask[idx]:
@@ -681,17 +684,16 @@ class DICController:
             if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
                 continue
             
-            end_x = int(x + u * scale * 5)
-            end_y = int(y + v * scale * 5)
+            end_x = int(x + u * auto_scale)
+            end_y = int(y + v * auto_scale)
             
+            # 색상: 변위 크기에 따라 (초록 → 빨강)
             magnitude = np.sqrt(u*u + v*v)
-            ratio = min(magnitude / max_mag, 1.0) if max_mag > 0 else 0
-            
-            hue = int((1 - ratio) * 120)
+            ratio = min(magnitude / max_disp, 1.0)
+            hue = int((1 - ratio) * 120)  # 120(초록) → 0(빨강)
             color = self._hsv_to_bgr(hue, 255, 255)
             
             cv2.arrowedLine(img, (x, y), (end_x, end_y), color, 1, tipLength=0.3)
-            cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
         
         return img
     
@@ -803,9 +805,10 @@ class DICController:
         self.state.fft_cc_result = result
         self._refresh_display()
     
-    def update_display(self, mode: str, scale: float):
+    def update_display(self, mode: str):
+        """표시 모드 변경"""
         self._refresh_display()
-    
+
     # ===== 줌/캔버스 =====
     
     def fit_to_canvas(self):

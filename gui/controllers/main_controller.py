@@ -313,7 +313,7 @@ class MainController:
                     'subset_size': params.subset_size,
                     'spacing': params.spacing
                 }
-        return {'subset_size': 21, 'spacing': 10}
+        return {'subset_size': 21, 'spacing': 16}
     
     def get_roi(self):
         """현재 ROI 반환"""
