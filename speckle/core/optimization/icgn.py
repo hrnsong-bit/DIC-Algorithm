@@ -39,7 +39,8 @@ def compute_icgn(
     convergence_threshold: float = 0.001,
     zncc_threshold: float = 0.6,
     interpolation_order: int = 5,
-    shape_function: str = 'affine',  # 추가: 'affine' or 'quadratic'
+    shape_function: str = 'affine',
+    gaussian_blur: Optional[int] = None,  # 추가: Pan (2013) Gaussian pre-filtering
     n_workers: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None
 ) -> ICGNResult:
@@ -56,11 +57,17 @@ def compute_icgn(
         zncc_threshold: 유효 판정 ZNCC 임계값
         interpolation_order: 보간 차수 (3 or 5)
         shape_function: 'affine' (6 params) or 'quadratic' (12 params)
+        gaussian_blur: Gaussian pre-filtering 커널 크기 (None이면 비활성화)
+                       Pan et al. (2013) 권장: 5
         n_workers: 병렬 워커 수
         progress_callback: 진행 콜백 (current, total)
     
     Returns:
         ICGNResult: 서브픽셀 정밀도 결과
+        
+    References:
+        Pan, B., et al. "Bias error reduction of digital image correlation 
+        using Gaussian pre-filtering." Optics and Lasers in Engineering, 2013.
     """
     start_time = time.time()
     
@@ -74,10 +81,21 @@ def compute_icgn(
     ref_gray = _to_gray(ref_image).astype(np.float64)
     def_gray = _to_gray(def_image).astype(np.float64)
     
-    # Gradient 계산
+    # Gaussian pre-filtering 적용 (Pan 2013)
+    if gaussian_blur is not None and gaussian_blur > 0:
+        # 커널 크기는 홀수여야 함
+        if gaussian_blur % 2 == 0:
+            gaussian_blur += 1
+        print(f"[DEBUG] Gaussian Blur 적용: 커널 크기 = {gaussian_blur}")  
+        ref_gray = cv2.GaussianBlur(ref_gray, (gaussian_blur, gaussian_blur), 0)
+        def_gray = cv2.GaussianBlur(def_gray, (gaussian_blur, gaussian_blur), 0)
+    else:
+        print(f"[DEBUG] Gaussian Blur 미적용 (gaussian_blur = {gaussian_blur})")
+
+    # Gradient 계산 (Blur된 이미지에서)
     grad_x, grad_y = _compute_gradient(ref_gray)
     
-    # Target 보간 함수 생성
+    # Target 보간 함수 생성 (Blur된 이미지로)
     target_interp = create_interpolator(def_gray, order=interpolation_order)
     
     # 로컬 좌표 생성
@@ -131,9 +149,6 @@ def compute_icgn(
         if idx < 3:
             print(f"[DEBUG] IC-GN POI[{idx}]: 위치=({px}, {py}), 초기변위=({initial_guess.disp_u[idx]}, {initial_guess.disp_v[idx]})")
         
-        # FFTCC 결과가 유효하지 않으면 스킵
-        if not initial_guess.valid_mask[idx]:
-            return idx, np.zeros(n_params), 0.0, 0, False
         # FFTCC 결과가 유효하지 않으면 스킵
         if not initial_guess.valid_mask[idx]:
             return idx, np.zeros(n_params), 0.0, 0, False
@@ -276,6 +291,7 @@ def _icgn_iterate(
     n_iter = 0
     conv = False
     zncc = 0.0
+    fail_reason = ""  # 추가: 실패 원인 추적
     
     # 수렴/발산 체크용 인덱스 (u, v 위치)
     if shape_function == 'affine':
@@ -287,8 +303,7 @@ def _icgn_iterate(
     p_initial_u = p[u_idx]
     p_initial_v = p[v_idx]
     
-    # 발산 임계값: 초기값에서 너무 벗어나면 발산으로 판정
-    max_displacement_change = 5.0  # 초기값 대비 최대 허용 변화 (픽셀)
+    max_displacement_change = 5.0
     
     for iteration in range(max_iterations):
         n_iter = iteration + 1
@@ -308,14 +323,16 @@ def _icgn_iterate(
         g_tilde = np.linalg.norm(g - g_mean)
         
         if g_tilde < 1e-10:
+            fail_reason = "g_tilde too small"
             break
         
         # ZNSSD 계산
         znssd = _compute_znssd(f, f_mean, f_tilde, g, g_mean, g_tilde)
         zncc = 1.0 - 0.5 * znssd
         
-        # ===== 발산 체크 1: ZNCC가 너무 낮으면 발산 =====
+        # 발산 체크 1: ZNCC가 너무 낮으면 발산
         if zncc < 0.5:
+            fail_reason = f"ZNCC too low: {zncc:.4f}"
             conv = False
             break
         
@@ -326,16 +343,12 @@ def _icgn_iterate(
         b = -J.T @ residual
         dp = H_inv @ b
         
-        # ===== 발산 체크 2: 업데이트가 너무 크면 발산 =====
+        # 발산 체크 2: 업데이트가 너무 크면 발산
         dp_norm = np.sqrt(dp[u_idx]**2 + dp[v_idx]**2)
-        if dp_norm > 2.0:  # 한 번에 2픽셀 이상 점프하면 발산
+        if dp_norm > 2.0:
+            fail_reason = f"dp_norm too large: {dp_norm:.4f}"
             conv = False
             break
-        
-        # 디버그 출력
-        if debug and iteration < 5:
-            print(f"    iter {iteration}: p=[{p[u_idx]:.4f}, {p[v_idx]:.4f}], "
-                  f"dp=[{dp[u_idx]:.4f}, {dp[v_idx]:.4f}], zncc={zncc:.4f}")
         
         # 수렴 체크
         if dp_norm < convergence_threshold:
@@ -345,16 +358,26 @@ def _icgn_iterate(
         # Inverse compositional update
         p = update_warp_inverse_compositional(p, dp, shape_function)
         
-        # ===== 발산 체크 3: 초기값에서 너무 벗어나면 발산 =====
+        # 발산 체크 3: 초기값에서 너무 벗어나면 발산
         displacement_change_u = abs(p[u_idx] - p_initial_u)
         displacement_change_v = abs(p[v_idx] - p_initial_v)
         
         if displacement_change_u > max_displacement_change or \
            displacement_change_v > max_displacement_change:
+            fail_reason = f"displacement change too large: u={displacement_change_u:.2f}, v={displacement_change_v:.2f}"
             conv = False
             break
     
+    # 최대 반복 도달 시
+    if n_iter == max_iterations and not conv:
+        fail_reason = f"max iterations reached, dp_norm={dp_norm:.4f}, zncc={zncc:.4f}"
+    
+    # ===== 디버그 출력: 실패한 경우만 =====
+    if not conv and np.random.random() < 0.1:  # 10% 샘플링
+        print(f"[ICGN FAIL] POI({cx},{cy}): {fail_reason}")
+    
     return p, zncc, n_iter, conv
+
 
 # ===== 전처리 함수 =====
 

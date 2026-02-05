@@ -238,6 +238,8 @@ class DICTab(ttk.Frame):
                                           command=self._export_image)
         self.export_img_btn.pack(fill=tk.X)
 
+        # dic_tab.py의 _setup_left_panel 메서드 내 서브픽셀 최적화 섹션에 추가
+
         # === 서브픽셀 최적화 섹션 ===
         subpix_frame = ttk.LabelFrame(self.left_content, text="서브픽셀 최적화 (IC-GN)", padding=10)
         subpix_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -264,6 +266,39 @@ class DICTab(ttk.Frame):
                         value='bicubic', variable=self.interp_var).pack(anchor=tk.W)
         ttk.Radiobutton(interp_frame, text="Biquintic (정확)", 
                         value='biquintic', variable=self.interp_var).pack(anchor=tk.W)
+
+        # ===== 노이즈 제거 옵션 추가 =====
+        ttk.Separator(subpix_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        ttk.Label(subpix_frame, text="노이즈 제거:").pack(anchor=tk.W)
+        noise_tip = ttk.Label(subpix_frame, text="Pan et al. (2013) Gaussian pre-filtering", 
+                              foreground="gray", font=("", 8))
+        noise_tip.pack(anchor=tk.W)
+        
+        self.gaussian_blur_var = tk.BooleanVar(value=False)
+        self.gaussian_blur_check = ttk.Checkbutton(
+            subpix_frame, 
+            text="Gaussian Blur 적용",
+            variable=self.gaussian_blur_var,
+            command=self._toggle_gaussian_blur
+        )
+        self.gaussian_blur_check.pack(anchor=tk.W)
+        
+        # 커널 크기 선택 (기본 숨김)
+        self.blur_kernel_frame = ttk.Frame(subpix_frame)
+        
+        ttk.Label(self.blur_kernel_frame, text="커널 크기:").pack(side=tk.LEFT)
+        self.blur_kernel_var = tk.IntVar(value=5)
+        self.blur_kernel_combo = ttk.Combobox(
+            self.blur_kernel_frame, 
+            textvariable=self.blur_kernel_var,
+            values=[3, 5, 7, 9],
+            width=5,
+            state='readonly'
+        )
+        self.blur_kernel_combo.pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Label(self.blur_kernel_frame, text="(권장: 5)", foreground="gray").pack(side=tk.LEFT, padx=(5, 0))
+        # ===== 노이즈 제거 옵션 끝 =====
 
         # 고급 옵션 (접힘)
         self.advanced_var = tk.BooleanVar(value=False)
@@ -464,11 +499,30 @@ class DICTab(ttk.Frame):
         if selection:
             index = selection[0]
             self._call('select_image_index', index)
-    
+    # === 토글 메서드 ===
+    def _toggle_gaussian_blur(self):
+        """Gaussian Blur 옵션 표시/숨김"""
+        if self.gaussian_blur_var.get():
+            self.blur_kernel_frame.pack(anchor=tk.W, padx=(20, 0), pady=(2, 0))
+        else:
+            self.blur_kernel_frame.pack_forget()
+
+    def get_parameters(self) -> Dict[str, Any]:
+        """현재 파라미터 반환"""
+        # Gaussian blur 값 결정
+        gaussian_blur = None
+        if self.gaussian_blur_var.get():
+            gaussian_blur = self.blur_kernel_var.get()
+            
     # === 공개 메서드 ===
     
     def get_parameters(self) -> Dict[str, Any]:
         """현재 파라미터 반환"""
+        # Gaussian blur 값 결정
+        gaussian_blur = None
+        if self.gaussian_blur_var.get():
+            gaussian_blur = self.blur_kernel_var.get()
+        
         return {
             # 공용 파라미터
             'subset_size': self.subset_var.get(),
@@ -480,6 +534,8 @@ class DICTab(ttk.Frame):
             'interpolation': self.interp_var.get(),
             'conv_threshold': self.conv_threshold_var.get(),
             'max_iter': self.max_iter_var.get(),
+            # 노이즈 제거
+            'gaussian_blur': gaussian_blur,
         }
     
     def set_parameters(self, params: Dict[str, Any]):

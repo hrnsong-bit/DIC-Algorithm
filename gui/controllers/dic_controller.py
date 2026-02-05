@@ -396,11 +396,10 @@ class DICController:
                 def icgn_progress(current, total):
                     if self.state.should_stop:
                         raise InterruptedError("사용자 중단")
-                    progress = 50 + (current / total) * 50  # 50-100%
+                    progress = 50 + (current / total) * 50
                     self.view.after(0, lambda p=progress, c=current, t=total: 
                                     self.view.update_progress(p, f"IC-GN: {c}/{t}"))
                 
-                # 보간 차수 변환 (bicubic=3, biquintic=5)
                 interp_order = 5 if params['interpolation'] == 'biquintic' else 3
                 
                 icgn_result = compute_icgn(
@@ -412,6 +411,7 @@ class DICController:
                     interpolation_order=interp_order,
                     convergence_threshold=params['conv_threshold'],
                     max_iterations=params['max_iter'],
+                    gaussian_blur=params.get('gaussian_blur'),  # 추가
                     progress_callback=icgn_progress
                 )
                 print(f"\n[DEBUG] ===== IC-GN 입력 확인 =====")
@@ -554,7 +554,8 @@ class DICController:
                     print(f"\n[DEBUG] ===== {filename} =====")
                     print(f"[DEBUG] FFTCC U: [{np.min(fftcc_result.disp_u)}, {np.max(fftcc_result.disp_u)}]")
                     print(f"[DEBUG] FFTCC V: [{np.min(fftcc_result.disp_v)}, {np.max(fftcc_result.disp_v)}]")
-
+                    print(f"[DEBUG] 파라미터: gaussian_blur = {params.get('gaussian_blur')}")
+                    
                     # === 2단계: IC-GN ===
                     interp_order = 5 if params['interpolation'] == 'biquintic' else 3
                     
@@ -566,7 +567,8 @@ class DICController:
                         shape_function=params['shape_function'],
                         interpolation_order=interp_order,
                         convergence_threshold=params['conv_threshold'],
-                        max_iterations=params['max_iter']
+                        max_iterations=params['max_iter'],
+                        gaussian_blur=params.get('gaussian_blur')  # 추가
                     )
                     
                     self.state.batch_results[filename] = icgn_result
@@ -604,7 +606,7 @@ class DICController:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-        def _run_batch_streaming(self, params: Dict[str, Any]):
+    def _run_batch_streaming(self, params: Dict[str, Any]):
             """스트리밍 배치 분석 (FFTCC + IC-GN)"""
             if not self.state.sequence_files or len(self.state.sequence_files) < 2:
                 messagebox.showwarning("경고", "시퀀스 폴더를 먼저 선택해주세요.")
@@ -670,7 +672,8 @@ class DICController:
                             shape_function=params['shape_function'],
                             interpolation_order=interp_order,
                             convergence_threshold=params['conv_threshold'],
-                            max_iterations=params['max_iter']
+                            max_iterations=params['max_iter'],
+                            gaussian_blur=params.get('gaussian_blur')  # 추가
                         )
                         
                         self.state.batch_results[filename] = icgn_result
