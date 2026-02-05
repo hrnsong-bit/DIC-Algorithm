@@ -43,7 +43,7 @@ class SpeckleQualityAssessor:
             subset_size: 초기 subset 크기 (기본 21)
             poi_spacing: POI 간격 (기본 10)
             auto_find_size: 자동 최적 크기 탐색 여부
-            desired_accuracy: 원하는 변위 측정 정확도 (pixels, 기본 0.01)
+            desired_accuracy: 원하는 변위 측정 정확도 (pixels, 기본 0.02)
         """
         self.mig_threshold = mig_threshold
         self.sssig_threshold = sssig_threshold
@@ -67,8 +67,6 @@ class SpeckleQualityAssessor:
         Returns:
             QualityReport 객체
         """
-        print(f"[DEBUG] assessor.poi_spacing = {self.poi_spacing}")
-        print(f"[DEBUG] assessor.desired_accuracy = {self.desired_accuracy}")
         start_time = time.time()
         warnings = []
         
@@ -136,8 +134,8 @@ class SpeckleQualityAssessor:
             # 2. 현재 설정(GUI) 기준으로 결과 계산 (표시/CSV용)
             sssig_result = compute_sssig_map(
                 roi_gray,
-                subset_size=self.subset_size,   # GUI 설정값 (21)
-                spacing=self.poi_spacing,        # GUI 설정값 (16)
+                subset_size=self.subset_size,
+                spacing=self.poi_spacing,
                 noise_variance=noise_variance,
                 desired_accuracy=self.desired_accuracy
             )

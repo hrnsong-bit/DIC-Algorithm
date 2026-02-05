@@ -32,8 +32,8 @@ class MainController:
         self.on_state_changed: Optional[Callable[[], None]] = None
         self.on_progress: Optional[Callable[[int, int, str], None]] = None
         self.on_batch_complete: Optional[Callable[[], None]] = None
-        self.on_loading_progress: Optional[Callable[[int, int, str], None]] = None  # 추가
-        self.on_loading_complete: Optional[Callable[[int], None]] = None  # 추가
+        self.on_loading_progress: Optional[Callable[[int, int, str], None]] = None
+        self.on_loading_complete: Optional[Callable[[int], None]] = None
     
     def set_views(self, canvas_view: CanvasView, param_panel: ParamPanel):
         """뷰 연결"""
@@ -165,8 +165,6 @@ class MainController:
     def get_loading_progress(self) -> float:
         """로딩 진행률 반환"""
         return self.state.loading_state.progress
-    
-    # ===== 기존 메서드들 (변경 없음) =====
     
     def evaluate_current(self):
         """현재 이미지 평가"""
@@ -347,7 +345,7 @@ class MainController:
             'max_subset': max_subset
         }
     
-    # ===== 내보내기 기능 (변경 없음) =====
+    # ===== 내보내기 기능 =====
     
     def export_results(self, export_type: str = 'all', include_images: bool = False) -> Optional[Dict[str, Path]]:
         """결과 내보내기"""

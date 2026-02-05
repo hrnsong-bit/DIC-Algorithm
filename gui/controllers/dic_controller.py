@@ -987,31 +987,118 @@ class DICController:
     # ===== 내보내기 =====
     
     def export_csv(self):
-        if self.state.fft_cc_result is None:
+        """IC-GN 결과 CSV 저장"""
+        result = self.state.icgn_result if self.state.icgn_result else self.state.fft_cc_result
+        
+        if result is None:
             messagebox.showwarning("경고", "내보낼 결과가 없습니다.")
             return
+        
+        # 기본 파일명 설정
+        if self.state.def_path:
+            default_name = f"dic_result_{self.state.def_path.stem}.csv"
+        else:
+            default_name = "dic_result.csv"
         
         path = filedialog.asksaveasfilename(
             title="CSV 저장",
             defaultextension=".csv",
+            initialfile=default_name,
             filetypes=[("CSV 파일", "*.csv")]
         )
-        if path:
-            try:
-                result = self.state.fft_cc_result
+        
+        if not path:
+            return
+        
+        try:
+            is_icgn = hasattr(result, 'converged')
+            
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                # 메타 정보 헤더
+                f.write(f"# DIC Analysis Result\n")
+                f.write(f"# Reference: {self.state.ref_path.name if self.state.ref_path else 'N/A'}\n")
+                f.write(f"# Deformed: {self.state.def_path.name if self.state.def_path else 'N/A'}\n")
+                f.write(f"# ROI: {self.state.roi}\n")
+                f.write(f"# Subset Size: {result.subset_size}\n")
+                
+                if is_icgn:
+                    f.write(f"# Shape Function: {result.shape_function}\n")
+                    f.write(f"# Convergence Threshold: {result.convergence_threshold}\n")
+                    f.write(f"# Max Iterations: {result.max_iterations}\n")
+                    f.write(f"# Total POI: {result.n_points}\n")
+                    f.write(f"# Converged: {result.n_converged} ({result.convergence_rate*100:.1f}%)\n")
+                    f.write(f"# Valid: {result.n_valid}\n")
+                    f.write(f"# Mean Iterations: {result.mean_iterations:.1f}\n")
+                else:
+                    f.write(f"# Total POI: {result.n_points}\n")
+                    f.write(f"# Valid: {result.n_valid}\n")
+                
+                f.write(f"# Mean ZNCC: {result.mean_zncc:.6f}\n")
+                f.write(f"# Processing Time: {result.processing_time:.2f}s\n")
+                f.write(f"#\n")
+                
+                # CSV 데이터
                 import csv
-                with open(path, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
+                writer = csv.writer(f)
+                
+                if is_icgn:
+                    # IC-GN 결과 (변형률 정보 포함)
+                    if result.shape_function == 'affine':
+                        writer.writerow(['x', 'y', 'u', 'v', 'ux', 'uy', 'vx', 'vy', 'zncc', 'converged', 'iterations'])
+                        for i in range(result.n_points):
+                            writer.writerow([
+                                result.points_x[i],
+                                result.points_y[i],
+                                f"{result.disp_u[i]:.6f}",
+                                f"{result.disp_v[i]:.6f}",
+                                f"{result.disp_ux[i]:.6f}",
+                                f"{result.disp_uy[i]:.6f}",
+                                f"{result.disp_vx[i]:.6f}",
+                                f"{result.disp_vy[i]:.6f}",
+                                f"{result.zncc_values[i]:.6f}",
+                                result.converged[i],
+                                result.iterations[i]
+                            ])
+                    else:  # quadratic
+                        writer.writerow(['x', 'y', 'u', 'v', 'ux', 'uy', 'uxx', 'uxy', 'uyy', 
+                                        'vx', 'vy', 'vxx', 'vxy', 'vyy', 'zncc', 'converged', 'iterations'])
+                        for i in range(result.n_points):
+                            writer.writerow([
+                                result.points_x[i],
+                                result.points_y[i],
+                                f"{result.disp_u[i]:.6f}",
+                                f"{result.disp_v[i]:.6f}",
+                                f"{result.disp_ux[i]:.6f}",
+                                f"{result.disp_uy[i]:.6f}",
+                                f"{result.disp_uxx[i]:.6f}",
+                                f"{result.disp_uxy[i]:.6f}",
+                                f"{result.disp_uyy[i]:.6f}",
+                                f"{result.disp_vx[i]:.6f}",
+                                f"{result.disp_vy[i]:.6f}",
+                                f"{result.disp_vxx[i]:.6f}",
+                                f"{result.disp_vxy[i]:.6f}",
+                                f"{result.disp_vyy[i]:.6f}",
+                                f"{result.zncc_values[i]:.6f}",
+                                result.converged[i],
+                                result.iterations[i]
+                            ])
+                else:
+                    # FFTCC 결과
                     writer.writerow(['x', 'y', 'u', 'v', 'zncc', 'valid'])
                     for i in range(result.n_points):
                         writer.writerow([
-                            result.points_x[i], result.points_y[i],
-                            result.disp_u[i], result.disp_v[i],
-                            result.zncc_values[i], result.valid_mask[i]
+                            result.points_x[i],
+                            result.points_y[i],
+                            f"{result.disp_u[i]:.6f}",
+                            f"{result.disp_v[i]:.6f}",
+                            f"{result.zncc_values[i]:.6f}",
+                            result.valid_mask[i]
                         ])
-                messagebox.showinfo("완료", "CSV 저장 완료")
-            except Exception as e:
-                messagebox.showerror("오류", f"저장 실패: {e}")
-    
+            
+            messagebox.showinfo("완료", f"CSV 저장 완료\n{path}")
+            
+        except Exception as e:
+            messagebox.showerror("오류", f"저장 실패: {e}")
+
     def export_image(self):
         messagebox.showinfo("정보", "이미지 내보내기 기능은 추후 구현 예정입니다.")

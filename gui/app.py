@@ -36,8 +36,6 @@ class SpeckleQualityGUI:
         
         self._connect_controller()
         self._start_periodic_check()
-        self._connect_controller()
-        self._start_periodic_check()
         
         # 초기 탭에 맞게 키 바인딩 설정
         self._on_tab_changed(None)
@@ -153,8 +151,6 @@ class SpeckleQualityGUI:
         
         # 우측 파일 목록
         self._create_file_list(main_frame)
-    
-    # ===== 기존 품질 평가 탭 메서드들 (변경 없음) =====
     
     def _create_file_buttons(self, parent):
         """파일 버튼"""
@@ -327,7 +323,7 @@ class SpeckleQualityGUI:
         """로딩 UI 업데이트"""
         self.progress_var.set(f"로딩: {current}/{total}")
         self.progress_bar['value'] = (current / total) * 100
-        self._update_file_list()  # 파일 목록 업데이트
+        self._update_file_list()
 
     def _on_loading_complete(self, total_loaded: int):
         """로딩 완료"""
@@ -497,6 +493,10 @@ class SpeckleQualityGUI:
         
         if report.recommended_subset_size > report.current_subset_size:
             text += "  ⚠ Subset 크기 증가 필요!\n"
+        
+        # 예상 정확도
+        if report.predicted_accuracy:
+            text += f"[예상 정확도] {report.predicted_accuracy:.4f} px\n"
         
         # 결과
         text += f"\n[결과] {report.quality_grade}\n"

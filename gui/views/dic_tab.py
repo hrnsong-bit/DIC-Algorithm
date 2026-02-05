@@ -27,51 +27,42 @@ class DICTab(ttk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         
-        # 콜백 저장
         self.callbacks: Dict[str, Callable] = {}
-        
-        # 현재 상태
         self.current_index = 0
         self.sequence_files: List[Path] = []
         
         self._setup_ui()
-        self._setup_key_bindings()  # 여기에 추가
+        self._setup_key_bindings()
 
     def _setup_key_bindings(self):
         """키보드 바인딩 설정"""
-        # 탭 자체에 바인딩
         self.bind('<Left>', self._on_key_left)
         self.bind('<Right>', self._on_key_right)
         self.bind('<Up>', self._on_key_up)
         self.bind('<Down>', self._on_key_down)
         
-        # 캔버스에도 바인딩 (포커스가 캔버스에 있을 때도 작동하도록)
         self.canvas_view.canvas.bind('<Left>', self._on_key_left)
         self.canvas_view.canvas.bind('<Right>', self._on_key_right)
         self.canvas_view.canvas.bind('<Up>', self._on_key_up)
         self.canvas_view.canvas.bind('<Down>', self._on_key_down)
 
     def _on_key_left(self, event):
-        """왼쪽 방향키: 이전 이미지"""
         if self.sequence_files and self.current_index > 0:
             self._call('select_image_index', self.current_index - 1)
         return "break"
 
     def _on_key_right(self, event):
-        """오른쪽 방향키: 다음 이미지"""
         if self.sequence_files and self.current_index < len(self.sequence_files) - 1:
             self._call('select_image_index', self.current_index + 1)
         return "break"
 
     def _on_key_up(self, event):
-        """위 방향키: 10장 이전"""
         if self.sequence_files:
             new_index = max(0, self.current_index - 10)
             self._call('select_image_index', new_index)
         return "break"
 
     def _on_key_down(self, event):
-        """아래 방향키: 10장 다음"""
         if self.sequence_files:
             new_index = min(len(self.sequence_files) - 1, self.current_index + 10)
             self._call('select_image_index', new_index)
@@ -79,17 +70,11 @@ class DICTab(ttk.Frame):
 
     def _setup_ui(self):
         """UI 구성"""
-        # 메인 PanedWindow (좌-중앙-우 분할)
         self.main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         self.main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # 왼쪽 패널 (파라미터)
         self._setup_left_panel()
-        
-        # 중앙 패널 (캔버스)
         self._setup_center_panel()
-        
-        # 오른쪽 패널 (결과 + 파일 목록)
         self._setup_right_panel()
     
     def _setup_left_panel(self):
@@ -114,455 +99,312 @@ class DICTab(ttk.Frame):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         # === 이미지 선택 섹션 ===
-        img_frame = ttk.LabelFrame(self.left_content, text="이미지 선택", padding=10)
+        img_frame = ttk.LabelFrame(self.left_content, text="이미지", padding=5)
         img_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Reference 이미지
-        ttk.Label(img_frame, text="Reference 이미지:").pack(anchor=tk.W)
+        # Reference
         ref_frame = ttk.Frame(img_frame)
-        ref_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        self.ref_label = ttk.Label(ref_frame, text="선택 안됨", foreground="gray")
+        ref_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(ref_frame, text="Ref:", width=5).pack(side=tk.LEFT)
+        self.ref_label = ttk.Label(ref_frame, text="선택 안됨", foreground="gray", width=20)
         self.ref_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        self.ref_btn = ttk.Button(ref_frame, text="선택", width=6,
-                                   command=self._select_reference)
+        self.ref_btn = ttk.Button(ref_frame, text="선택", width=5, command=self._select_reference)
         self.ref_btn.pack(side=tk.RIGHT)
         
-        # Deformed 이미지
-        ttk.Label(img_frame, text="Deformed 이미지:").pack(anchor=tk.W)
+        # Deformed
         def_frame = ttk.Frame(img_frame)
-        def_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        self.def_label = ttk.Label(def_frame, text="선택 안됨", foreground="gray")
+        def_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(def_frame, text="Def:", width=5).pack(side=tk.LEFT)
+        self.def_label = ttk.Label(def_frame, text="선택 안됨", foreground="gray", width=20)
         self.def_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        self.def_btn = ttk.Button(def_frame, text="선택", width=6,
-                                   command=self._select_deformed)
+        self.def_btn = ttk.Button(def_frame, text="선택", width=5, command=self._select_deformed)
         self.def_btn.pack(side=tk.RIGHT)
         
-        ttk.Separator(img_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-        
         # 시퀀스 폴더
-        ttk.Label(img_frame, text="또는 시퀀스 폴더:").pack(anchor=tk.W)
         seq_frame = ttk.Frame(img_frame)
-        seq_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        self.seq_label = ttk.Label(seq_frame, text="선택 안됨", foreground="gray")
+        seq_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(seq_frame, text="폴더:", width=5).pack(side=tk.LEFT)
+        self.seq_label = ttk.Label(seq_frame, text="선택 안됨", foreground="gray", width=20)
         self.seq_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        self.seq_btn = ttk.Button(seq_frame, text="선택", width=6,
-                                   command=self._select_sequence)
+        self.seq_btn = ttk.Button(seq_frame, text="선택", width=5, command=self._select_sequence)
         self.seq_btn.pack(side=tk.RIGHT)
         
-        # === DIC 파라미터 섹션 ===
-        param_frame = ttk.LabelFrame(self.left_content, text="DIC 파라미터", padding=10)
+        # 품질평가 동기화 버튼
+        self.sync_btn = ttk.Button(img_frame, text="품질평가 탭에서 가져오기",
+                                    command=self._sync_from_quality_tab)
+        self.sync_btn.pack(fill=tk.X, pady=(5, 0))
+        
+        # === 파라미터 섹션 (통합) ===
+        param_frame = ttk.LabelFrame(self.left_content, text="파라미터", padding=5)
         param_frame.pack(fill=tk.X, padx=5, pady=5)
         
+        # 그리드 레이아웃
+        grid = ttk.Frame(param_frame)
+        grid.pack(fill=tk.X)
+        
         # Subset Size
-        ttk.Label(param_frame, text="Subset Size (px):").pack(anchor=tk.W)
+        ttk.Label(grid, text="Subset:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.subset_var = tk.IntVar(value=21)
-        self.subset_spin = ttk.Spinbox(param_frame, from_=11, to=101, increment=2,
-                                        textvariable=self.subset_var, width=10)
-        self.subset_spin.pack(anchor=tk.W, pady=(0, 5))
+        self.subset_spin = ttk.Spinbox(grid, textvariable=self.subset_var,
+                                        values=[11,13,15,17,19,21,23,25,27,29,31,35,41,51,61],
+                                        width=8)
+        self.subset_spin.grid(row=0, column=1, pady=2)
         
         # Spacing
-        ttk.Label(param_frame, text="Spacing (px):").pack(anchor=tk.W)
+        ttk.Label(grid, text="Spacing:").grid(row=0, column=2, sticky=tk.W, padx=(10,0), pady=2)
         self.spacing_var = tk.IntVar(value=16)
-        self.spacing_spin = ttk.Spinbox(param_frame, from_=1, to=50,
-                                         textvariable=self.spacing_var, width=10)
-        self.spacing_spin.pack(anchor=tk.W, pady=(0, 5))
+        self.spacing_spin = ttk.Spinbox(grid, from_=5, to=50, textvariable=self.spacing_var, width=8)
+        self.spacing_spin.grid(row=0, column=3, pady=2)
         
         # Search Range
-        ttk.Label(param_frame, text="Search Range (px):").pack(anchor=tk.W)
-        search_tip = ttk.Label(param_frame, text="예상 최대 변위보다 크게", 
-                               foreground="gray", font=("", 8))
-        search_tip.pack(anchor=tk.W)
+        ttk.Label(grid, text="Search:").grid(row=1, column=0, sticky=tk.W, pady=2)
         self.search_var = tk.IntVar(value=50)
-        self.search_spin = ttk.Spinbox(param_frame, from_=10, to=200,
-                                        textvariable=self.search_var, width=10)
-        self.search_spin.pack(anchor=tk.W, pady=(0, 5))
+        self.search_spin = ttk.Spinbox(grid, from_=10, to=200, textvariable=self.search_var, width=8)
+        self.search_spin.grid(row=1, column=1, pady=2)
         
         # ZNCC Threshold
-        ttk.Label(param_frame, text="ZNCC Threshold:").pack(anchor=tk.W)
-        zncc_tip = ttk.Label(param_frame, text="낮을수록 관대 (불연속 검출용)", 
-                             foreground="gray", font=("", 8))
-        zncc_tip.pack(anchor=tk.W)
+        ttk.Label(grid, text="ZNCC:").grid(row=1, column=2, sticky=tk.W, padx=(10,0), pady=2)
         self.zncc_var = tk.DoubleVar(value=0.7)
-        self.zncc_spin = ttk.Spinbox(param_frame, from_=0.1, to=0.99, increment=0.05,
-                                      textvariable=self.zncc_var, width=10)
-        self.zncc_spin.pack(anchor=tk.W, pady=(0, 5))
+        self.zncc_spin = ttk.Spinbox(grid, from_=0.1, to=0.99, increment=0.05,
+                                      textvariable=self.zncc_var, width=8)
+        self.zncc_spin.grid(row=1, column=3, pady=2)
         
-        # 품질평가 파라미터 동기화 버튼
-        self.sync_btn = ttk.Button(param_frame, text="품질평가 탭에서 가져오기",
-                                    command=self._sync_from_quality_tab)
-        self.sync_btn.pack(fill=tk.X, pady=(10, 0))
+        # Shape Function
+        ttk.Label(grid, text="Shape:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.shape_func_var = tk.StringVar(value='affine')
+        shape_combo = ttk.Combobox(grid, textvariable=self.shape_func_var,
+                                    values=['affine', 'quadratic'], width=10, state='readonly')
+        shape_combo.grid(row=2, column=1, pady=2)
+        
+        # Interpolation
+        ttk.Label(grid, text="Interp:").grid(row=2, column=2, sticky=tk.W, padx=(10,0), pady=2)
+        self.interp_var = tk.StringVar(value='bicubic')
+        interp_combo = ttk.Combobox(grid, textvariable=self.interp_var,
+                                     values=['bicubic', 'biquintic'], width=10, state='readonly')
+        interp_combo.grid(row=2, column=3, pady=2)
+        
+        # Gaussian Blur
+        blur_frame = ttk.Frame(param_frame)
+        blur_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        self.gaussian_blur_var = tk.BooleanVar(value=False)
+        self.gaussian_blur_check = ttk.Checkbutton(blur_frame, text="Gaussian Blur:",
+                                                    variable=self.gaussian_blur_var,
+                                                    command=self._toggle_gaussian_blur)
+        self.gaussian_blur_check.pack(side=tk.LEFT)
+        
+        self.blur_kernel_var = tk.IntVar(value=5)
+        self.blur_kernel_combo = ttk.Combobox(blur_frame, textvariable=self.blur_kernel_var,
+                                               values=[3, 5, 7, 9], width=5, state='disabled')
+        self.blur_kernel_combo.pack(side=tk.LEFT, padx=(5, 0))
+        
+        # 고급 옵션
+        self.advanced_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(param_frame, text="고급 옵션",
+                        variable=self.advanced_var,
+                        command=self._toggle_advanced_options).pack(anchor=tk.W, pady=(5, 0))
+        
+        self.advanced_frame = ttk.Frame(param_frame)
+        adv_grid = ttk.Frame(self.advanced_frame)
+        adv_grid.pack(fill=tk.X)
+        
+        ttk.Label(adv_grid, text="수렴 기준:").grid(row=0, column=0, sticky=tk.W)
+        self.conv_threshold_var = tk.DoubleVar(value=0.001)
+        ttk.Entry(adv_grid, textvariable=self.conv_threshold_var, width=10).grid(row=0, column=1)
+        
+        ttk.Label(adv_grid, text="최대 반복:").grid(row=1, column=0, sticky=tk.W)
+        self.max_iter_var = tk.IntVar(value=20)
+        ttk.Spinbox(adv_grid, from_=10, to=200, textvariable=self.max_iter_var, width=8).grid(row=1, column=1)
         
         # === 분석 섹션 ===
-        analysis_frame = ttk.LabelFrame(self.left_content, text="분석", padding=10)
+        analysis_frame = ttk.LabelFrame(self.left_content, text="분석", padding=5)
         analysis_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        # 현재 이미지 분석 버튼
-        self.analyze_btn = ttk.Button(analysis_frame, text="현재 이미지 분석",
-                                    command=self._run_analysis)
-        self.analyze_btn.pack(fill=tk.X, pady=(0, 5))
-
-        # 전체 시퀀스 분석 버튼
-        self.batch_btn = ttk.Button(analysis_frame, text="전체 시퀀스 분석",
-                                    command=self._run_batch_analysis)
-        self.batch_btn.pack(fill=tk.X, pady=(0, 5))
-                
+        
+        btn_frame = ttk.Frame(analysis_frame)
+        btn_frame.pack(fill=tk.X)
+        
+        self.analyze_btn = ttk.Button(btn_frame, text="현재 분석", command=self._run_analysis)
+        self.analyze_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        
+        self.batch_btn = ttk.Button(btn_frame, text="전체 분석", command=self._run_batch_analysis)
+        self.batch_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        
         # 진행 상황
         self.progress_var = tk.DoubleVar(value=0)
-        self.progress_bar = ttk.Progressbar(analysis_frame, variable=self.progress_var,
-                                             maximum=100)
+        self.progress_bar = ttk.Progressbar(analysis_frame, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=(5, 0))
         
-        self.progress_label = ttk.Label(analysis_frame, text="대기 중")
+        self.progress_label = ttk.Label(analysis_frame, text="대기 중", font=("", 8))
         self.progress_label.pack(anchor=tk.W)
         
-        # 중지 버튼
         self.stop_btn = ttk.Button(analysis_frame, text="중지", state=tk.DISABLED,
                                     command=self._stop_analysis)
         self.stop_btn.pack(fill=tk.X, pady=(5, 0))
-        
-        # === 내보내기 섹션 ===
-        export_frame = ttk.LabelFrame(self.left_content, text="내보내기", padding=10)
-        export_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.export_csv_btn = ttk.Button(export_frame, text="결과 CSV 저장",
-                                          command=self._export_csv)
-        self.export_csv_btn.pack(fill=tk.X, pady=(0, 5))
-        
-        self.export_img_btn = ttk.Button(export_frame, text="변위 이미지 저장",
-                                          command=self._export_image)
-        self.export_img_btn.pack(fill=tk.X)
-
-        # dic_tab.py의 _setup_left_panel 메서드 내 서브픽셀 최적화 섹션에 추가
-
-        # === 서브픽셀 최적화 섹션 ===
-        subpix_frame = ttk.LabelFrame(self.left_content, text="서브픽셀 최적화 (IC-GN)", padding=10)
-        subpix_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        # Shape Function 선택
-        ttk.Label(subpix_frame, text="Shape Function:").pack(anchor=tk.W)
-        self.shape_func_var = tk.StringVar(value='affine')
-
-        shape_frame = ttk.Frame(subpix_frame)
-        shape_frame.pack(fill=tk.X, pady=(0, 5))
-
-        ttk.Radiobutton(shape_frame, text="Affine (6 params)", 
-                        value='affine', variable=self.shape_func_var).pack(anchor=tk.W)
-        ttk.Radiobutton(shape_frame, text="Quadratic (12 params)", 
-                        value='quadratic', variable=self.shape_func_var).pack(anchor=tk.W)
-
-        # 보간 방법
-        ttk.Label(subpix_frame, text="보간 방법:").pack(anchor=tk.W)
-        self.interp_var = tk.StringVar(value='bicubic')
-        interp_frame = ttk.Frame(subpix_frame)
-        interp_frame.pack(fill=tk.X, pady=(0, 5))
-
-        ttk.Radiobutton(interp_frame, text="Bicubic (빠름)", 
-                        value='bicubic', variable=self.interp_var).pack(anchor=tk.W)
-        ttk.Radiobutton(interp_frame, text="Biquintic (정확)", 
-                        value='biquintic', variable=self.interp_var).pack(anchor=tk.W)
-
-        # ===== 노이즈 제거 옵션 추가 =====
-        ttk.Separator(subpix_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-        
-        ttk.Label(subpix_frame, text="노이즈 제거:").pack(anchor=tk.W)
-        noise_tip = ttk.Label(subpix_frame, text="Pan et al. (2013) Gaussian pre-filtering", 
-                              foreground="gray", font=("", 8))
-        noise_tip.pack(anchor=tk.W)
-        
-        self.gaussian_blur_var = tk.BooleanVar(value=False)
-        self.gaussian_blur_check = ttk.Checkbutton(
-            subpix_frame, 
-            text="Gaussian Blur 적용",
-            variable=self.gaussian_blur_var,
-            command=self._toggle_gaussian_blur
-        )
-        self.gaussian_blur_check.pack(anchor=tk.W)
-        
-        # 커널 크기 선택 (기본 숨김)
-        self.blur_kernel_frame = ttk.Frame(subpix_frame)
-        
-        ttk.Label(self.blur_kernel_frame, text="커널 크기:").pack(side=tk.LEFT)
-        self.blur_kernel_var = tk.IntVar(value=5)
-        self.blur_kernel_combo = ttk.Combobox(
-            self.blur_kernel_frame, 
-            textvariable=self.blur_kernel_var,
-            values=[3, 5, 7, 9],
-            width=5,
-            state='readonly'
-        )
-        self.blur_kernel_combo.pack(side=tk.LEFT, padx=(5, 0))
-        ttk.Label(self.blur_kernel_frame, text="(권장: 5)", foreground="gray").pack(side=tk.LEFT, padx=(5, 0))
-        # ===== 노이즈 제거 옵션 끝 =====
-
-        # 고급 옵션 (접힘)
-        self.advanced_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(subpix_frame, text="고급 옵션 표시", 
-                        variable=self.advanced_var,
-                        command=self._toggle_advanced_options).pack(anchor=tk.W, pady=(5, 0))
-
-        self.advanced_frame = ttk.Frame(subpix_frame)
-
-        # 수렴 조건
-        ttk.Label(self.advanced_frame, text="수렴 기준:").pack(anchor=tk.W)
-        self.conv_threshold_var = tk.DoubleVar(value=0.001)
-        ttk.Entry(self.advanced_frame, textvariable=self.conv_threshold_var, width=10).pack(anchor=tk.W, pady=(0, 5))
-
-        # 최대 반복
-        ttk.Label(self.advanced_frame, text="최대 반복:").pack(anchor=tk.W)
-        self.max_iter_var = tk.IntVar(value=50)
-        ttk.Spinbox(self.advanced_frame, from_=10, to=200, increment=10,
-                    textvariable=self.max_iter_var, width=10).pack(anchor=tk.W)
 
     def _setup_center_panel(self):
         """중앙 패널: 캔버스"""
         center_frame = ttk.Frame(self.main_paned)
         self.main_paned.add(center_frame, weight=1)
         
-        # 캔버스 영역 (CanvasView가 내부에서 pack 처리함)
         canvas_container = ttk.Frame(center_frame)
         canvas_container.pack(fill=tk.BOTH, expand=True)
         
         self.canvas_view = CanvasView(canvas_container)
-        # pack 호출하지 않음!
         
-        # 줌 컨트롤 (하단)
+        # 줌 컨트롤
         zoom_frame = ttk.Frame(center_frame)
         zoom_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        ttk.Button(zoom_frame, text="−", width=3,
-                command=self._zoom_out).pack(side=tk.LEFT)
-        
+        ttk.Button(zoom_frame, text="−", width=3, command=self._zoom_out).pack(side=tk.LEFT)
         self.zoom_label = ttk.Label(zoom_frame, text="100%")
         self.zoom_label.pack(side=tk.LEFT, padx=10)
-        
-        ttk.Button(zoom_frame, text="+", width=3,
-                command=self._zoom_in).pack(side=tk.LEFT)
-        
-        ttk.Button(zoom_frame, text="Fit", width=5,
-                command=self._fit_to_canvas).pack(side=tk.LEFT, padx=10)
-        
-        ttk.Button(zoom_frame, text="1:1", width=5,
-                command=self._set_zoom_1to1).pack(side=tk.LEFT)
+        ttk.Button(zoom_frame, text="+", width=3, command=self._zoom_in).pack(side=tk.LEFT)
+        ttk.Button(zoom_frame, text="Fit", width=5, command=self._fit_to_canvas).pack(side=tk.LEFT, padx=10)
+        ttk.Button(zoom_frame, text="1:1", width=5, command=self._set_zoom_1to1).pack(side=tk.LEFT)
 
     def _setup_right_panel(self):
         """오른쪽 패널: 결과 정보 + 파일 목록"""
-        right_frame = ttk.Frame(self.main_paned, width=280)
+        right_frame = ttk.Frame(self.main_paned, width=250)
         self.main_paned.add(right_frame, weight=0)
         
         # === 표시 옵션 ===
-        display_frame = ttk.LabelFrame(right_frame, text="표시 옵션", padding=10)
+        display_frame = ttk.LabelFrame(right_frame, text="표시", padding=5)
         display_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        ttk.Label(display_frame, text="표시 모드:").pack(anchor=tk.W)
         self.display_mode_var = tk.StringVar(value="vectors")
-        modes = [
-            ("변위 벡터", "vectors"),
-            ("변위 크기 (컬러맵)", "magnitude"),
-            ("ZNCC 맵", "zncc"),
-            ("불량 포인트", "invalid")
-        ]
+        modes = [("벡터", "vectors"), ("크기", "magnitude"), ("ZNCC", "zncc"), ("불량", "invalid")]
+        mode_frame = ttk.Frame(display_frame)
+        mode_frame.pack(fill=tk.X)
         for text, value in modes:
-            ttk.Radiobutton(display_frame, text=text, value=value,
+            ttk.Radiobutton(mode_frame, text=text, value=value,
                            variable=self.display_mode_var,
-                           command=self._update_display).pack(anchor=tk.W)
+                           command=self._update_display).pack(side=tk.LEFT)
         
         # === 결과 정보 ===
-        result_frame = ttk.LabelFrame(right_frame, text="분석 결과", padding=10)
+        result_frame = ttk.LabelFrame(right_frame, text="결과", padding=5)
         result_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        self.result_text = tk.Text(result_frame, height=12, width=30, 
-                                    state=tk.DISABLED, font=("Consolas", 9))
+        self.result_text = tk.Text(result_frame, height=10, width=28, 
+                                    state=tk.DISABLED, font=("Consolas", 8))
         result_scroll = ttk.Scrollbar(result_frame, orient=tk.VERTICAL,
                                        command=self.result_text.yview)
         self.result_text.configure(yscrollcommand=result_scroll.set)
-        
         self.result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         result_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
         # === 검증 결과 ===
-        valid_frame = ttk.LabelFrame(right_frame, text="검증 결과", padding=10)
+        valid_frame = ttk.LabelFrame(right_frame, text="검증", padding=5)
         valid_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        self.valid_text = tk.Text(valid_frame, height=6, width=30,
-                                   state=tk.DISABLED, font=("Consolas", 9))
+        self.valid_text = tk.Text(valid_frame, height=5, width=28,
+                                   state=tk.DISABLED, font=("Consolas", 8))
         self.valid_text.pack(fill=tk.BOTH, expand=True)
         
-        # === 파일 목록 (오른쪽 하단) ===
-        file_frame = ttk.LabelFrame(right_frame, text="이미지 시퀀스", padding=5)
+        # === 파일 목록 ===
+        file_frame = ttk.LabelFrame(right_frame, text="시퀀스", padding=5)
         file_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # 현재 위치 표시
-        nav_frame = ttk.Frame(file_frame)
-        nav_frame.pack(fill=tk.X, pady=(0, 5))
+        self.nav_label = ttk.Label(file_frame, text="0 / 0", font=("", 9, "bold"))
+        self.nav_label.pack(anchor=tk.W)
         
-        self.nav_label = ttk.Label(nav_frame, text="0 / 0", font=("", 10, "bold"))
-        self.nav_label.pack(side=tk.LEFT)
-        
-        # 파일 목록 (작은 리스트박스)
         list_frame = ttk.Frame(file_frame)
         list_frame.pack(fill=tk.BOTH, expand=True)
         
-        self.file_listbox = tk.Listbox(list_frame, height=6, font=("", 8),
-                                        selectmode=tk.SINGLE)
-        file_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
-                                     command=self.file_listbox.yview)
+        self.file_listbox = tk.Listbox(list_frame, height=8, font=("", 8), selectmode=tk.SINGLE)
+        file_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
         self.file_listbox.configure(yscrollcommand=file_scroll.set)
-        
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         file_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # 리스트 선택 이벤트
         self.file_listbox.bind('<<ListboxSelect>>', self._on_file_select)
     
     # === 콜백 메서드 ===
     
     def set_callback(self, name: str, callback: Callable):
-        """콜백 등록"""
         self.callbacks[name] = callback
     
     def _call(self, name: str, *args, **kwargs):
-        """콜백 호출"""
         if name in self.callbacks:
             return self.callbacks[name](*args, **kwargs)
     
     def _select_reference(self):
-        """Reference 이미지 선택"""
         self._call('select_reference')
     
     def _select_deformed(self):
-        """Deformed 이미지 선택"""
         self._call('select_deformed')
     
     def _select_sequence(self):
-        """시퀀스 폴더 선택"""
         self._call('select_sequence')
     
     def _sync_from_quality_tab(self):
-        """품질평가 탭에서 파라미터 가져오기"""
         self._call('sync_from_quality')
     
     def _run_analysis(self):
-        """단일 FFT-CC 분석 실행"""
         self._call('run_analysis', self.get_parameters())
     
     def _run_batch_analysis(self):
-        """배치 분석 실행"""
         self._call('run_batch_analysis', self.get_parameters())
     
     def _stop_analysis(self):
-        """분석 중지"""
         self._call('stop_analysis')
     
-    def _export_csv(self):
-        """CSV 내보내기"""
-        self._call('export_csv')
-    
-    def _export_image(self):
-        """이미지 내보내기"""
-        self._call('export_image')
-    
     def _update_display(self):
-        """표시 업데이트"""
         self._call('update_display', self.display_mode_var.get())
 
-    def _on_shape_func_changed(self):
-        """Shape function 변경 시"""
-        if self.shape_func_var.get() == 'quadratic':
-            # Quadratic은 더 큰 subset 권장
-            if self.icgn_subset_var.get() < 31:
-                self.icgn_subset_var.set(31)
+    def _toggle_gaussian_blur(self):
+        if self.gaussian_blur_var.get():
+            self.blur_kernel_combo.configure(state='readonly')
+        else:
+            self.blur_kernel_combo.configure(state='disabled')
 
     def _toggle_advanced_options(self):
-        """고급 옵션 표시/숨김"""
         if self.advanced_var.get():
             self.advanced_frame.pack(fill=tk.X, pady=(5, 0))
         else:
             self.advanced_frame.pack_forget()
     
     def _fit_to_canvas(self):
-        """캔버스에 맞추기"""
         self._call('fit_to_canvas')
     
-    def _on_zoom_changed(self, zoom_level: float):
-        """줌 변경 시"""
-        self.zoom_label.configure(text=f"{zoom_level * 100:.0f}%")
-    
     def _on_file_select(self, event):
-        """파일 목록에서 선택 시"""
         selection = self.file_listbox.curselection()
         if selection:
-            index = selection[0]
-            self._call('select_image_index', index)
-    # === 토글 메서드 ===
-    def _toggle_gaussian_blur(self):
-        """Gaussian Blur 옵션 표시/숨김"""
-        if self.gaussian_blur_var.get():
-            self.blur_kernel_frame.pack(anchor=tk.W, padx=(20, 0), pady=(2, 0))
-        else:
-            self.blur_kernel_frame.pack_forget()
-
-    def get_parameters(self) -> Dict[str, Any]:
-        """현재 파라미터 반환"""
-        # Gaussian blur 값 결정
-        gaussian_blur = None
-        if self.gaussian_blur_var.get():
-            gaussian_blur = self.blur_kernel_var.get()
-            
+            self._call('select_image_index', selection[0])
+    
     # === 공개 메서드 ===
     
     def get_parameters(self) -> Dict[str, Any]:
-        """현재 파라미터 반환"""
-        # Gaussian blur 값 결정
         gaussian_blur = None
         if self.gaussian_blur_var.get():
             gaussian_blur = self.blur_kernel_var.get()
         
         return {
-            # 공용 파라미터
             'subset_size': self.subset_var.get(),
             'spacing': self.spacing_var.get(),
             'search_range': self.search_var.get(),
             'zncc_threshold': self.zncc_var.get(),
-            # IC-GN 전용 파라미터
             'shape_function': self.shape_func_var.get(),
             'interpolation': self.interp_var.get(),
             'conv_threshold': self.conv_threshold_var.get(),
             'max_iter': self.max_iter_var.get(),
-            # 노이즈 제거
             'gaussian_blur': gaussian_blur,
         }
     
     def set_parameters(self, params: Dict[str, Any]):
-        """파라미터 설정 (품질평가에서 동기화 시 사용)"""
         if 'subset_size' in params:
             self.subset_var.set(params['subset_size'])
         if 'spacing' in params:
             self.spacing_var.set(params['spacing'])
-        if 'search_range' in params:
-            self.search_var.set(params.get('search_range', 50))
-        if 'zncc_threshold' in params:
-            self.zncc_var.set(params.get('zncc_threshold', 0.7))
     
     def update_reference_label(self, text: str):
-        """Reference 라벨 업데이트"""
-        self.ref_label.configure(text=text, foreground="black")
+        self.ref_label.configure(text=text[:20], foreground="black")
     
     def update_deformed_label(self, text: str):
-        """Deformed 라벨 업데이트"""
-        self.def_label.configure(text=text, foreground="black")
+        self.def_label.configure(text=text[:20], foreground="black")
     
     def update_sequence_label(self, text: str):
-        """시퀀스 라벨 업데이트"""
-        self.seq_label.configure(text=text, foreground="black")
+        self.seq_label.configure(text=text[:20], foreground="black")
     
     def update_file_list(self, files: List[Path], current_index: int = 0):
-        """파일 목록 업데이트"""
         self.sequence_files = files
         self.current_index = current_index
         
@@ -577,7 +419,6 @@ class DICTab(ttk.Frame):
         self._update_nav_label()
     
     def set_current_index(self, index: int):
-        """현재 인덱스 설정"""
         if 0 <= index < len(self.sequence_files):
             self.current_index = index
             self.file_listbox.selection_clear(0, tk.END)
@@ -586,33 +427,28 @@ class DICTab(ttk.Frame):
             self._update_nav_label()
     
     def _update_nav_label(self):
-        """네비게이션 라벨 업데이트"""
         total = len(self.sequence_files)
         current = self.current_index + 1 if total > 0 else 0
         self.nav_label.configure(text=f"{current} / {total}")
     
     def update_progress(self, value: float, text: str = ""):
-        """진행 상황 업데이트"""
         self.progress_var.set(value)
         if text:
             self.progress_label.configure(text=text)
     
     def update_result_text(self, text: str):
-        """결과 텍스트 업데이트"""
         self.result_text.configure(state=tk.NORMAL)
         self.result_text.delete(1.0, tk.END)
         self.result_text.insert(tk.END, text)
         self.result_text.configure(state=tk.DISABLED)
     
     def update_validation_text(self, text: str):
-        """검증 결과 텍스트 업데이트"""
         self.valid_text.configure(state=tk.NORMAL)
         self.valid_text.delete(1.0, tk.END)
         self.valid_text.insert(tk.END, text)
         self.valid_text.configure(state=tk.DISABLED)
     
     def set_analysis_state(self, running: bool):
-        """분석 상태에 따른 UI 업데이트"""
         state = tk.DISABLED if running else tk.NORMAL
         self.analyze_btn.configure(state=state)
         self.batch_btn.configure(state=state)

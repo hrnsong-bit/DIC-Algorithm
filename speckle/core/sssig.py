@@ -84,26 +84,45 @@ def estimate_noise_variance(image: np.ndarray, method: str = 'laplacian') -> flo
         return 4.0
 
 
-def estimate_noise_from_pair(image1: np.ndarray, image2: np.ndarray) -> float:
+def estimate_noise_from_pair(image1: np.ndarray, image2: np.ndarray, 
+                              roi: Optional[Tuple[int, int, int, int]] = None) -> float:
     """
-    두 장의 동일 조건 이미지에서 노이즈 분산 추정
-    (논문에서 권장하는 방법)
+    두 이미지 차이로 노이즈 표준편차 추정 (DIC Challenge 방식)
     
     Args:
         image1, image2: 동일 조건에서 촬영한 두 이미지
+        roi: 분석 영역 (x, y, w, h)
     
     Returns:
-        노이즈 분산 D(η)
+        노이즈 표준편차 (GL 단위)
     """
+    # 그레이스케일 변환
     if len(image1.shape) == 3:
-        image1 = cv2.cvtColor(image1, cv2.COLOR_BGR2GRAY)
-    if len(image2.shape) == 3:
-        image2 = cv2.cvtColor(image2, cv2.COLOR_BGR2GRAY)
+        gray1 = cv2.cvtColor(image1, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    else:
+        gray1 = image1.astype(np.float64)
     
-    diff = image1.astype(np.float64) - image2.astype(np.float64)
-    # Var(diff) = Var(η1) + Var(η2) = 2 * D(η)
-    return float(np.var(diff) / 2)
-
+    if len(image2.shape) == 3:
+        gray2 = cv2.cvtColor(image2, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    else:
+        gray2 = image2.astype(np.float64)
+    
+    # ROI 적용
+    if roi is not None:
+        x, y, w, h = roi
+        gray1 = gray1[y:y+h, x:x+w]
+        gray2 = gray2[y:y+h, x:x+w]
+    
+    # 차이 이미지
+    diff = gray1 - gray2
+    
+    # 평균 밝기 차이 제거 (DC 성분 제거)
+    diff = diff - np.mean(diff)
+    
+    # σ_noise = std(diff) / sqrt(2)
+    noise_std = np.std(diff) / np.sqrt(2)
+    
+    return noise_std
 
 def calculate_sssig_threshold(noise_variance: float, 
                                desired_accuracy: float = 0.01) -> float:

@@ -37,7 +37,7 @@ class SSSIGResult:
     noise_variance: float = 4.0
     threshold: float = 1e5
     predicted_accuracy: float = 0.01
-
+    
     @property
     def n_points(self) -> int:
         return len(self.points_y)
@@ -117,6 +117,8 @@ class BatchReport:
     # 통계
     mig_stats: Dict[str, float] = field(default_factory=dict)
     sssig_stats: Dict[str, float] = field(default_factory=dict)
+    noise_stats: Dict[str, float] = field(default_factory=dict)
+    accuracy_stats: Dict[str, float] = field(default_factory=dict)
     
     # 메타데이터
     total_processing_time: float = 0.0
