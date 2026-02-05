@@ -34,7 +34,10 @@ class SSSIGResult:
     points_x: np.ndarray               # POI x 좌표 배열
     subset_size: int = 21              # 사용된 subset 크기
     spacing: int = 10                  # 사용된 spacing
-    
+    noise_variance: float = 4.0
+    threshold: float = 1e5
+    predicted_accuracy: float = 0.01
+
     @property
     def n_points(self) -> int:
         return len(self.points_y)
@@ -76,6 +79,9 @@ class QualityReport:
     # 메타데이터
     image_shape: tuple = (0, 0)
     processing_time: float = 0.0
+    
+    noise_variance: Optional[float] = None
+    predicted_accuracy: Optional[float] = None
     
     def __post_init__(self):
         self._update_grade()

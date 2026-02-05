@@ -35,7 +35,48 @@ class DICTab(ttk.Frame):
         self.sequence_files: List[Path] = []
         
         self._setup_ui()
-    
+        self._setup_key_bindings()  # 여기에 추가
+
+    def _setup_key_bindings(self):
+        """키보드 바인딩 설정"""
+        # 탭 자체에 바인딩
+        self.bind('<Left>', self._on_key_left)
+        self.bind('<Right>', self._on_key_right)
+        self.bind('<Up>', self._on_key_up)
+        self.bind('<Down>', self._on_key_down)
+        
+        # 캔버스에도 바인딩 (포커스가 캔버스에 있을 때도 작동하도록)
+        self.canvas_view.canvas.bind('<Left>', self._on_key_left)
+        self.canvas_view.canvas.bind('<Right>', self._on_key_right)
+        self.canvas_view.canvas.bind('<Up>', self._on_key_up)
+        self.canvas_view.canvas.bind('<Down>', self._on_key_down)
+
+    def _on_key_left(self, event):
+        """왼쪽 방향키: 이전 이미지"""
+        if self.sequence_files and self.current_index > 0:
+            self._call('select_image_index', self.current_index - 1)
+        return "break"
+
+    def _on_key_right(self, event):
+        """오른쪽 방향키: 다음 이미지"""
+        if self.sequence_files and self.current_index < len(self.sequence_files) - 1:
+            self._call('select_image_index', self.current_index + 1)
+        return "break"
+
+    def _on_key_up(self, event):
+        """위 방향키: 10장 이전"""
+        if self.sequence_files:
+            new_index = max(0, self.current_index - 10)
+            self._call('select_image_index', new_index)
+        return "break"
+
+    def _on_key_down(self, event):
+        """아래 방향키: 10장 다음"""
+        if self.sequence_files:
+            new_index = min(len(self.sequence_files) - 1, self.current_index + 10)
+            self._call('select_image_index', new_index)
+        return "break"
+
     def _setup_ui(self):
         """UI 구성"""
         # 메인 PanedWindow (좌-중앙-우 분할)
@@ -127,7 +168,7 @@ class DICTab(ttk.Frame):
         
         # Spacing
         ttk.Label(param_frame, text="Spacing (px):").pack(anchor=tk.W)
-        self.spacing_var = tk.IntVar(value=10)
+        self.spacing_var = tk.IntVar(value=16)
         self.spacing_spin = ttk.Spinbox(param_frame, from_=1, to=50,
                                          textvariable=self.spacing_var, width=10)
         self.spacing_spin.pack(anchor=tk.W, pady=(0, 5))
@@ -160,17 +201,17 @@ class DICTab(ttk.Frame):
         # === 분석 섹션 ===
         analysis_frame = ttk.LabelFrame(self.left_content, text="분석", padding=10)
         analysis_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # 단일 분석 버튼
-        self.analyze_btn = ttk.Button(analysis_frame, text="FFT-CC 분석",
-                                       command=self._run_analysis)
+
+        # 현재 이미지 분석 버튼
+        self.analyze_btn = ttk.Button(analysis_frame, text="현재 이미지 분석",
+                                    command=self._run_analysis)
         self.analyze_btn.pack(fill=tk.X, pady=(0, 5))
-        
-        # 배치 분석 버튼
+
+        # 전체 시퀀스 분석 버튼
         self.batch_btn = ttk.Button(analysis_frame, text="전체 시퀀스 분석",
-                                     command=self._run_batch_analysis)
+                                    command=self._run_batch_analysis)
         self.batch_btn.pack(fill=tk.X, pady=(0, 5))
-        
+                
         # 진행 상황
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_bar = ttk.Progressbar(analysis_frame, variable=self.progress_var,
@@ -196,7 +237,53 @@ class DICTab(ttk.Frame):
         self.export_img_btn = ttk.Button(export_frame, text="변위 이미지 저장",
                                           command=self._export_image)
         self.export_img_btn.pack(fill=tk.X)
-    
+
+        # === 서브픽셀 최적화 섹션 ===
+        subpix_frame = ttk.LabelFrame(self.left_content, text="서브픽셀 최적화 (IC-GN)", padding=10)
+        subpix_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Shape Function 선택
+        ttk.Label(subpix_frame, text="Shape Function:").pack(anchor=tk.W)
+        self.shape_func_var = tk.StringVar(value='affine')
+
+        shape_frame = ttk.Frame(subpix_frame)
+        shape_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Radiobutton(shape_frame, text="Affine (6 params)", 
+                        value='affine', variable=self.shape_func_var).pack(anchor=tk.W)
+        ttk.Radiobutton(shape_frame, text="Quadratic (12 params)", 
+                        value='quadratic', variable=self.shape_func_var).pack(anchor=tk.W)
+
+        # 보간 방법
+        ttk.Label(subpix_frame, text="보간 방법:").pack(anchor=tk.W)
+        self.interp_var = tk.StringVar(value='bicubic')
+        interp_frame = ttk.Frame(subpix_frame)
+        interp_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Radiobutton(interp_frame, text="Bicubic (빠름)", 
+                        value='bicubic', variable=self.interp_var).pack(anchor=tk.W)
+        ttk.Radiobutton(interp_frame, text="Biquintic (정확)", 
+                        value='biquintic', variable=self.interp_var).pack(anchor=tk.W)
+
+        # 고급 옵션 (접힘)
+        self.advanced_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(subpix_frame, text="고급 옵션 표시", 
+                        variable=self.advanced_var,
+                        command=self._toggle_advanced_options).pack(anchor=tk.W, pady=(5, 0))
+
+        self.advanced_frame = ttk.Frame(subpix_frame)
+
+        # 수렴 조건
+        ttk.Label(self.advanced_frame, text="수렴 기준:").pack(anchor=tk.W)
+        self.conv_threshold_var = tk.DoubleVar(value=0.001)
+        ttk.Entry(self.advanced_frame, textvariable=self.conv_threshold_var, width=10).pack(anchor=tk.W, pady=(0, 5))
+
+        # 최대 반복
+        ttk.Label(self.advanced_frame, text="최대 반복:").pack(anchor=tk.W)
+        self.max_iter_var = tk.IntVar(value=50)
+        ttk.Spinbox(self.advanced_frame, from_=10, to=200, increment=10,
+                    textvariable=self.max_iter_var, width=10).pack(anchor=tk.W)
+
     def _setup_center_panel(self):
         """중앙 패널: 캔버스"""
         center_frame = ttk.Frame(self.main_paned)
@@ -349,6 +436,19 @@ class DICTab(ttk.Frame):
         """표시 업데이트"""
         self._call('update_display', self.display_mode_var.get())
 
+    def _on_shape_func_changed(self):
+        """Shape function 변경 시"""
+        if self.shape_func_var.get() == 'quadratic':
+            # Quadratic은 더 큰 subset 권장
+            if self.icgn_subset_var.get() < 31:
+                self.icgn_subset_var.set(31)
+
+    def _toggle_advanced_options(self):
+        """고급 옵션 표시/숨김"""
+        if self.advanced_var.get():
+            self.advanced_frame.pack(fill=tk.X, pady=(5, 0))
+        else:
+            self.advanced_frame.pack_forget()
     
     def _fit_to_canvas(self):
         """캔버스에 맞추기"""
@@ -370,10 +470,16 @@ class DICTab(ttk.Frame):
     def get_parameters(self) -> Dict[str, Any]:
         """현재 파라미터 반환"""
         return {
+            # 공용 파라미터
             'subset_size': self.subset_var.get(),
             'spacing': self.spacing_var.get(),
             'search_range': self.search_var.get(),
-            'zncc_threshold': self.zncc_var.get()
+            'zncc_threshold': self.zncc_var.get(),
+            # IC-GN 전용 파라미터
+            'shape_function': self.shape_func_var.get(),
+            'interpolation': self.interp_var.get(),
+            'conv_threshold': self.conv_threshold_var.get(),
+            'max_iter': self.max_iter_var.get(),
         }
     
     def set_parameters(self, params: Dict[str, Any]):

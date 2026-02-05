@@ -127,7 +127,13 @@ def compute_icgn(
     def process_poi(idx: int) -> Tuple[int, np.ndarray, float, int, bool]:
         px = points_x[idx]
         py = points_y[idx]
+        # 디버그 (처음 3개만)
+        if idx < 3:
+            print(f"[DEBUG] IC-GN POI[{idx}]: 위치=({px}, {py}), 초기변위=({initial_guess.disp_u[idx]}, {initial_guess.disp_v[idx]})")
         
+        # FFTCC 결과가 유효하지 않으면 스킵
+        if not initial_guess.valid_mask[idx]:
+            return idx, np.zeros(n_params), 0.0, 0, False
         # FFTCC 결과가 유효하지 않으면 스킵
         if not initial_guess.valid_mask[idx]:
             return idx, np.zeros(n_params), 0.0, 0, False
@@ -271,11 +277,18 @@ def _icgn_iterate(
     conv = False
     zncc = 0.0
     
-    # 수렴 체크용 인덱스 (u, v 위치)
+    # 수렴/발산 체크용 인덱스 (u, v 위치)
     if shape_function == 'affine':
         u_idx, v_idx = 0, 3
     else:  # quadratic
         u_idx, v_idx = 0, 6
+    
+    # 초기값 저장 (발산 판정용)
+    p_initial_u = p[u_idx]
+    p_initial_v = p[v_idx]
+    
+    # 발산 임계값: 초기값에서 너무 벗어나면 발산으로 판정
+    max_displacement_change = 5.0  # 초기값 대비 최대 허용 변화 (픽셀)
     
     for iteration in range(max_iterations):
         n_iter = iteration + 1
@@ -301,6 +314,11 @@ def _icgn_iterate(
         znssd = _compute_znssd(f, f_mean, f_tilde, g, g_mean, g_tilde)
         zncc = 1.0 - 0.5 * znssd
         
+        # ===== 발산 체크 1: ZNCC가 너무 낮으면 발산 =====
+        if zncc < 0.5:
+            conv = False
+            break
+        
         # Residual 계산
         residual = (f - f_mean) - (f_tilde / g_tilde) * (g - g_mean)
         
@@ -308,23 +326,35 @@ def _icgn_iterate(
         b = -J.T @ residual
         dp = H_inv @ b
         
+        # ===== 발산 체크 2: 업데이트가 너무 크면 발산 =====
+        dp_norm = np.sqrt(dp[u_idx]**2 + dp[v_idx]**2)
+        if dp_norm > 2.0:  # 한 번에 2픽셀 이상 점프하면 발산
+            conv = False
+            break
+        
         # 디버그 출력
         if debug and iteration < 5:
             print(f"    iter {iteration}: p=[{p[u_idx]:.4f}, {p[v_idx]:.4f}], "
                   f"dp=[{dp[u_idx]:.4f}, {dp[v_idx]:.4f}], zncc={zncc:.4f}")
         
         # 수렴 체크
-        dp_norm = np.sqrt(dp[u_idx]**2 + dp[v_idx]**2)
-        
         if dp_norm < convergence_threshold:
             conv = True
             break
         
         # Inverse compositional update
         p = update_warp_inverse_compositional(p, dp, shape_function)
+        
+        # ===== 발산 체크 3: 초기값에서 너무 벗어나면 발산 =====
+        displacement_change_u = abs(p[u_idx] - p_initial_u)
+        displacement_change_v = abs(p[v_idx] - p_initial_v)
+        
+        if displacement_change_u > max_displacement_change or \
+           displacement_change_v > max_displacement_change:
+            conv = False
+            break
     
     return p, zncc, n_iter, conv
-
 
 # ===== 전처리 함수 =====
 

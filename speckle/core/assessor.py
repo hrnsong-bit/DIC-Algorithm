@@ -8,7 +8,13 @@ from typing import Optional, Tuple, Callable, Dict
 from ..models.reports import BadPoint, SSSIGResult, QualityReport, BatchReport
 from ..utils.logger import logger
 from .mig import compute_mig
-from .sssig import compute_sssig_map, find_optimal_subset_size, warmup_numba
+from .sssig import (
+    compute_sssig_map, 
+    find_optimal_subset_size, 
+    warmup_numba,
+    estimate_noise_variance,
+    calculate_sssig_threshold
+)
 
 
 class SpeckleQualityAssessor:
@@ -28,23 +34,26 @@ class SpeckleQualityAssessor:
                  sssig_threshold: float = 1e5,
                  subset_size: int = 21,
                  poi_spacing: int = 10,
-                 auto_find_size: bool = True):
+                 auto_find_size: bool = True,
+                 desired_accuracy: float = 0.02):
         """
         Args:
             mig_threshold: MIG 임계값 (기본 30.0)
-            sssig_threshold: SSSIG 임계값 (기본 1e5)
+            sssig_threshold: SSSIG 임계값 (기본 1e5, 자동 계산 시 무시)
             subset_size: 초기 subset 크기 (기본 21)
             poi_spacing: POI 간격 (기본 10)
             auto_find_size: 자동 최적 크기 탐색 여부
+            desired_accuracy: 원하는 변위 측정 정확도 (pixels, 기본 0.01)
         """
         self.mig_threshold = mig_threshold
         self.sssig_threshold = sssig_threshold
         self.subset_size = subset_size
         self.poi_spacing = poi_spacing
         self.auto_find_size = auto_find_size
+        self.desired_accuracy = desired_accuracy
         
         warmup_numba()
-        logger.debug(f"SpeckleQualityAssessor 초기화: MIG={mig_threshold}, SSSIG={sssig_threshold}")
+        logger.debug(f"SpeckleQualityAssessor 초기화: MIG={mig_threshold}, desired_accuracy={desired_accuracy}")
     
     def evaluate(self, image: np.ndarray, 
                  roi: Optional[Tuple[int, int, int, int]] = None) -> QualityReport:
@@ -58,6 +67,8 @@ class SpeckleQualityAssessor:
         Returns:
             QualityReport 객체
         """
+        print(f"[DEBUG] assessor.poi_spacing = {self.poi_spacing}")
+        print(f"[DEBUG] assessor.desired_accuracy = {self.desired_accuracy}")
         start_time = time.time()
         warnings = []
         
@@ -81,6 +92,10 @@ class SpeckleQualityAssessor:
         if mean_intensity < 30:
             warnings.append(f"ROI 평균 밝기가 낮음 ({mean_intensity:.1f}) - 배경 포함 가능성")
         
+        # ====== 노이즈 분산 추정 ======
+        noise_variance = estimate_noise_variance(roi_gray)
+        calculated_threshold = calculate_sssig_threshold(noise_variance, self.desired_accuracy)
+        
         # ====== Stage 1: MIG ======
         mig = compute_mig(roi_gray)
         mig_pass = mig >= self.mig_threshold
@@ -93,35 +108,51 @@ class SpeckleQualityAssessor:
                 mig_threshold=self.mig_threshold,
                 sssig_result=None,
                 sssig_pass=False,
-                sssig_threshold=self.sssig_threshold,
+                sssig_threshold=calculated_threshold,
                 recommended_subset_size=self.subset_size,
                 subset_size_found=False,
                 current_subset_size=self.subset_size,
                 analyzable=False,
                 warnings=warnings,
                 image_shape=image_shape,
-                processing_time=time.time() - start_time
+                processing_time=time.time() - start_time,
+                noise_variance=noise_variance,
+                predicted_accuracy=None
             )
         
         # ====== Stage 2: SSSIG ======
         if self.auto_find_size:
-            optimal_size, size_found, sssig_result = find_optimal_subset_size(
+            # 1. 최적 size 찾기 (권장용만)
+            optimal_size, size_found, _, info = find_optimal_subset_size(
                 roi_gray,
                 spacing=self.poi_spacing,
-                threshold=self.sssig_threshold,
+                desired_accuracy=self.desired_accuracy,
+                noise_variance=noise_variance,
                 min_size=11,
                 max_size=61
             )
             recommended_size = optimal_size
+            
+            # 2. 현재 설정(GUI) 기준으로 결과 계산 (표시/CSV용)
+            sssig_result = compute_sssig_map(
+                roi_gray,
+                subset_size=self.subset_size,   # GUI 설정값 (21)
+                spacing=self.poi_spacing,        # GUI 설정값 (16)
+                noise_variance=noise_variance,
+                desired_accuracy=self.desired_accuracy
+            )
+            predicted_accuracy = sssig_result.predicted_accuracy if sssig_result else None
         else:
             sssig_result = compute_sssig_map(
                 roi_gray,
                 subset_size=self.subset_size,
                 spacing=self.poi_spacing,
-                threshold=self.sssig_threshold
+                noise_variance=noise_variance,
+                desired_accuracy=self.desired_accuracy
             )
             recommended_size = self.subset_size
             size_found = len(sssig_result.bad_points) == 0
+            predicted_accuracy = sssig_result.predicted_accuracy if sssig_result else None
         
         if sssig_result and len(sssig_result.points_y) == 0:
             warnings.append("유효한 POI가 없음 - ROI 확인 필요")
@@ -137,8 +168,14 @@ class SpeckleQualityAssessor:
         if not size_found:
             warnings.append("최대 크기(61px)로도 모든 POI 통과 불가")
         
+        # 예상 정확도가 목표보다 나쁘면 경고
+        if predicted_accuracy and predicted_accuracy > self.desired_accuracy:
+            warnings.append(
+                f"예상 정확도 {predicted_accuracy:.4f}px > 목표 {self.desired_accuracy}px"
+            )
+        
         processing_time = time.time() - start_time
-        logger.info(f"평가 완료: MIG={mig:.2f}, 처리시간={processing_time:.3f}s")
+        logger.info(f"평가 완료: MIG={mig:.2f}, 노이즈분산={noise_variance:.2f}, 처리시간={processing_time:.3f}s")
         
         return QualityReport(
             mig=mig,
@@ -146,14 +183,16 @@ class SpeckleQualityAssessor:
             mig_threshold=self.mig_threshold,
             sssig_result=sssig_result,
             sssig_pass=sssig_pass,
-            sssig_threshold=self.sssig_threshold,
+            sssig_threshold=calculated_threshold,
             recommended_subset_size=recommended_size,
             subset_size_found=size_found,
             current_subset_size=self.subset_size,
             analyzable=mig_pass and sssig_pass,
             warnings=warnings,
             image_shape=image_shape,
-            processing_time=processing_time
+            processing_time=processing_time,
+            noise_variance=noise_variance,
+            predicted_accuracy=predicted_accuracy
         )
     
     def evaluate_batch(self, 
@@ -173,6 +212,8 @@ class SpeckleQualityAssessor:
         
         mig_values = []
         sssig_min_values = []
+        noise_variances = []
+        predicted_accuracies = []
         
         logger.info(f"배치 평가 시작: {total}개 이미지")
         
@@ -185,6 +226,12 @@ class SpeckleQualityAssessor:
                 individual_reports[filename] = report
                 
                 mig_values.append(report.mig)
+                
+                if report.noise_variance:
+                    noise_variances.append(report.noise_variance)
+                
+                if report.predicted_accuracy:
+                    predicted_accuracies.append(report.predicted_accuracy)
                 
                 if report.sssig_result and len(report.sssig_result.points_y) > 0:
                     sssig_min_values.append(report.sssig_result.min)
@@ -232,6 +279,16 @@ class SpeckleQualityAssessor:
                 'mean': float(np.mean(sssig_min_values)) if sssig_min_values else 0.0,
                 'min': float(np.min(sssig_min_values)) if sssig_min_values else 0.0,
                 'max': float(np.max(sssig_min_values)) if sssig_min_values else 0.0
+            },
+            noise_stats={
+                'mean': float(np.mean(noise_variances)) if noise_variances else 0.0,
+                'min': float(np.min(noise_variances)) if noise_variances else 0.0,
+                'max': float(np.max(noise_variances)) if noise_variances else 0.0
+            },
+            accuracy_stats={
+                'mean': float(np.mean(predicted_accuracies)) if predicted_accuracies else 0.0,
+                'min': float(np.min(predicted_accuracies)) if predicted_accuracies else 0.0,
+                'max': float(np.max(predicted_accuracies)) if predicted_accuracies else 0.0
             },
             total_processing_time=total_time
         )

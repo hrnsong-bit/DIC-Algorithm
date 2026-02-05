@@ -17,6 +17,7 @@ from speckle.io import load_image, get_image_files
 
 from ..models.app_state import AppState
 
+from speckle.core.optimization import compute_icgn
 
 @dataclass
 class DICState:
@@ -37,12 +38,12 @@ class DICState:
     pan_offset: tuple = (0, 0)
     
     fft_cc_result: Optional[FFTCCResult] = None
+    icgn_result: Optional[Any] = None 
     validation_result: Optional[ValidationResult] = None
-    batch_results: Dict[str, FFTCCResult] = field(default_factory=dict)
+    batch_results: Dict[str, Any] = field(default_factory=dict)
     
     is_running: bool = False
     should_stop: bool = False
-
 
 class DICController:
     """DIC 분석 컨트롤러"""
@@ -198,11 +199,13 @@ class DICController:
         
         if 0 <= index < len(self.state.sequence_files):
             self.state.current_index = index
+            self.view.current_index = index  # 뷰 상태도 동기화
             path = self.state.sequence_files[index]
             
             self._load_deformed(path)
             self.view.set_current_index(index)
             
+            # 기존 결과가 있으면 표시
             if path.name in self.state.batch_results:
                 result = self.state.batch_results[path.name]
                 self.state.fft_cc_result = result
@@ -212,27 +215,51 @@ class DICController:
                 self.state.fft_cc_result = None
                 self._refresh_display()
     
-    def _update_result_ui(self, result: FFTCCResult):
-        """결과 UI 업데이트"""
+    def _update_result_ui(self, result):
+        """결과 UI 업데이트 (FFTCCResult, ICGNResult 둘 다 지원)"""
+        if result is None:
+            return
+            
         u_min = np.min(result.disp_u) if len(result.disp_u) > 0 else 0
         u_max = np.max(result.disp_u) if len(result.disp_u) > 0 else 0
         v_min = np.min(result.disp_v) if len(result.disp_v) > 0 else 0
         v_max = np.max(result.disp_v) if len(result.disp_v) > 0 else 0
         
-        text = f"""총 POI: {result.n_points}
-유효 포인트: {result.n_valid}
-불량 포인트: {result.n_invalid}
-유효율: {result.valid_ratio * 100:.1f}%
-평균 ZNCC: {result.mean_zncc:.4f}
+        # ICGNResult인지 확인
+        is_icgn = hasattr(result, 'converged')
+        
+        if is_icgn:
+            text = f"""=== IC-GN 결과 ===
+    Shape Function: {result.shape_function}
+    총 POI: {result.n_points}
+    수렴: {result.n_converged} ({result.convergence_rate*100:.1f}%)
+    유효: {result.n_valid}
+    평균 반복: {result.mean_iterations:.1f}
+    평균 ZNCC: {result.mean_zncc:.4f}
 
-변위 범위:
-  U: [{u_min}, {u_max}] px
-  V: [{v_min}, {v_max}] px
+    변위 범위:
+    U: [{u_min:.4f}, {u_max:.4f}] px
+    V: [{v_min:.4f}, {v_max:.4f}] px
 
-처리 시간: {result.processing_time:.2f}초"""
+    처리 시간: {result.processing_time:.2f}초"""
+        else:
+            # FFTCCResult
+            text = f"""=== FFTCC 결과 ===
+    총 POI: {result.n_points}
+    유효 포인트: {result.n_valid}
+    불량 포인트: {result.n_invalid}
+    유효율: {result.valid_ratio * 100:.1f}%
+    평균 ZNCC: {result.mean_zncc:.4f}
+
+    변위 범위:
+    U: [{u_min:.4f}, {u_max:.4f}] px
+    V: [{v_min:.4f}, {v_max:.4f}] px
+
+    처리 시간: {result.processing_time:.2f}초"""
         
         self.view.update_result_text(text)
-    
+
+
     # ===== 동기화 (핵심 수정) =====
     
     def sync_from_quality_tab(self):
@@ -279,7 +306,13 @@ class DICController:
             
             # ROI 동기화
             self.state.roi = self.app_state.roi
-            
+                # ===== 여기에 디버그 추가 =====
+            print(f"\n[DEBUG] ===== 동기화 확인 =====")
+            print(f"[DEBUG] app_state.roi: {self.app_state.roi}")
+            print(f"[DEBUG] self.state.roi: {self.state.roi}")
+            print(f"[DEBUG] ================================\n")
+            # ===== 디버그 끝 ====
+
             # 파라미터 동기화
             if self.main_controller:
                 quality_params = self.main_controller.get_current_parameters()
@@ -309,9 +342,8 @@ class DICController:
             messagebox.showerror("오류", f"동기화 실패: {e}")
     
     # ===== 분석 =====
-    
     def run_fft_cc(self, params: Dict[str, Any]):
-        """FFT-CC 분석 실행 (단일)"""
+        """FFT-CC + IC-GN 분석 실행"""
         if self.state.ref_image is None or self.state.def_image is None:
             messagebox.showwarning("경고", "Reference와 Deformed 이미지를 모두 선택해주세요.")
             return
@@ -327,18 +359,19 @@ class DICController:
         
         def worker():
             error_msg = None
-            result = None
-            validation = None
+            fftcc_result = None
+            icgn_result = None
             
             try:
-                def progress_callback(current, total):
+                # === 1단계: FFTCC ===
+                def fftcc_progress(current, total):
                     if self.state.should_stop:
                         raise InterruptedError("사용자 중단")
-                    progress = (current / total) * 100
+                    progress = (current / total) * 50  # 0-50%
                     self.view.after(0, lambda p=progress, c=current, t=total: 
-                                    self.view.update_progress(p, f"처리 중: {c}/{t}"))
+                                    self.view.update_progress(p, f"FFTCC: {c}/{t}"))
                 
-                result = compute_fft_cc(
+                fftcc_result = compute_fft_cc(
                     self.state.ref_image,
                     self.state.def_image,
                     subset_size=params['subset_size'],
@@ -346,40 +379,103 @@ class DICController:
                     search_range=params['search_range'],
                     zncc_threshold=params['zncc_threshold'],
                     roi=self.state.roi,
-                    progress_callback=progress_callback
+                    progress_callback=fftcc_progress
                 )
                 
-                print(f"[DEBUG] 분석 완료 - POI: {result.n_points}, Valid: {result.n_valid}")
+                print(f"[DEBUG] FFTCC 완료 - POI: {fftcc_result.n_points}, Valid: {fftcc_result.n_valid}")
+                print(f"[DEBUG] FFTCC U range: [{np.min(fftcc_result.disp_u):.4f}, {np.max(fftcc_result.disp_u):.4f}]")
+                print(f"[DEBUG] FFTCC V range: [{np.min(fftcc_result.disp_v):.4f}, {np.max(fftcc_result.disp_v):.4f}]")
+                print(f"[DEBUG] FFTCC Mean ZNCC: {fftcc_result.mean_zncc:.4f}")
+
+                if self.state.should_stop:
+                    raise InterruptedError("사용자 중단")
                 
-                validation = validate_displacement_field(
-                    result,
-                    zncc_threshold=params['zncc_threshold']
+                # === 2단계: IC-GN ===
+                self.view.after(0, lambda: self.view.update_progress(50, "IC-GN 시작..."))
+                
+                def icgn_progress(current, total):
+                    if self.state.should_stop:
+                        raise InterruptedError("사용자 중단")
+                    progress = 50 + (current / total) * 50  # 50-100%
+                    self.view.after(0, lambda p=progress, c=current, t=total: 
+                                    self.view.update_progress(p, f"IC-GN: {c}/{t}"))
+                
+                # 보간 차수 변환 (bicubic=3, biquintic=5)
+                interp_order = 5 if params['interpolation'] == 'biquintic' else 3
+                
+                icgn_result = compute_icgn(
+                    self.state.ref_image,
+                    self.state.def_image,
+                    initial_guess=fftcc_result,
+                    subset_size=params['subset_size'],
+                    shape_function=params['shape_function'],
+                    interpolation_order=interp_order,
+                    convergence_threshold=params['conv_threshold'],
+                    max_iterations=params['max_iter'],
+                    progress_callback=icgn_progress
                 )
-                
-                self.state.fft_cc_result = result
-                self.state.validation_result = validation
+                print(f"\n[DEBUG] ===== IC-GN 입력 확인 =====")
+                print(f"[DEBUG] ROI: {self.state.roi}")
+                print(f"[DEBUG] Ref image shape: {self.state.ref_image.shape}")
+                print(f"[DEBUG] Def image shape: {self.state.def_image.shape}")
+                print(f"[DEBUG] FFTCC points_x range: [{np.min(fftcc_result.points_x)}, {np.max(fftcc_result.points_x)}]")
+                print(f"[DEBUG] FFTCC points_y range: [{np.min(fftcc_result.points_y)}, {np.max(fftcc_result.points_y)}]")
+                print(f"[DEBUG] FFTCC disp_u (처음 5개): {fftcc_result.disp_u[:5]}")
+                print(f"[DEBUG] FFTCC disp_v (처음 5개): {fftcc_result.disp_v[:5]}")
+                # 첫 번째 POI 상세 확인
+                idx = 0
+                px, py = fftcc_result.points_x[idx], fftcc_result.points_y[idx]
+                du, dv = fftcc_result.disp_u[idx], fftcc_result.disp_v[idx]
+                print(f"[DEBUG] 첫 POI: 위치=({px}, {py}), FFTCC변위=({du}, {dv})")
+
+                if self.state.roi:
+                    rx, ry, rw, rh = self.state.roi
+                    print(f"[DEBUG] 첫 POI 전체이미지 좌표: ({px + rx}, {py + ry})")
+                print(f"[DEBUG] ================================\n")
+
+                self.state.fft_cc_result = fftcc_result  # 로그용 보관
+                self.state.icgn_result = icgn_result     # 최종 결과
                 
                 if self.state.def_path:
-                    self.state.batch_results[self.state.def_path.name] = result
+                    self.state.batch_results[self.state.def_path.name] = icgn_result
                 
             except InterruptedError:
                 self.view.after(0, lambda: self.view.update_progress(0, "중단됨"))
             except Exception as ex:
                 error_msg = str(ex)
                 print(f"[DEBUG] 분석 오류: {error_msg}")
+                import traceback
+                traceback.print_exc()
             finally:
                 self.state.is_running = False
                 
                 if error_msg:
                     self.view.after(0, lambda msg=error_msg: self._show_error(msg))
-                elif result and validation:
-                    self.view.after(0, lambda r=result, v=validation: self._on_analysis_complete(r, v))
+                elif icgn_result:
+                    self.view.after(0, lambda r=icgn_result: self._on_icgn_complete(r))
                 
                 self.view.after(0, lambda: self.view.set_analysis_state(False))
         
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
-    
+
+    def _on_icgn_complete(self, result):
+        """IC-GN 분석 완료 처리"""
+        self.view.update_progress(100, "완료")
+        
+        # 결과 표시용으로 저장 (시각화에 사용)
+        self.state.fft_cc_result = result  # ICGNResult도 동일한 인터페이스 사용
+        self._refresh_display()
+        self._update_result_ui(result)
+        
+        # 검증 결과 (간단히)
+        valid_text = f"""수렴율: {result.convergence_rate * 100:.1f}%
+    유효 POI: {result.n_valid}/{result.n_points}
+    평균 반복: {result.mean_iterations:.1f}회
+    평균 ZNCC: {result.mean_zncc:.4f}"""
+        
+        self.view.update_validation_text(valid_text)
+
     def _show_error(self, msg: str):
         messagebox.showerror("오류", f"분석 실패: {msg}")
     
@@ -394,11 +490,10 @@ class DICController:
             self._run_batch_streaming(params)
     
     def _run_batch_cached(self, params: Dict[str, Any]):
-        """캐시된 이미지로 배치 분석 (가장 빠름)"""
+        """캐시된 이미지로 배치 분석 (FFTCC + IC-GN)"""
         if self.state.is_running:
             return
         
-        # 로딩 중이면 경고
         if self.app_state.loading_state.is_loading:
             result = messagebox.askyesno(
                 "로딩 중",
@@ -414,16 +509,12 @@ class DICController:
         self.state.batch_results.clear()
         self.view.set_analysis_state(True)
         
-        print(f"[DEBUG] 캐시 배치 분석 시작")
-        print(f"[DEBUG] 캐시된 이미지: {len(self.app_state.images)}장")
-        print(f"[DEBUG] 메모리 사용: {self.app_state.memory_usage_mb:.1f}MB")
-        print(f"[DEBUG] ROI: {self.state.roi}")
+        print(f"[DEBUG] 캐시 배치 분석 시작 (FFTCC + IC-GN)")
         
         def worker():
             error_msg = None
             
             try:
-                # 분석할 파일 목록 (Reference 제외, 캐시에 있는 것만)
                 all_files = self.state.sequence_files[1:] if self.state.sequence_files else self.app_state.file_paths[1:]
                 cached_files = [f for f in all_files if f.name in self.app_state.images]
                 
@@ -433,46 +524,65 @@ class DICController:
                 total_files = len(cached_files)
                 print(f"[DEBUG] 분석 대상: {total_files}개 파일")
                 
-                # 캐시에서 이미지 가져오는 함수
-                def get_cached_image(path: Path) -> Optional[np.ndarray]:
-                    return self.app_state.get_image(path.name)
-                
-                # 진행 콜백
-                def progress_callback(current, total, filename):
+                for file_idx, def_path in enumerate(cached_files):
                     if self.state.should_stop:
-                        raise InterruptedError("사용자 중단")
+                        break
                     
-                    progress = (current / total) * 100 if total > 0 else 0
-                    self.view.after(0, lambda p=progress, c=current, t=total, fn=filename:
-                                   self.view.update_progress(p, f"분석 중 {c}/{t}: {fn}"))
-                    self.view.after(0, lambda idx=current: self.view.set_current_index(idx))
+                    filename = def_path.name
+                    
+                    # 진행률 업데이트
+                    progress = (file_idx / total_files) * 100
+                    self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
+                                self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
+                    self.view.after(0, lambda idx=file_idx+1: self.view.set_current_index(idx))
+                    
+                    # 캐시에서 이미지 가져오기
+                    def_image = self.app_state.get_image(filename)
+                    if def_image is None:
+                        continue
+                    
+                    # === 1단계: FFTCC ===
+                    fftcc_result = compute_fft_cc(
+                        self.state.ref_image,
+                        def_image,
+                        subset_size=params['subset_size'],
+                        spacing=params['spacing'],
+                        search_range=params['search_range'],
+                        zncc_threshold=params['zncc_threshold'],
+                        roi=self.state.roi
+                    )
+                    print(f"\n[DEBUG] ===== {filename} =====")
+                    print(f"[DEBUG] FFTCC U: [{np.min(fftcc_result.disp_u)}, {np.max(fftcc_result.disp_u)}]")
+                    print(f"[DEBUG] FFTCC V: [{np.min(fftcc_result.disp_v)}, {np.max(fftcc_result.disp_v)}]")
+
+                    # === 2단계: IC-GN ===
+                    interp_order = 5 if params['interpolation'] == 'biquintic' else 3
+                    
+                    icgn_result = compute_icgn(
+                        self.state.ref_image,
+                        def_image,
+                        initial_guess=fftcc_result,
+                        subset_size=params['subset_size'],
+                        shape_function=params['shape_function'],
+                        interpolation_order=interp_order,
+                        convergence_threshold=params['conv_threshold'],
+                        max_iterations=params['max_iter']
+                    )
+                    
+                    self.state.batch_results[filename] = icgn_result
+                    
+                    print(f"[DEBUG] {file_idx+1}/{total_files}: {filename} - 수렴 {icgn_result.n_converged}/{icgn_result.n_points}")
+                    print(f"[DEBUG] IC-GN U: [{np.min(icgn_result.disp_u):.4f}, {np.max(icgn_result.disp_u):.4f}]")
+                    print(f"[DEBUG] IC-GN V: [{np.min(icgn_result.disp_v):.4f}, {np.max(icgn_result.disp_v):.4f}]")
+                    print(f"[DEBUG] 수렴: {icgn_result.n_converged}/{icgn_result.n_points}")
+
+                # 마지막 결과 저장
+                if self.state.batch_results:
+                    last_key = list(self.state.batch_results.keys())[-1]
+                    self.state.icgn_result = self.state.batch_results[last_key]
+                    self.state.fft_cc_result = self.state.batch_results[last_key]
                 
-                # 중단 체크 함수
-                def should_stop():
-                    return self.state.should_stop
-                
-                # 배치 분석 실행 (캐시 버전)
-                results = compute_fft_cc_batch_cached(
-                    ref_image=self.state.ref_image,
-                    def_file_paths=cached_files,
-                    get_image_func=get_cached_image,
-                    subset_size=params['subset_size'],
-                    spacing=params['spacing'],
-                    search_range=params['search_range'],
-                    zncc_threshold=params['zncc_threshold'],
-                    roi=self.state.roi,
-                    progress_callback=progress_callback,
-                    should_stop=should_stop
-                )
-                
-                self.state.batch_results = results
-                
-                print(f"[DEBUG] 배치 완료: {len(results)} 결과")
-                
-                # 마지막 결과 표시
-                if results:
-                    last_key = list(results.keys())[-1]
-                    self.state.fft_cc_result = results[last_key]
+                print(f"[DEBUG] 배치 완료: {len(self.state.batch_results)} 결과")
                 
             except InterruptedError:
                 self.view.after(0, lambda: self.view.update_progress(0, "중단됨"))
@@ -493,83 +603,102 @@ class DICController:
         
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
-    
-    def _run_batch_streaming(self, params: Dict[str, Any]):
-        """스트리밍 배치 분석 (캐시 없을 때 폴백)"""
-        if not self.state.sequence_files or len(self.state.sequence_files) < 2:
-            messagebox.showwarning("경고", "시퀀스 폴더를 먼저 선택해주세요.")
-            return
-        
-        if self.state.is_running:
-            return
-        
-        self.state.is_running = True
-        self.state.should_stop = False
-        self.state.batch_results.clear()
-        self.view.set_analysis_state(True)
-        
-        print(f"[DEBUG] 스트리밍 배치 분석 시작 (캐시 미사용)")
-        
-        def worker():
-            error_msg = None
+
+        def _run_batch_streaming(self, params: Dict[str, Any]):
+            """스트리밍 배치 분석 (FFTCC + IC-GN)"""
+            if not self.state.sequence_files or len(self.state.sequence_files) < 2:
+                messagebox.showwarning("경고", "시퀀스 폴더를 먼저 선택해주세요.")
+                return
             
-            try:
-                files = self.state.sequence_files[1:]
-                total_files = len(files)
+            if self.state.is_running:
+                return
+            
+            self.state.is_running = True
+            self.state.should_stop = False
+            self.state.batch_results.clear()
+            self.view.set_analysis_state(True)
+            
+            print(f"[DEBUG] 배치 분석 시작 (FFTCC + IC-GN)")
+            
+            def worker():
+                error_msg = None
                 
-                # 이미지를 하나씩 로드하며 분석
-                for file_idx, def_path in enumerate(files):
-                    if self.state.should_stop:
-                        break
+                try:
+                    files = self.state.sequence_files[1:]
+                    total_files = len(files)
                     
-                    filename = def_path.name
+                    for file_idx, def_path in enumerate(files):
+                        if self.state.should_stop:
+                            break
+                        
+                        filename = def_path.name
+                        
+                        # 진행률 업데이트
+                        progress = (file_idx / total_files) * 100
+                        self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
+                                    self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
+                        
+                        # 이미지 로드
+                        def_image = self.app_state.get_image(filename)
+                        if def_image is None:
+                            def_image = load_image(def_path)
+                        if def_image is None:
+                            continue
+                        
+                        # === 1단계: FFTCC ===
+                        fftcc_result = compute_fft_cc(
+                            self.state.ref_image,
+                            def_image,
+                            subset_size=params['subset_size'],
+                            spacing=params['spacing'],
+                            search_range=params['search_range'],
+                            zncc_threshold=params['zncc_threshold'],
+                            roi=self.state.roi
+                        )
+                        print(f"\n[DEBUG] ===== {filename} =====")
+                        print(f"[DEBUG] FFTCC U: [{np.min(fftcc_result.disp_u)}, {np.max(fftcc_result.disp_u)}]")
+                        print(f"[DEBUG] FFTCC V: [{np.min(fftcc_result.disp_v)}, {np.max(fftcc_result.disp_v)}]")
+                        
+                        # === 2단계: IC-GN ===
+                        interp_order = 5 if params['interpolation'] == 'biquintic' else 3
+                        
+                        icgn_result = compute_icgn(
+                            self.state.ref_image,
+                            def_image,
+                            initial_guess=fftcc_result,
+                            subset_size=params['subset_size'],
+                            shape_function=params['shape_function'],
+                            interpolation_order=interp_order,
+                            convergence_threshold=params['conv_threshold'],
+                            max_iterations=params['max_iter']
+                        )
+                        
+                        self.state.batch_results[filename] = icgn_result
+                        
+                        print(f"[DEBUG] {file_idx+1}/{total_files}: {filename} - 수렴 {icgn_result.n_converged}/{icgn_result.n_points}")
                     
-                    # 진행률 업데이트
-                    progress = (file_idx / total_files) * 100
-                    self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
-                                   self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
+                    # 마지막 결과 저장
+                    if self.state.batch_results:
+                        last_key = list(self.state.batch_results.keys())[-1]
+                        self.state.icgn_result = self.state.batch_results[last_key]
+                        self.state.fft_cc_result = self.state.batch_results[last_key]
                     
-                    # 이미지 로드
-                    def_image = load_image(def_path)
-                    if def_image is None:
-                        continue
+                except Exception as ex:
+                    error_msg = str(ex)
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    self.state.is_running = False
                     
-                    # 분석
-                    result = compute_fft_cc(
-                        self.state.ref_image,
-                        def_image,
-                        subset_size=params['subset_size'],
-                        spacing=params['spacing'],
-                        search_range=params['search_range'],
-                        zncc_threshold=params['zncc_threshold'],
-                        roi=self.state.roi
-                    )
+                    if error_msg:
+                        self.view.after(0, lambda msg=error_msg: self._show_error(msg))
+                    else:
+                        self.view.after(0, self._on_batch_complete)
                     
-                    self.state.batch_results[filename] = result
-                    
-                    # 메모리 해제
-                    del def_image
-                
-                if self.state.batch_results:
-                    last_key = list(self.state.batch_results.keys())[-1]
-                    self.state.fft_cc_result = self.state.batch_results[last_key]
-                
-            except Exception as ex:
-                error_msg = str(ex)
-                import traceback
-                traceback.print_exc()
-            finally:
-                self.state.is_running = False
-                
-                if error_msg:
-                    self.view.after(0, lambda msg=error_msg: self._show_error(msg))
-                else:
-                    self.view.after(0, self._on_batch_complete)
-                
-                self.view.after(0, lambda: self.view.set_analysis_state(False))
-        
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
+                    self.view.after(0, lambda: self.view.set_analysis_state(False))
+            
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
     
     def stop_analysis(self):
         """분석 중지"""
@@ -594,17 +723,37 @@ class DICController:
         self.view.update_progress(100, f"완료: {n_results} 파일 처리됨")
         self._refresh_display()
         
+        # 마지막 결과 표시
+        if self.state.batch_results:
+            last_key = list(self.state.batch_results.keys())[-1]
+            last_result = self.state.batch_results[last_key]
+            self._update_result_ui(last_result)
+        
         # 총 처리 시간 계산
         total_time = sum(r.processing_time for r in self.state.batch_results.values())
         avg_time = total_time / n_results if n_results > 0 else 0
         
-        messagebox.showinfo(
-            "배치 분석 완료", 
-            f"처리된 파일: {n_results}개\n"
-            f"총 소요 시간: {total_time:.1f}초\n"
-            f"평균 처리 시간: {avg_time:.2f}초/파일"
-        )
-    
+        # ICGNResult인지 확인 후 수렴율 계산
+        first_result = list(self.state.batch_results.values())[0] if self.state.batch_results else None
+        is_icgn = first_result and hasattr(first_result, 'convergence_rate')
+        
+        if is_icgn:
+            avg_conv_rate = np.mean([r.convergence_rate for r in self.state.batch_results.values()]) * 100
+            messagebox.showinfo(
+                "배치 분석 완료", 
+                f"처리된 파일: {n_results}개\n"
+                f"총 소요 시간: {total_time:.1f}초\n"
+                f"평균 처리 시간: {avg_time:.2f}초/파일\n"
+                f"평균 수렴율: {avg_conv_rate:.1f}%"
+            )
+        else:
+            messagebox.showinfo(
+                "배치 분석 완료", 
+                f"처리된 파일: {n_results}개\n"
+                f"총 소요 시간: {total_time:.1f}초\n"
+                f"평균 처리 시간: {avg_time:.2f}초/파일"
+            )
+
     # ===== 표시 (기존과 동일) =====
     
     def _display_image(self, img: np.ndarray):

@@ -18,6 +18,7 @@ class SpeckleQualityGUI:
         self.root = root
         self.root.title("Speckle Analysis Suite v3.3")
         self.root.geometry("1500x950")
+        self._last_navigate_time = 0
         
         # 상태 초기화
         self.state = AppState()
@@ -35,6 +36,11 @@ class SpeckleQualityGUI:
         
         self._connect_controller()
         self._start_periodic_check()
+        self._connect_controller()
+        self._start_periodic_check()
+        
+        # 초기 탭에 맞게 키 바인딩 설정
+        self._on_tab_changed(None)
     
     def _create_menu(self):
         """메뉴바 생성"""
@@ -85,6 +91,43 @@ class SpeckleQualityGUI:
         self.dic_tab = DICTab(self.notebook)
         self.notebook.add(self.dic_tab, text="  변위 분석  ")
         
+        # 탭 전환 이벤트 바인딩
+        self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
+        
+    def _on_tab_changed(self, event):
+        """탭 전환 시 키 바인딩 변경"""
+        current_tab = self.notebook.index(self.notebook.select())
+        
+        # 기존 바인딩 해제
+        self.root.unbind('<Left>')
+        self.root.unbind('<Right>')
+        self.root.unbind('<Up>')
+        self.root.unbind('<Down>')
+        
+        if current_tab == 0:  # 품질 평가 탭
+            self.root.bind('<Left>', lambda e: self.controller.navigate(-1))
+            self.root.bind('<Right>', lambda e: self.controller.navigate(1))
+        elif current_tab == 1:  # 변위 분석 탭
+            self.root.bind('<Left>', lambda e: self._dic_navigate(-1))
+            self.root.bind('<Right>', lambda e: self._dic_navigate(1))
+            self.root.bind('<Up>', lambda e: self._dic_navigate(-10))
+            self.root.bind('<Down>', lambda e: self._dic_navigate(10))
+
+    def _dic_navigate(self, delta: int):
+        """변위 분석 탭 이미지 네비게이션 (디바운싱 적용)"""
+        import time
+        current_time = time.time()
+        
+        # 100ms 이내 반복 입력 무시
+        if current_time - self._last_navigate_time < 0.1:
+            return
+        self._last_navigate_time = current_time
+        
+        if self.dic_tab.sequence_files:
+            new_index = self.dic_tab.current_index + delta
+            new_index = max(0, min(len(self.dic_tab.sequence_files) - 1, new_index))
+            self.dic_controller.select_image_index(new_index)
+    
     def _create_quality_tab(self):
         """품질 평가 탭 (기존 UI)"""
         main_frame = self.quality_frame
@@ -265,10 +308,6 @@ class SpeckleQualityGUI:
         
         ttk.Label(nav_frame, text="← → 키로 이동", 
                   font=('Arial', 8), foreground='gray').pack(pady=2)
-        
-        # 키보드 바인딩
-        self.root.bind('<Left>', lambda e: self.controller.navigate(-1))
-        self.root.bind('<Right>', lambda e: self.controller.navigate(1))
     
     def _connect_controller(self):
         """컨트롤러 콜백 연결"""

@@ -46,7 +46,7 @@ class ParamPanel:
         
         # Spacing
         ttk.Label(grid, text="Spacing:").grid(row=1, column=2, sticky=tk.W, padx=(10, 0))
-        self.spacing_var = tk.StringVar(value="10")
+        self.spacing_var = tk.StringVar(value="16")
         ttk.Entry(grid, textvariable=self.spacing_var, width=10).grid(row=1, column=3)
     
     def get_parameters(self) -> Optional[Parameters]:
