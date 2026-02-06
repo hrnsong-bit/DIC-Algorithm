@@ -15,6 +15,56 @@ import time
 from .results import MatchResult, FFTCCResult
 
 
+# ===== FFT 기반 ZNCC =====
+
+def _fft_zncc(template: np.ndarray, search_win: np.ndarray) -> Tuple[int, int, float]:
+    """
+    FFT 기반 Zero-mean Normalized Cross-Correlation
+    
+    Args:
+        template: 참조 서브셋 (subset_size x subset_size)
+        search_win: 검색 영역
+    
+    Returns:
+        (peak_y, peak_x, zncc_value)
+    """
+    sh, sw = search_win.shape
+    th, tw = template.shape
+    
+    # Zero-mean
+    t = template.astype(np.float64) - np.mean(template)
+    s = search_win.astype(np.float64) - np.mean(search_win)
+    
+    # Template 정규화 계수
+    t_norm = np.sqrt(np.sum(t ** 2))
+    if t_norm < 1e-10:
+        return 0, 0, 0.0
+    
+    # FFT cross-correlation
+    F = np.fft.fft2(t, s=(sh, sw))
+    G = np.fft.fft2(s)
+    cc = np.fft.ifft2(np.conj(F) * G).real
+    
+    # 로컬 정규화를 위한 search_win 제곱합 계산 (FFT 활용)
+    s_sq = s ** 2
+    ones = np.ones((th, tw), dtype=np.float64)
+    local_sum_sq = np.fft.ifft2(np.fft.fft2(s_sq) * np.fft.fft2(ones, s=(sh, sw))).real
+    local_norm = np.sqrt(np.maximum(local_sum_sq, 1e-10))
+    
+    # 정규화
+    zncc = cc / (t_norm * local_norm + 1e-10)
+    
+    # 유효 영역에서 피크 찾기
+    valid_h = sh - th + 1
+    valid_w = sw - tw + 1
+    zncc_valid = zncc[:valid_h, :valid_w]
+    
+    peak_idx = np.argmax(zncc_valid)
+    peak_y, peak_x = np.unravel_index(peak_idx, zncc_valid.shape)
+    
+    return int(peak_y), int(peak_x), float(zncc_valid[peak_y, peak_x])
+
+
 def compute_fft_cc(ref_image: np.ndarray,
                    def_image: np.ndarray,
                    subset_size: int = 21,
@@ -73,14 +123,13 @@ def compute_fft_cc(ref_image: np.ndarray,
         if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
             return idx, 0, 0, 0.0
         
-        result = cv2.matchTemplate(search_win, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        # FFT-CC 호출
+        best_y, best_x, zncc = _fft_zncc(template, search_win)
         
-        best_x, best_y = max_loc
         du = (sx1 + best_x + half) - (px + ox)
         dv = (sy1 + best_y + half) - (py + oy)
         
-        return idx, du, dv, float(max_val)
+        return idx, du, dv, zncc
     
     # 병렬 처리
     completed = 0
@@ -138,22 +187,6 @@ def compute_fft_cc_batch_cached(
 ) -> Dict[str, FFTCCResult]:
     """
     캐시된 이미지를 사용한 배치 FFT-CC 분석
-    
-    최적화 포인트:
-    - 이미지가 이미 메모리에 있으므로 로드 시간 = 0
-    - Reference 처리 한 번만
-    - 템플릿 사전 추출
-    - ThreadPool 재사용
-    
-    Args:
-        ref_image: 기준 이미지
-        def_file_paths: 변형 이미지 경로 리스트
-        get_image_func: 캐시에서 이미지 가져오는 함수 (Path -> np.ndarray)
-        progress_callback: (current_file, total_files, filename) 콜백
-        should_stop: 중단 여부 확인 함수
-    
-    Returns:
-        {파일명: FFTCCResult} 딕셔너리
     """
     results = {}
     
@@ -187,15 +220,12 @@ def compute_fft_cc_batch_cached(
     points_x = xx.ravel().astype(np.int64)
     n_points = len(points_y)
     
-    # 템플릿 사전 추출 (핵심 최적화!)
+    # 템플릿 사전 추출
     templates = []
     for idx in range(n_points):
         py, px = points_y[idx], points_x[idx]
         template = ref_roi[py - half:py + half + 1, px - half:px + half + 1].copy()
         templates.append(template)
-    
-    print(f"[DEBUG] 캐시 배치: {n_points} POI, {len(def_file_paths)} 파일")
-    print(f"[DEBUG] 템플릿 {n_points}개 사전 추출 완료")
     
     # ===== 배치 처리 =====
     n_workers = max(1, os.cpu_count() - 1)
@@ -204,9 +234,7 @@ def compute_fft_cc_batch_cached(
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         
         for file_idx, def_path in enumerate(def_file_paths):
-            # 중단 체크
             if should_stop and should_stop():
-                print(f"[DEBUG] 사용자 중단")
                 break
             
             filename = def_path.name
@@ -215,13 +243,10 @@ def compute_fft_cc_batch_cached(
             if progress_callback:
                 progress_callback(file_idx, total_files, filename)
             
-            # 캐시에서 이미지 가져오기 (로드 시간 = 0)
             def_image = get_image_func(def_path)
             if def_image is None:
-                print(f"[WARN] 캐시에 없음: {filename}")
                 continue
             
-            # 전처리
             def_gray = _to_gray(def_image).astype(np.float32)
             
             # ROI 영역 + search_range 확장
@@ -243,7 +268,6 @@ def compute_fft_cc_batch_cached(
             disp_v = np.zeros(n_points, dtype=np.int32)
             zncc_values = np.zeros(n_points, dtype=np.float64)
             
-            # POI 처리 함수 (클로저로 현재 상태 캡처)
             def make_process_poi(def_ext, offset_x, offset_y, d_h, d_w):
                 def process_poi(idx: int) -> Tuple[int, int, int, float]:
                     py, px = points_y[idx], points_x[idx]
@@ -259,19 +283,17 @@ def compute_fft_cc_batch_cached(
                     if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
                         return idx, 0, 0, 0.0
                     
-                    result = cv2.matchTemplate(search_win, template, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                    # FFT-CC 호출
+                    best_y, best_x, zncc = _fft_zncc(template, search_win)
                     
-                    best_x, best_y = max_loc
                     du = (sx1 + best_x + half) - (px + offset_x)
                     dv = (sy1 + best_y + half) - (py + offset_y)
                     
-                    return idx, du, dv, float(max_val)
+                    return idx, du, dv, zncc
                 return process_poi
             
             process_poi = make_process_poi(def_extended, ox, oy, def_h, def_w)
             
-            # 병렬 처리
             futures = [executor.submit(process_poi, i) for i in range(n_points)]
             
             for future in as_completed(futures):
@@ -280,7 +302,6 @@ def compute_fft_cc_batch_cached(
                 disp_v[idx] = dv
                 zncc_values[idx] = zncc
             
-            # 결과 생성
             valid_mask = zncc_values >= zncc_threshold
             
             invalid_points = []
@@ -413,7 +434,5 @@ def _empty_result(subset_size: int, search_range: int, spacing: int) -> FFTCCRes
 
 def warmup_fft_cc():
     """워밍업"""
-    print("[INFO] FFT-CC 워밍업 중...")
     dummy = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
     compute_fft_cc(dummy, dummy, subset_size=21, spacing=30, search_range=20, n_workers=2)
-    print("[INFO] FFT-CC 워밍업 완료")

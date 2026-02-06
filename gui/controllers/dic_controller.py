@@ -16,6 +16,7 @@ from speckle.io import load_image, get_image_files
 from ..models.app_state import AppState
 from speckle.core.optimization import compute_icgn
 from speckle.core.postprocess import compute_strain_from_icgn, StrainResult
+from speckle.core.postprocess.strain_smoothing import compute_strain_savgol, SmoothedStrainResult
 
 @dataclass
 class DICState:
@@ -1009,20 +1010,184 @@ class DICController:
 
     def _draw_strain_field(self, img: np.ndarray, result, strain_type: str,
                         offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """변형률 필드 시각화"""
+        """변형률 필드 시각화 (Savitzky-Golay + 부드러운 보간)"""
         if result.n_points == 0:
             return img
         
         is_icgn = hasattr(result, 'disp_ux') and result.disp_ux is not None
         if not is_icgn:
             cv2.putText(img, "IC-GN 결과 필요", (50, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return img
         
+        # === POI를 2D 그리드로 변환 ===
+        valid = result.valid_mask
+        px, py = result.points_x, result.points_y
+        
+        px_valid = px[valid]
+        py_valid = py[valid]
+        
+        unique_x = np.unique(px_valid)
+        unique_y = np.unique(py_valid)
+        nx, ny = len(unique_x), len(unique_y)
+        
+        if nx < 5 or ny < 5:
+            return self._draw_strain_field_points(img, result, strain_type, offset_x, offset_y)
+        
+        grid_step = float(np.median(np.diff(unique_x))) if len(unique_x) > 1 else 1.0
+        
+        # 좌표 → 인덱스 매핑
+        x_to_idx = {x: i for i, x in enumerate(unique_x)}
+        y_to_idx = {y: i for i, y in enumerate(unique_y)}
+        
+        # 변위를 2D 그리드로 변환
+        disp_u_grid = np.full((ny, nx), np.nan)
+        disp_v_grid = np.full((ny, nx), np.nan)
+        
+        for i in range(len(px)):
+            if valid[i]:
+                xi = x_to_idx.get(px[i])
+                yi = y_to_idx.get(py[i])
+                if xi is not None and yi is not None:
+                    disp_u_grid[yi, xi] = result.disp_u[i]
+                    disp_v_grid[yi, xi] = result.disp_v[i]
+        
+        # === Savitzky-Golay 스무딩 ===
+        try:
+            from speckle.core.postprocess.strain_smoothing import compute_strain_savgol
+            strain_smooth = compute_strain_savgol(
+                disp_u_grid, disp_v_grid,
+                window_size=11,  # 작게 조정
+                poly_order=2,
+                grid_step=grid_step
+            )
+        except Exception as e:
+            print(f"[WARN] Savitzky-Golay 실패: {e}")
+            return self._draw_strain_field_points(img, result, strain_type, offset_x, offset_y)
+        
+        # 필드 선택
+        field_map = {
+            'exx': (strain_smooth.exx, "εxx"),
+            'eyy': (strain_smooth.eyy, "εyy"),
+            'exy': (strain_smooth.exy, "εxy"),
+            'e1': (strain_smooth.e1, "ε1"),
+            'von_mises': (strain_smooth.von_mises, "ε_vm")
+        }
+        
+        if strain_type not in field_map:
+            return img
+        
+        strain_2d, label = field_map[strain_type]
+        
+        # NaN이 아닌 값들
+        valid_strain = ~np.isnan(strain_2d)
+        valid_values = strain_2d[valid_strain]
+        if len(valid_values) == 0:
+            return img
+        
+        # 범위 결정
+        color_range = self.view.get_color_range()
+        if color_range is not None:
+            vmin, vmax = color_range
+        else:
+            # 이상치 제거 (1%, 99% 퍼센타일)
+            vmin = np.percentile(valid_values, 1)
+            vmax = np.percentile(valid_values, 99)
+            v_abs_max = max(abs(vmin), abs(vmax))
+            if v_abs_max < 1e-10:
+                v_abs_max = 1e-6
+            vmin, vmax = -v_abs_max, v_abs_max
+        
+        # 컬러바 업데이트
+        self.view.update_colorbar(vmin, vmax, label, 'diverging')
+        
+        # === scipy로 부드럽게 보간 ===
+        from scipy.interpolate import RegularGridInterpolator
+        
+        # 유효한 영역만 보간
+        strain_filled = strain_2d.copy()
+        strain_filled[np.isnan(strain_filled)] = 0  # NaN을 0으로
+        
+        # 원본 그리드 좌표
+        grid_y_coords = unique_y
+        grid_x_coords = unique_x
+        
+        # 보간기 생성
+        interp = RegularGridInterpolator(
+            (grid_y_coords, grid_x_coords), 
+            strain_filled,
+            method='linear',
+            bounds_error=False,
+            fill_value=np.nan
+        )
+        
+        # 목표 좌표 (원본 이미지 픽셀)
+        x_min, x_max = int(unique_x[0]), int(unique_x[-1])
+        y_min, y_max = int(unique_y[0]), int(unique_y[-1])
+        
+        # 픽셀 단위 그리드 생성
+        target_y = np.arange(y_min, y_max + 1)
+        target_x = np.arange(x_min, x_max + 1)
+        target_yy, target_xx = np.meshgrid(target_y, target_x, indexing='ij')
+        target_points = np.stack([target_yy.ravel(), target_xx.ravel()], axis=-1)
+        
+        # 보간 수행
+        strain_interp = interp(target_points).reshape(len(target_y), len(target_x))
+        
+        # === 컬러맵 적용 ===
+        strain_norm = (strain_interp - vmin) / (vmax - vmin + 1e-10)
+        strain_norm = np.clip(strain_norm, 0, 1)
+        
+        # 컬러 이미지 생성
+        h, w = strain_norm.shape
+        strain_color = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        for j in range(h):
+            for i in range(w):
+                if not np.isnan(strain_interp[j, i]):
+                    strain_color[j, i] = self._diverging_colormap(strain_norm[j, i])
+        
+        # === 오버레이 ===
+        alpha = 0.6
+        x_start = x_min + offset_x
+        y_start = y_min + offset_y
+        
+        # 경계 체크
+        x_end = min(x_start + w, img.shape[1])
+        y_end = min(y_start + h, img.shape[0])
+        x_start = max(0, x_start)
+        y_start = max(0, y_start)
+        
+        crop_x = x_start - (x_min + offset_x)
+        crop_y = y_start - (y_min + offset_y)
+        crop_w = x_end - x_start
+        crop_h = y_end - y_start
+        
+        if crop_w > 0 and crop_h > 0:
+            strain_crop = strain_color[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+            interp_crop = strain_interp[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+            
+            roi = img[y_start:y_end, x_start:x_end].copy()
+            
+            # NaN이 아닌 영역만 블렌딩
+            valid_mask = ~np.isnan(interp_crop)
+            for c in range(3):
+                roi[:, :, c] = np.where(
+                    valid_mask,
+                    (alpha * strain_crop[:, :, c] + (1 - alpha) * roi[:, :, c]).astype(np.uint8),
+                    roi[:, :, c]
+                )
+            
+            img[y_start:y_end, x_start:x_end] = roi
+        
+        return img
+
+    def _draw_strain_field_points(self, img: np.ndarray, result, strain_type: str,
+                                offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
+        """변형률 필드 점 시각화 (폴백용)"""
         from speckle.core.postprocess import compute_strain_from_icgn
         strain = compute_strain_from_icgn(result)
         
-        # 필드 선택
         field_map = {
             'exx': (strain.exx, "εxx"),
             'eyy': (strain.eyy, "εyy"),
@@ -1041,22 +1206,18 @@ class DICController:
         if len(valid_values) == 0:
             return img
         
-        # 범위 결정
         color_range = self.view.get_color_range()
         if color_range is not None:
             vmin, vmax = color_range
         else:
             vmin, vmax = np.min(valid_values), np.max(valid_values)
-            # 대칭 범위 (변형률은 보통 대칭)
             v_abs_max = max(abs(vmin), abs(vmax))
             if v_abs_max < 1e-10:
                 v_abs_max = 1e-6
             vmin, vmax = -v_abs_max, v_abs_max
         
-        # 컬러바 업데이트
         self.view.update_colorbar(vmin, vmax, label, 'diverging')
         
-        # POI 그리기
         for idx in range(result.n_points):
             x = int(result.points_x[idx]) + offset_x
             y = int(result.points_y[idx]) + offset_y

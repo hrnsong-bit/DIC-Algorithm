@@ -204,7 +204,7 @@ def _update_affine_direct(p: np.ndarray, dp: np.ndarray) -> np.ndarray:
 
 
 def _update_affine_matrix_fallback(p: np.ndarray, dp: np.ndarray) -> np.ndarray:
-    """Fallback: 기존 행렬 방식 (near-singular 케이스용)"""
+    """Fallback: 행렬 방식 (near-singular 케이스용)"""
     W_p = np.array([
         [1.0 + p[1], p[2], p[0]],
         [p[4], 1.0 + p[5], p[3]],
@@ -218,9 +218,9 @@ def _update_affine_matrix_fallback(p: np.ndarray, dp: np.ndarray) -> np.ndarray:
     ], dtype=np.float64)
     
     try:
-        W_new = np.linalg.solve(W_dp, W_p)
+        W_dp_inv = np.linalg.inv(W_dp)
+        W_new = W_p @ W_dp_inv          # W(p) · W(Δp)^(-1)
     except np.linalg.LinAlgError:
-        # 완전 singular - 파라미터 유지
         return p.copy()
     
     return np.array([
