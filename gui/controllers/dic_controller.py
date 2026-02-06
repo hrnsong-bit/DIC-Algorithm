@@ -421,12 +421,6 @@ class DICController:
 
                 interp_order = 5 if params['interpolation'] == 'biquintic' else 3
 
-                # POI 좌표를 전체 이미지 좌표로 변환
-                if self.state.roi:
-                    rx, ry, rw, rh = self.state.roi
-                    fftcc_result.points_x = fftcc_result.points_x + rx
-                    fftcc_result.points_y = fftcc_result.points_y + ry
-
                 # 전체 이미지 사용
                 icgn_result = compute_icgn(
                     self.state.ref_image,
@@ -455,11 +449,17 @@ class DICController:
                 du, dv = fftcc_result.disp_u[idx], fftcc_result.disp_v[idx]
                 print(f"[DEBUG] 첫 POI: 위치=({px}, {py}), FFTCC변위=({du}, {dv})")
 
-                if self.state.roi:
-                    rx, ry, rw, rh = self.state.roi
-                    print(f"[DEBUG] 첫 POI 전체이미지 좌표: ({px + rx}, {py + ry})")
-                print(f"[DEBUG] ================================\n")
-
+                # 불량 POI 상세 확인
+                invalid_indices = np.where(~icgn_result.valid_mask)[0]
+                if len(invalid_indices) > 0:
+                    print(f"\n[DEBUG] ===== 불량 POI 상세 =====")
+                    for idx in invalid_indices[:10]:
+                        print(f"  POI({icgn_result.points_x[idx]}, {icgn_result.points_y[idx]}): "
+                            f"u={icgn_result.disp_u[idx]:.4f}, v={icgn_result.disp_v[idx]:.4f}, "
+                            f"zncc={icgn_result.zncc_values[idx]:.4f}, "
+                            f"converged={icgn_result.converged[idx]}, "
+                            f"iter={icgn_result.iterations[idx]}")
+                    print(f"[DEBUG] ==============================\n")
                 self.state.fft_cc_result = fftcc_result  # 로그용 보관
                 self.state.icgn_result = icgn_result     # 최종 결과
                 
@@ -611,12 +611,6 @@ class DICController:
                    # === 2단계: IC-GN ===
                     t_icgn_start = time.time()
                     interp_order = 5 if params['interpolation'] == 'biquintic' else 3
-
-                    # POI 좌표를 전체 이미지 좌표로 변환
-                    if self.state.roi:
-                        rx, ry, rw, rh = self.state.roi
-                        fftcc_result.points_x = fftcc_result.points_x + rx
-                        fftcc_result.points_y = fftcc_result.points_y + ry
 
                     # 전체 이미지 사용
                     icgn_result = compute_icgn(
@@ -779,12 +773,6 @@ class DICController:
                         # === 2단계: IC-GN ===
                         interp_order = 5 if params['interpolation'] == 'biquintic' else 3
 
-                        # POI 좌표를 전체 이미지 좌표로 변환
-                        if self.state.roi:
-                            rx, ry, rw, rh = self.state.roi
-                            fftcc_result.points_x = fftcc_result.points_x + rx
-                            fftcc_result.points_y = fftcc_result.points_y + ry
-
                         # 전체 이미지 사용
                         icgn_result = compute_icgn(
                             self.state.ref_image,
@@ -919,8 +907,12 @@ class DICController:
         
         mode = self.view.display_mode_var.get()
         
-        offset_x = 0
-        offset_y = 0
+        if self.state.roi:
+            offset_x = self.state.roi[0]  # rx
+            offset_y = self.state.roi[1]  # ry
+        else:
+            offset_x = 0
+            offset_y = 0
         
         if mode == "vectors":
             display_img = self._draw_vectors(display_img, result, offset_x, offset_y)

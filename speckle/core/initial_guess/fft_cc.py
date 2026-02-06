@@ -16,42 +16,51 @@ from .results import MatchResult, FFTCCResult
 
 
 # ===== FFT 기반 ZNCC =====
-
 def _fft_zncc(template: np.ndarray, search_win: np.ndarray) -> Tuple[int, int, float]:
     """
     FFT 기반 Zero-mean Normalized Cross-Correlation
     
-    Args:
-        template: 참조 서브셋 (subset_size x subset_size)
-        search_win: 검색 영역
-    
-    Returns:
-        (peak_y, peak_x, zncc_value)
+    올바른 ZNCC: 각 위치에서 로컬 평균과 로컬 에너지를 계산하여 정규화
     """
     sh, sw = search_win.shape
     th, tw = template.shape
     
-    # Zero-mean
-    t = template.astype(np.float64) - np.mean(template)
-    s = search_win.astype(np.float64) - np.mean(search_win)
-    
-    # Template 정규화 계수
-    t_norm = np.sqrt(np.sum(t ** 2))
+    # Template zero-mean & 정규화
+    t = template.astype(np.float64)
+    t_mean = np.mean(t)
+    t_zm = t - t_mean
+    t_norm = np.sqrt(np.sum(t_zm ** 2))
     if t_norm < 1e-10:
         return 0, 0, 0.0
     
-    # FFT cross-correlation
-    F = np.fft.fft2(t, s=(sh, sw))
+    n_pixels = th * tw  # subset 내 픽셀 수
+    s = search_win.astype(np.float64)
+    
+    # FFT cross-correlation: Σ(t_zm * s) 
+    F = np.fft.fft2(t_zm, s=(sh, sw))
     G = np.fft.fft2(s)
     cc = np.fft.ifft2(np.conj(F) * G).real
     
-    # 로컬 정규화를 위한 search_win 제곱합 계산 (FFT 활용)
-    s_sq = s ** 2
+    # 로컬 합 계산 (FFT 활용)
     ones = np.ones((th, tw), dtype=np.float64)
-    local_sum_sq = np.fft.ifft2(np.fft.fft2(s_sq) * np.fft.fft2(ones, s=(sh, sw))).real
-    local_norm = np.sqrt(np.maximum(local_sum_sq, 1e-10))
+    Ones_fft = np.fft.fft2(ones, s=(sh, sw))
     
-    # 정규화
+    # Σs (각 위치에서의 로컬 합)
+    local_sum = np.fft.ifft2(np.fft.fft2(s) * np.conj(Ones_fft)).real
+    
+    # Σs² (각 위치에서의 로컬 제곱합)
+    local_sum_sq = np.fft.ifft2(np.fft.fft2(s ** 2) * np.conj(Ones_fft)).real
+    
+    # 로컬 분산: Σ(s - s_mean)² = Σs² - (Σs)²/n
+    local_var = local_sum_sq - (local_sum ** 2) / n_pixels
+    local_var = np.maximum(local_var, 0.0)  # 수치 오차 보정
+    local_norm = np.sqrt(local_var)
+    
+    # ZNCC: cc에서 t_zm과 s의 상관이므로
+    # Σ(t_zm * s) = Σ(t_zm * (s - s_mean)) + Σ(t_zm * s_mean)
+    # Σ(t_zm) = 0 이므로 Σ(t_zm * s_mean) = s_mean * Σ(t_zm) = 0
+    # 따라서 cc = Σ(t_zm * (s - s_mean)) → 정확한 zero-mean cross-correlation
+    
     zncc = cc / (t_norm * local_norm + 1e-10)
     
     # 유효 영역에서 피크 찾기
@@ -63,7 +72,6 @@ def _fft_zncc(template: np.ndarray, search_win: np.ndarray) -> Tuple[int, int, f
     peak_y, peak_x = np.unravel_index(peak_idx, zncc_valid.shape)
     
     return int(peak_y), int(peak_x), float(zncc_valid[peak_y, peak_x])
-
 
 def compute_fft_cc(ref_image: np.ndarray,
                    def_image: np.ndarray,
@@ -207,7 +215,7 @@ def compute_fft_cc_batch_cached(
     # POI 그리드 생성
     h, w = ref_roi.shape
     half = subset_size // 2
-    margin = half + 1
+    margin = half + search_range + 1
     
     y_coords = np.arange(margin, h - margin, spacing)
     x_coords = np.arange(margin, w - margin, spacing)

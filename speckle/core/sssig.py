@@ -47,13 +47,13 @@ def _compute_sssig_map_parallel(gx: np.ndarray, gy: np.ndarray,
     return sssig_x, sssig_y
 
 
-def estimate_noise_variance(image: np.ndarray, method: str = 'laplacian') -> float:
+def estimate_noise_variance(image: np.ndarray, method: str = 'local_std') -> float:
     """
     이미지 노이즈 분산 추정 (논문 Section 5.1 참조)
     
     Args:
         image: 그레이스케일 이미지
-        method: 'laplacian' (단일 이미지) 또는 'difference' (두 이미지 필요)
+        method: 'local_std' (기본, 스페클 안전), 'laplacian', 또는 기본값 4.0
     
     Returns:
         노이즈 분산 D(η)
@@ -65,23 +65,31 @@ def estimate_noise_variance(image: np.ndarray, method: str = 'laplacian') -> flo
     
     if method == 'laplacian':
         # Robust Median Estimator (Donoho & Johnstone, 1994)
-        # σ = median(|Laplacian|) / 0.6745
+        # ⚠ 스페클 패턴에서는 텍스처를 노이즈로 오인하여 과대추정됨
         laplacian = cv2.Laplacian(img_float, cv2.CV_64F)
         sigma = np.median(np.abs(laplacian)) / 0.6745
         return sigma ** 2
     
     elif method == 'local_std':
-        # 로컬 영역의 표준편차 기반 추정
-        kernel_size = 7
+        # 로컬 영역의 분산 기반 추정
+        # 가장 평탄한 영역(하위 5%)의 분산 = 카메라 노이즈
+        # 스페클 텍스처 영향을 자연스럽게 배제
+        kernel_size = 5
         local_mean = cv2.blur(img_float, (kernel_size, kernel_size))
         local_sq_mean = cv2.blur(img_float ** 2, (kernel_size, kernel_size))
         local_var = local_sq_mean - local_mean ** 2
-        # 하위 10% (평탄한 영역)의 분산을 노이즈로 추정
-        return float(np.percentile(local_var[local_var > 0], 10))
+        # 하위 5% (가장 평탄한 영역) → 스페클 텍스처가 아닌 순수 노이즈
+        valid_var = local_var[local_var > 0]
+        if len(valid_var) == 0:
+            return 4.0
+        noise_var = float(np.percentile(valid_var, 5))
+        # 안전 하한: 최소 1.0 (완전 무노이즈는 비현실적)
+        return max(noise_var, 1.0)
     
     else:
         # 기본값: 일반적인 8-bit 카메라 노이즈
         return 4.0
+
 
 
 def estimate_noise_from_pair(image1: np.ndarray, image2: np.ndarray, 
@@ -312,8 +320,10 @@ def compute_sssig_map(image: np.ndarray,
     predicted_accuracy_y = predict_displacement_accuracy(np.min(sssig_y), noise_variance)
     predicted_accuracy = max(predicted_accuracy_x, predicted_accuracy_y)
     
-    # 불량 포인트 (x 또는 y 방향 중 하나라도 threshold 미만)
-    bad_mask = (sssig_x < threshold / 2) | (sssig_y < threshold / 2)
+    # 불량 포인트 (총합 기준, Pan et al. 2008 원 논문 방식)
+    # 논문의 SSSIG threshold는 Σ(gx² + gy²)의 총합에 대한 것
+    bad_mask = sssig_values < threshold
+    
     bad_indices = np.where(bad_mask)[0]
     
     bad_points = [
