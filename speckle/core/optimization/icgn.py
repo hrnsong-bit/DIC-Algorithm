@@ -5,6 +5,14 @@ IC-GN (Inverse Compositional Gauss-Newton) 최적화 모듈
 
 FFTCC 초기 추정값을 서브픽셀 정밀도로 최적화
 Affine (1차) 및 Quadratic (2차) Shape Function 지원
+
+References:
+    - Pan, B., et al. "Fast, robust and accurate DIC calculation without 
+      redundant computations." Experimental Mechanics, 2013.
+    - Pan, B., et al. "Bias error reduction of digital image correlation 
+      using Gaussian pre-filtering." Optics and Lasers in Engineering, 2013.
+    - Jiang, Z., et al. "Path-independent digital image correlation with 
+      high accuracy, speed and robustness." Optics and Lasers in Engineering, 2014.
 """
 
 import numpy as np
@@ -24,7 +32,8 @@ from .shape_function import (
     compute_steepest_descent,
     compute_hessian,
     get_initial_params,
-    get_num_params
+    get_num_params,
+    check_convergence  # 새로 추가
 )
 
 
@@ -40,7 +49,7 @@ def compute_icgn(
     zncc_threshold: float = 0.6,
     interpolation_order: int = 5,
     shape_function: str = 'affine',
-    gaussian_blur: Optional[int] = None,  # 추가: Pan (2013) Gaussian pre-filtering
+    gaussian_blur: Optional[int] = None,
     n_workers: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None
 ) -> ICGNResult:
@@ -53,21 +62,16 @@ def compute_icgn(
         initial_guess: FFTCC 결과 (정수 픽셀 변위)
         subset_size: 서브셋 크기 (홀수)
         max_iterations: 최대 반복 횟수
-        convergence_threshold: 수렴 기준 (|Δp| norm)
+        convergence_threshold: 수렴 기준 (Jiang et al. 2014 방식)
         zncc_threshold: 유효 판정 ZNCC 임계값
-        interpolation_order: 보간 차수 (3 or 5)
+        interpolation_order: 보간 차수 (3=bicubic, 5=biquintic)
         shape_function: 'affine' (6 params) or 'quadratic' (12 params)
         gaussian_blur: Gaussian pre-filtering 커널 크기 (None이면 비활성화)
-                       Pan et al. (2013) 권장: 5
-        n_workers: 병렬 워커 수
+        n_workers: 병렬 워커 수 (None이면 자동)
         progress_callback: 진행 콜백 (current, total)
     
     Returns:
         ICGNResult: 서브픽셀 정밀도 결과
-        
-    References:
-        Pan, B., et al. "Bias error reduction of digital image correlation 
-        using Gaussian pre-filtering." Optics and Lasers in Engineering, 2013.
     """
     start_time = time.time()
     
@@ -83,19 +87,15 @@ def compute_icgn(
     
     # Gaussian pre-filtering 적용 (Pan 2013)
     if gaussian_blur is not None and gaussian_blur > 0:
-        # 커널 크기는 홀수여야 함
         if gaussian_blur % 2 == 0:
             gaussian_blur += 1
-        print(f"[DEBUG] Gaussian Blur 적용: 커널 크기 = {gaussian_blur}")  
         ref_gray = cv2.GaussianBlur(ref_gray, (gaussian_blur, gaussian_blur), 0)
         def_gray = cv2.GaussianBlur(def_gray, (gaussian_blur, gaussian_blur), 0)
-    else:
-        print(f"[DEBUG] Gaussian Blur 미적용 (gaussian_blur = {gaussian_blur})")
 
-    # Gradient 계산 (Blur된 이미지에서)
+    # Gradient 계산
     grad_x, grad_y = _compute_gradient(ref_gray)
     
-    # Target 보간 함수 생성 (Blur된 이미지로)
+    # Target 보간 함수 생성
     target_interp = create_interpolator(def_gray, order=interpolation_order)
     
     # 로컬 좌표 생성
@@ -117,7 +117,6 @@ def compute_icgn(
     disp_vx = np.zeros(n_points, dtype=np.float64)
     disp_vy = np.zeros(n_points, dtype=np.float64)
     
-    # Quadratic 전용 필드
     if shape_function == 'quadratic':
         disp_uxx = np.zeros(n_points, dtype=np.float64)
         disp_uxy = np.zeros(n_points, dtype=np.float64)
@@ -145,9 +144,6 @@ def compute_icgn(
     def process_poi(idx: int) -> Tuple[int, np.ndarray, float, int, bool]:
         px = points_x[idx]
         py = points_y[idx]
-        # 디버그 (처음 3개만)
-        if idx < 3:
-            print(f"[DEBUG] IC-GN POI[{idx}]: 위치=({px}, {py}), 초기변위=({initial_guess.disp_u[idx]}, {initial_guess.disp_v[idx]})")
         
         # FFTCC 결과가 유효하지 않으면 스킵
         if not initial_guess.valid_mask[idx]:
@@ -163,7 +159,7 @@ def compute_icgn(
         
         f, dfdx, dfdy, f_mean, f_tilde = ref_data
         
-        # Jacobian & Hessian (한 번만 계산)
+        # Jacobian & Hessian (한 번만 계산 - IC의 핵심 장점)
         J = compute_steepest_descent(dfdx, dfdy, xsi, eta, shape_function)
         H = compute_hessian(J)
         
@@ -189,6 +185,7 @@ def compute_icgn(
             px, py,
             xsi, eta,
             p,
+            subset_size,
             max_iterations,
             convergence_threshold,
             shape_function
@@ -280,101 +277,110 @@ def _icgn_iterate(
     xsi: np.ndarray,
     eta: np.ndarray,
     p: np.ndarray,
+    subset_size: int,
     max_iterations: int,
     convergence_threshold: float,
-    shape_function: str = 'affine',
-    debug: bool = False
+    shape_function: str = 'affine'
 ) -> Tuple[np.ndarray, float, int, bool]:
     """
     단일 POI에 대한 IC-GN 반복
     """
+    import time  # 추가
+    
     n_iter = 0
     conv = False
     zncc = 0.0
-    fail_reason = ""  # 추가: 실패 원인 추적
+    dp_norm = 0.0
     
-    # 수렴/발산 체크용 인덱스 (u, v 위치)
+    # 시간 측정용 (처음 3개 POI만)
+    time_warp = 0
+    time_interp = 0
+    time_zncc = 0
+    time_solve = 0
+    time_update = 0
+    debug_timing = (cx < 100 and cy < 100)  # 처음 몇 개만
+    
     if shape_function == 'affine':
         u_idx, v_idx = 0, 3
-    else:  # quadratic
+    else:
         u_idx, v_idx = 0, 6
     
-    # 초기값 저장 (발산 판정용)
     p_initial_u = p[u_idx]
     p_initial_v = p[v_idx]
-    
     max_displacement_change = 5.0
     
     for iteration in range(max_iterations):
         n_iter = iteration + 1
         
-        # Warp된 좌표 계산
+        # Warp 계산
+        t0 = time.perf_counter()
         xsi_w, eta_w = warp(p, xsi, eta, shape_function)
-        
-        # 전역 좌표로 변환
         x_def = cx + xsi_w
         y_def = cy + eta_w
+        t1 = time.perf_counter()
+        time_warp += (t1 - t0)
         
-        # Target subset 보간
+        # 보간
         g = target_interp(y_def, x_def)
+        t2 = time.perf_counter()
+        time_interp += (t2 - t1)
         
-        # g 통계
+        # ZNCC 계산
         g_mean = np.mean(g)
         g_tilde = np.linalg.norm(g - g_mean)
         
         if g_tilde < 1e-10:
-            fail_reason = "g_tilde too small"
             break
         
-        # ZNSSD 계산
         znssd = _compute_znssd(f, f_mean, f_tilde, g, g_mean, g_tilde)
         zncc = 1.0 - 0.5 * znssd
+        t3 = time.perf_counter()
+        time_zncc += (t3 - t2)
         
-        # 발산 체크 1: ZNCC가 너무 낮으면 발산
         if zncc < 0.5:
-            fail_reason = f"ZNCC too low: {zncc:.4f}"
             conv = False
             break
         
-        # Residual 계산
+        # 파라미터 계산
         residual = (f - f_mean) - (f_tilde / g_tilde) * (g - g_mean)
-        
-        # 파라미터 증분 계산
         b = -J.T @ residual
         dp = H_inv @ b
+        t4 = time.perf_counter()
+        time_solve += (t4 - t3)
         
-        # 발산 체크 2: 업데이트가 너무 크면 발산
-        dp_norm = np.sqrt(dp[u_idx]**2 + dp[v_idx]**2)
+        # 수렴 체크
+        conv, dp_norm = check_convergence(dp, subset_size, convergence_threshold, shape_function)
+        
+        if conv:
+            break
+        
         if dp_norm > 2.0:
-            fail_reason = f"dp_norm too large: {dp_norm:.4f}"
             conv = False
             break
         
-        # 수렴 체크
-        if dp_norm < convergence_threshold:
-            conv = True
-            break
-        
-        # Inverse compositional update
+        # Warp 업데이트
         p = update_warp_inverse_compositional(p, dp, shape_function)
+        t5 = time.perf_counter()
+        time_update += (t5 - t4)
         
-        # 발산 체크 3: 초기값에서 너무 벗어나면 발산
         displacement_change_u = abs(p[u_idx] - p_initial_u)
         displacement_change_v = abs(p[v_idx] - p_initial_v)
         
         if displacement_change_u > max_displacement_change or \
            displacement_change_v > max_displacement_change:
-            fail_reason = f"displacement change too large: u={displacement_change_u:.2f}, v={displacement_change_v:.2f}"
             conv = False
             break
     
-    # 최대 반복 도달 시
-    if n_iter == max_iterations and not conv:
-        fail_reason = f"max iterations reached, dp_norm={dp_norm:.4f}, zncc={zncc:.4f}"
-    
-    # ===== 디버그 출력: 실패한 경우만 =====
-    if not conv and np.random.random() < 0.1:  # 10% 샘플링
-        print(f"[ICGN FAIL] POI({cx},{cy}): {fail_reason}")
+    # 디버그 출력 (처음 몇 개 POI만)
+    if debug_timing and n_iter > 0:
+        total = time_warp + time_interp + time_zncc + time_solve + time_update
+        print(f"[ICGN TIMING] POI({cx},{cy}) iter={n_iter}")
+        print(f"  Warp:   {time_warp*1000:.2f}ms ({time_warp/total*100:.1f}%)")
+        print(f"  Interp: {time_interp*1000:.2f}ms ({time_interp/total*100:.1f}%)")
+        print(f"  ZNCC:   {time_zncc*1000:.2f}ms ({time_zncc/total*100:.1f}%)")
+        print(f"  Solve:  {time_solve*1000:.2f}ms ({time_solve/total*100:.1f}%)")
+        print(f"  Update: {time_update*1000:.2f}ms ({time_update/total*100:.1f}%)")
+        print(f"  Total:  {total*1000:.2f}ms")
     
     return p, zncc, n_iter, conv
 
@@ -391,9 +397,18 @@ def _to_gray(img: np.ndarray) -> np.ndarray:
 
 
 def _compute_gradient(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """이미지 gradient 계산 (Sobel)"""
-    grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=5) / 32.0
-    grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=5) / 32.0
+    """
+    이미지 gradient 계산 (Sobel)
+    
+    SunDIC 방식: ksize에 따른 정규화 적용
+    """
+    ksize = 5
+    # SunDIC: sobel_div = 2^(2*ksize - 3) = 2^7 = 128 for ksize=5
+    # 기존: 32.0 사용 중 → 호환성 유지
+    sobel_div = 32.0  # 또는 2.0 ** (2 * ksize - 3) = 128.0
+    
+    grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=ksize) / sobel_div
+    grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=ksize) / sobel_div
     return grad_x, grad_y
 
 

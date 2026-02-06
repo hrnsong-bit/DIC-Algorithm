@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from .models.app_state import AppState
+from .models.settings import SettingsManager
 from .controllers.main_controller import MainController
 from .controllers.dic_controller import DICController
 from .views.canvas_view import CanvasView
@@ -15,31 +16,87 @@ class SpeckleQualityGUI:
     """스페클 품질 분석 메인 윈도우"""
     
     def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Speckle Analysis Suite v3.3")
-        self.root.geometry("1500x950")
-        self._last_navigate_time = 0
-        
-        # 상태 초기화
-        self.state = AppState()
-        
-        # UI 먼저 생성
-        self._create_notebook()
-        self._create_menu()
-        
-        # 컨트롤러 초기화 (UI 생성 후!)
-        self.controller = MainController(self.state)
-        self.controller.set_views(self.canvas_view, self.param_panel)
-        
-        # DIC 컨트롤러 (DICTab 생성 후!)
-        self.dic_controller = DICController(self.dic_tab, self.state, self.controller)
-        
-        self._connect_controller()
-        self._start_periodic_check()
-        
-        # 초기 탭에 맞게 키 바인딩 설정
-        self._on_tab_changed(None)
+            self.root = root
+            self.root.title("Speckle Analysis Suite v3.3")
+            self.root.geometry("1500x950")
+            self._last_navigate_time = 0
+            
+            # 설정 관리자 초기화
+            self.settings = SettingsManager()
+            
+            # 상태 초기화
+            self.state = AppState()
+            
+            # UI 먼저 생성
+            self._create_notebook()
+            self._create_menu()
+            
+            # 컨트롤러 초기화 (UI 생성 후!)
+            self.controller = MainController(self.state)
+            self.controller.set_views(self.canvas_view, self.param_panel)
+            
+            # DIC 컨트롤러 (DICTab 생성 후!)
+            self.dic_controller = DICController(self.dic_tab, self.state, self.controller)
+            
+            self._connect_controller()
+            self._start_periodic_check()
+            
+            # 저장된 설정 적용
+            self._apply_saved_settings()
+            
+            # 초기 탭에 맞게 키 바인딩 설정
+            self._on_tab_changed(None)
+            
+            # 종료 시 설정 저장
+            self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+    def _apply_saved_settings(self):
+        """저장된 설정 적용"""
+        try:
+            # DIC 탭에 파라미터 적용
+            dic_params = self.settings.get_dic_params()
+            self.dic_tab.set_parameters(dic_params)
+            
+            # 품질평가 탭에 파라미터 적용
+            from .views.param_panel import Parameters
+            quality_params = Parameters(
+                mig_threshold=self.settings.get('mig_threshold', 30.0),
+                sssig_threshold=self.settings.get('sssig_threshold', 1e5),
+                subset_size=self.settings.get('quality_subset_size', 21),
+                spacing=self.settings.get('quality_spacing', 16)
+            )
+            self.param_panel.set_parameters(quality_params)
+            
+            print("[INFO] 저장된 설정 적용 완료")
+        except Exception as e:
+            print(f"[WARN] 설정 적용 실패: {e}")
+
     
+    def _on_closing(self):
+        """앱 종료 시 설정 저장"""
+        try:
+            # DIC 탭 파라미터 저장
+            dic_params = self.dic_tab.get_parameters()
+            self.settings.update(dic_params)
+            
+            # 품질평가 탭 파라미터 저장
+            quality_params = self.param_panel.get_parameters()
+            if quality_params:
+                self.settings.set('mig_threshold', quality_params.mig_threshold)
+                self.settings.set('sssig_threshold', quality_params.sssig_threshold)
+                self.settings.set('quality_subset_size', quality_params.subset_size)
+                self.settings.set('quality_spacing', quality_params.spacing)
+            
+            # 마지막 폴더 저장
+            if self.state.folder_path:
+                self.settings.set('last_folder', str(self.state.folder_path))
+            
+            self.settings.save()
+            print("[INFO] 설정 저장 완료")
+        except Exception as e:
+            print(f"[WARN] 설정 저장 실패: {e}")
+        
+        self.root.destroy()
+
     def _create_menu(self):
         """메뉴바 생성"""
         menubar = tk.Menu(self.root)

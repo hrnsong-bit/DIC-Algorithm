@@ -7,17 +7,15 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox
-
 from speckle.core.initial_guess import (
     compute_fft_cc, compute_fft_cc_batch_cached, warmup_fft_cc, 
     validate_displacement_field,
     FFTCCResult, ValidationResult
 )
 from speckle.io import load_image, get_image_files
-
 from ..models.app_state import AppState
-
 from speckle.core.optimization import compute_icgn
+from speckle.core.postprocess import compute_strain_from_icgn, StrainResult
 
 @dataclass
 class DICState:
@@ -216,46 +214,66 @@ class DICController:
                 self._refresh_display()
     
     def _update_result_ui(self, result):
-        """결과 UI 업데이트 (FFTCCResult, ICGNResult 둘 다 지원)"""
+        """결과 UI 업데이트 (깔끔한 버전)"""
         if result is None:
             return
-            
-        u_min = np.min(result.disp_u) if len(result.disp_u) > 0 else 0
-        u_max = np.max(result.disp_u) if len(result.disp_u) > 0 else 0
-        v_min = np.min(result.disp_v) if len(result.disp_v) > 0 else 0
-        v_max = np.max(result.disp_v) if len(result.disp_v) > 0 else 0
         
-        # ICGNResult인지 확인
+        u = result.disp_u
+        v = result.disp_v
+        valid = result.valid_mask if hasattr(result, 'valid_mask') else np.ones(len(u), bool)
+        
+        u_valid = u[valid]
+        v_valid = v[valid]
+        
         is_icgn = hasattr(result, 'converged')
+        filename = self.state.def_path.name if self.state.def_path else "N/A"
         
         if is_icgn:
-            text = f"""=== IC-GN 결과 ===
-    Shape Function: {result.shape_function}
-    총 POI: {result.n_points}
-    수렴: {result.n_converged} ({result.convergence_rate*100:.1f}%)
-    유효: {result.n_valid}
-    평균 반복: {result.mean_iterations:.1f}
-    평균 ZNCC: {result.mean_zncc:.4f}
-
-    변위 범위:
-    U: [{u_min:.4f}, {u_max:.4f}] px
-    V: [{v_min:.4f}, {v_max:.4f}] px
-
-    처리 시간: {result.processing_time:.2f}초"""
+            lines = []
+            lines.append(f"Shape: {result.shape_function}")
+            lines.append("")
+            lines.append(f"POI: {result.n_converged}/{result.n_points} ({result.convergence_rate*100:.1f}%)")
+            lines.append(f"반복: {result.mean_iterations:.1f}회 | ZNCC: {result.mean_zncc:.4f}")
+            lines.append("")
+            lines.append("── 변위 ──")
+            lines.append(f"U: {np.mean(u_valid):.4f} ± {np.std(u_valid):.4f}")
+            lines.append(f"   [{np.min(u_valid):.4f} ~ {np.max(u_valid):.4f}]")
+            lines.append(f"V: {np.mean(v_valid):.4f} ± {np.std(v_valid):.4f}")
+            lines.append(f"   [{np.min(v_valid):.4f} ~ {np.max(v_valid):.4f}]")
+            
+            # 변형률
+            if hasattr(result, 'disp_ux') and result.disp_ux is not None:
+                ux = result.disp_ux[valid]
+                uy = result.disp_uy[valid]
+                vx = result.disp_vx[valid]
+                vy = result.disp_vy[valid]
+                
+                lines.append("")
+                lines.append("── 변형률 ──")
+                lines.append(f"ux: {np.mean(ux): .5f} ± {np.std(ux):.5f}")
+                lines.append(f"uy: {np.mean(uy): .5f} ± {np.std(uy):.5f}")
+                lines.append(f"vx: {np.mean(vx): .5f} ± {np.std(vx):.5f}")
+                lines.append(f"vy: {np.mean(vy): .5f} ± {np.std(vy):.5f}")
+            
+            lines.append("")
+            lines.append(f"시간: {result.processing_time:.2f}초")
+            
+            text = "\n".join(lines)
+        
         else:
             # FFTCCResult
-            text = f"""=== FFTCC 결과 ===
-    총 POI: {result.n_points}
-    유효 포인트: {result.n_valid}
-    불량 포인트: {result.n_invalid}
-    유효율: {result.valid_ratio * 100:.1f}%
-    평균 ZNCC: {result.mean_zncc:.4f}
+            text = f"""파일: {filename}
 
-    변위 범위:
-    U: [{u_min:.4f}, {u_max:.4f}] px
-    V: [{v_min:.4f}, {v_max:.4f}] px
+    POI: {result.n_valid}/{result.n_points} ({result.valid_ratio*100:.1f}%)
+    ZNCC: {result.mean_zncc:.4f}
 
-    처리 시간: {result.processing_time:.2f}초"""
+    ── 변위 ──
+    U: {np.mean(u_valid):.4f} ± {np.std(u_valid):.4f}
+    [{np.min(u_valid):.4f} ~ {np.max(u_valid):.4f}]
+    V: {np.mean(v_valid):.4f} ± {np.std(v_valid):.4f}
+    [{np.min(v_valid):.4f} ~ {np.max(v_valid):.4f}]
+
+    시간: {result.processing_time:.2f}초"""
         
         self.view.update_result_text(text)
 
@@ -392,16 +410,23 @@ class DICController:
                 
                 # === 2단계: IC-GN ===
                 self.view.after(0, lambda: self.view.update_progress(50, "IC-GN 시작..."))
-                
+
                 def icgn_progress(current, total):
                     if self.state.should_stop:
                         raise InterruptedError("사용자 중단")
                     progress = 50 + (current / total) * 50
                     self.view.after(0, lambda p=progress, c=current, t=total: 
                                     self.view.update_progress(p, f"IC-GN: {c}/{t}"))
-                
+
                 interp_order = 5 if params['interpolation'] == 'biquintic' else 3
-                
+
+                # POI 좌표를 전체 이미지 좌표로 변환
+                if self.state.roi:
+                    rx, ry, rw, rh = self.state.roi
+                    fftcc_result.points_x = fftcc_result.points_x + rx
+                    fftcc_result.points_y = fftcc_result.points_y + ry
+
+                # 전체 이미지 사용
                 icgn_result = compute_icgn(
                     self.state.ref_image,
                     self.state.def_image,
@@ -411,9 +436,10 @@ class DICController:
                     interpolation_order=interp_order,
                     convergence_threshold=params['conv_threshold'],
                     max_iterations=params['max_iter'],
-                    gaussian_blur=params.get('gaussian_blur'),  # 추가
+                    gaussian_blur=params.get('gaussian_blur'),
                     progress_callback=icgn_progress
                 )
+
                 print(f"\n[DEBUG] ===== IC-GN 입력 확인 =====")
                 print(f"[DEBUG] ROI: {self.state.roi}")
                 print(f"[DEBUG] Ref image shape: {self.state.ref_image.shape}")
@@ -490,7 +516,7 @@ class DICController:
             self._run_batch_streaming(params)
     
     def _run_batch_cached(self, params: Dict[str, Any]):
-        """캐시된 이미지로 배치 분석 (FFTCC + IC-GN)"""
+        """캐시된 이미지로 배치 분석 (FFTCC + IC-GN) - 시간 분석 포함"""
         if self.state.is_running:
             return
         
@@ -514,10 +540,23 @@ class DICController:
         def worker():
             error_msg = None
             
+            # ===== 시간 측정용 변수 =====
+            import time
+            import traceback
+            timings = {
+                'image_load': [],
+                'fftcc': [],
+                'icgn': [],
+                'icgn_internal': [],
+                'result_save': [],
+                'gui_update': [],
+            }
+            batch_start = time.time()
+            
             try:
-                all_files = self.state.sequence_files[1:] if self.state.sequence_files else self.app_state.file_paths[1:]
+                all_files = self.state.sequence_files if self.state.sequence_files else self.app_state.file_paths
                 cached_files = [f for f in all_files if f.name in self.app_state.images]
-                
+
                 if not cached_files:
                     raise ValueError("분석할 캐시된 이미지가 없습니다.")
                 
@@ -529,19 +568,28 @@ class DICController:
                         break
                     
                     filename = def_path.name
+                    iter_start = time.time()
                     
                     # 진행률 업데이트
+                    t_gui_start = time.time()
                     progress = (file_idx / total_files) * 100
                     self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
                                 self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
                     self.view.after(0, lambda idx=file_idx+1: self.view.set_current_index(idx))
+                    t_gui_end = time.time()
+                    timings['gui_update'].append(t_gui_end - t_gui_start)
                     
                     # 캐시에서 이미지 가져오기
+                    t_load_start = time.time()
                     def_image = self.app_state.get_image(filename)
+                    t_load_end = time.time()
+                    timings['image_load'].append(t_load_end - t_load_start)
+                    
                     if def_image is None:
                         continue
                     
                     # === 1단계: FFTCC ===
+                    t_fftcc_start = time.time()
                     fftcc_result = compute_fft_cc(
                         self.state.ref_image,
                         def_image,
@@ -551,14 +599,25 @@ class DICController:
                         zncc_threshold=params['zncc_threshold'],
                         roi=self.state.roi
                     )
+                    t_fftcc_end = time.time()
+                    timings['fftcc'].append(t_fftcc_end - t_fftcc_start)
+                    
                     print(f"\n[DEBUG] ===== {filename} =====")
                     print(f"[DEBUG] FFTCC U: [{np.min(fftcc_result.disp_u)}, {np.max(fftcc_result.disp_u)}]")
                     print(f"[DEBUG] FFTCC V: [{np.min(fftcc_result.disp_v)}, {np.max(fftcc_result.disp_v)}]")
                     print(f"[DEBUG] 파라미터: gaussian_blur = {params.get('gaussian_blur')}")
                     
-                    # === 2단계: IC-GN ===
+                   # === 2단계: IC-GN ===
+                    t_icgn_start = time.time()
                     interp_order = 5 if params['interpolation'] == 'biquintic' else 3
-                    
+
+                    # POI 좌표를 전체 이미지 좌표로 변환
+                    if self.state.roi:
+                        rx, ry, rw, rh = self.state.roi
+                        fftcc_result.points_x = fftcc_result.points_x + rx
+                        fftcc_result.points_y = fftcc_result.points_y + ry
+
+                    # 전체 이미지 사용
                     icgn_result = compute_icgn(
                         self.state.ref_image,
                         def_image,
@@ -568,21 +627,75 @@ class DICController:
                         interpolation_order=interp_order,
                         convergence_threshold=params['conv_threshold'],
                         max_iterations=params['max_iter'],
-                        gaussian_blur=params.get('gaussian_blur')  # 추가
+                        gaussian_blur=params.get('gaussian_blur')
                     )
-                    
+                    t_icgn_end = time.time()
+                    timings['icgn'].append(t_icgn_end - t_icgn_start)
+                    timings['icgn_internal'].append(icgn_result.processing_time)
+
+
+                    # 결과 저장
+                    t_save_start = time.time()
                     self.state.batch_results[filename] = icgn_result
-                    
+                    t_save_end = time.time()
+                    timings['result_save'].append(t_save_end - t_save_start)
+
+                    iter_end = time.time()
+
                     print(f"[DEBUG] {file_idx+1}/{total_files}: {filename} - 수렴 {icgn_result.n_converged}/{icgn_result.n_points}")
                     print(f"[DEBUG] IC-GN U: [{np.min(icgn_result.disp_u):.4f}, {np.max(icgn_result.disp_u):.4f}]")
                     print(f"[DEBUG] IC-GN V: [{np.min(icgn_result.disp_v):.4f}, {np.max(icgn_result.disp_v):.4f}]")
-                    print(f"[DEBUG] 수렴: {icgn_result.n_converged}/{icgn_result.n_points}")
+
+                    # 개별 파일 시간 출력
+                    print(f"[TIME] {filename}:")
+                    print(f"       FFTCC: {timings['fftcc'][-1]:.3f}초")
+                    print(f"       IC-GN 전체: {timings['icgn'][-1]:.3f}초")
+                    print(f"       IC-GN 내부: {timings['icgn_internal'][-1]:.3f}초")
+                    print(f"       반복 전체: {iter_end - iter_start:.3f}초")
+
 
                 # 마지막 결과 저장
                 if self.state.batch_results:
                     last_key = list(self.state.batch_results.keys())[-1]
                     self.state.icgn_result = self.state.batch_results[last_key]
                     self.state.fft_cc_result = self.state.batch_results[last_key]
+                
+                batch_end = time.time()
+                
+                # ===== 시간 분석 결과 출력 =====
+                print(f"\n{'='*60}")
+                print(f"[TIME] ========== 시간 분석 결과 ==========")
+                print(f"{'='*60}")
+                print(f"분석 파일 수: {len(timings['fftcc'])}개")
+                print(f"")
+                print(f"[평균 시간 per 파일]")
+                print(f"  이미지 로드:    {np.mean(timings['image_load'])*1000:.1f} ms")
+                print(f"  FFTCC:          {np.mean(timings['fftcc']):.3f} 초")
+                print(f"  IC-GN 전체:     {np.mean(timings['icgn']):.3f} 초")
+                print(f"  IC-GN 내부:     {np.mean(timings['icgn_internal']):.3f} 초  ← 표시되는 값")
+                print(f"  IC-GN 오버헤드: {np.mean(timings['icgn']) - np.mean(timings['icgn_internal']):.3f} 초")
+                print(f"  결과 저장:      {np.mean(timings['result_save'])*1000:.1f} ms")
+                print(f"  GUI 업데이트:   {np.mean(timings['gui_update'])*1000:.1f} ms")
+                print(f"")
+                print(f"[총 시간]")
+                print(f"  이미지 로드:    {np.sum(timings['image_load']):.3f} 초")
+                print(f"  FFTCC:          {np.sum(timings['fftcc']):.3f} 초")
+                print(f"  IC-GN 전체:     {np.sum(timings['icgn']):.3f} 초")
+                print(f"  IC-GN 내부:     {np.sum(timings['icgn_internal']):.3f} 초")
+                print(f"  결과 저장:      {np.sum(timings['result_save']):.3f} 초")
+                print(f"  GUI 업데이트:   {np.sum(timings['gui_update']):.3f} 초")
+                print(f"")
+                print(f"  측정된 합계:    {sum(np.sum(v) for v in timings.values()):.3f} 초")
+                print(f"  배치 전체:      {batch_end - batch_start:.3f} 초")
+                print(f"  미측정 시간:    {(batch_end - batch_start) - sum(np.sum(v) for v in timings.values()):.3f} 초")
+                print(f"")
+                print(f"[비율 분석]")
+                total_measured = sum(np.sum(v) for v in timings.values())
+                if total_measured > 0:
+                    print(f"  FFTCC:          {np.sum(timings['fftcc'])/total_measured*100:.1f}%")
+                    print(f"  IC-GN:          {np.sum(timings['icgn'])/total_measured*100:.1f}%")
+                    print(f"  기타:           {(np.sum(timings['image_load']) + np.sum(timings['result_save']) + np.sum(timings['gui_update']))/total_measured*100:.1f}%")
+                print(f"{'='*60}\n")
                 
                 print(f"[DEBUG] 배치 완료: {len(self.state.batch_results)} 결과")
                 
@@ -606,6 +719,7 @@ class DICController:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
+
     def _run_batch_streaming(self, params: Dict[str, Any]):
             """스트리밍 배치 분석 (FFTCC + IC-GN)"""
             if not self.state.sequence_files or len(self.state.sequence_files) < 2:
@@ -626,7 +740,7 @@ class DICController:
                 error_msg = None
                 
                 try:
-                    files = self.state.sequence_files[1:]
+                    files = self.state.sequence_files
                     total_files = len(files)
                     
                     for file_idx, def_path in enumerate(files):
@@ -663,7 +777,14 @@ class DICController:
                         
                         # === 2단계: IC-GN ===
                         interp_order = 5 if params['interpolation'] == 'biquintic' else 3
-                        
+
+                        # POI 좌표를 전체 이미지 좌표로 변환
+                        if self.state.roi:
+                            rx, ry, rw, rh = self.state.roi
+                            fftcc_result.points_x = fftcc_result.points_x + rx
+                            fftcc_result.points_y = fftcc_result.points_y + ry
+
+                        # 전체 이미지 사용
                         icgn_result = compute_icgn(
                             self.state.ref_image,
                             def_image,
@@ -673,8 +794,9 @@ class DICController:
                             interpolation_order=interp_order,
                             convergence_threshold=params['conv_threshold'],
                             max_iterations=params['max_iter'],
-                            gaussian_blur=params.get('gaussian_blur')  # 추가
+                            gaussian_blur=params.get('gaussian_blur')
                         )
+
                         
                         self.state.batch_results[filename] = icgn_result
                         
@@ -795,25 +917,213 @@ class DICController:
             display_img = base_img.copy()
         
         mode = self.view.display_mode_var.get()
-        # scale = self.view.vector_scale_var.get()  ← 이 줄 삭제
         
         offset_x = 0
         offset_y = 0
-        if self.state.roi is not None:
-            offset_x = self.state.roi[0]
-            offset_y = self.state.roi[1]
         
         if mode == "vectors":
-            display_img = self._draw_vectors(display_img, result, offset_x, offset_y)  # scale 제거
+            display_img = self._draw_vectors(display_img, result, offset_x, offset_y)
+        elif mode == "u_field":
+            display_img = self._draw_scalar_field(display_img, result, 'u', offset_x, offset_y)
+        elif mode == "v_field":
+            display_img = self._draw_scalar_field(display_img, result, 'v', offset_x, offset_y)
         elif mode == "magnitude":
             display_img = self._draw_magnitude(display_img, result, offset_x, offset_y)
+        elif mode == "exx":
+            display_img = self._draw_strain_field(display_img, result, 'exx', offset_x, offset_y)
+        elif mode == "eyy":
+            display_img = self._draw_strain_field(display_img, result, 'eyy', offset_x, offset_y)
+        elif mode == "exy":
+            display_img = self._draw_strain_field(display_img, result, 'exy', offset_x, offset_y)
+        elif mode == "e1":
+            display_img = self._draw_strain_field(display_img, result, 'e1', offset_x, offset_y)
+        elif mode == "von_mises":
+            display_img = self._draw_strain_field(display_img, result, 'von_mises', offset_x, offset_y)
         elif mode == "zncc":
             display_img = self._draw_zncc_map(display_img, result, offset_x, offset_y)
         elif mode == "invalid":
             display_img = self._draw_invalid_points(display_img, result, offset_x, offset_y)
         
         return display_img
+    def _draw_scalar_field(self, img: np.ndarray, result, field_type: str,
+                        offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
+        """변위 필드 시각화 (U 또는 V)"""
+        if result.n_points == 0:
+            return img
+        
+        if field_type == 'u':
+            values = result.disp_u
+            label = "U (px)"
+        elif field_type == 'v':
+            values = result.disp_v
+            label = "V (px)"
+        else:  # magnitude
+            values = np.sqrt(result.disp_u**2 + result.disp_v**2)
+            label = "|D| (px)"
+        
+        valid = result.valid_mask
+        valid_values = values[valid]
+        
+        if len(valid_values) == 0:
+            return img
+        
+        # 범위 결정
+        color_range = self.view.get_color_range()
+        if color_range is not None:
+            vmin, vmax = color_range
+        else:
+            vmin, vmax = np.min(valid_values), np.max(valid_values)
+            # 대칭 범위
+            if field_type in ['u', 'v']:
+                v_abs_max = max(abs(vmin), abs(vmax))
+                if v_abs_max < 1e-10:
+                    v_abs_max = 1.0
+                vmin, vmax = -v_abs_max, v_abs_max
+        
+        # 컬러바 업데이트 (이미지 밖)
+        colormap = 'diverging' if field_type in ['u', 'v'] else 'sequential'
+        self.view.update_colorbar(vmin, vmax, label, colormap)
+        
+        # POI 그리기
+        for idx in range(result.n_points):
+            x = int(result.points_x[idx]) + offset_x
+            y = int(result.points_y[idx]) + offset_y
+            
+            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
+                continue
+            
+            if result.valid_mask[idx]:
+                norm_val = (values[idx] - vmin) / (vmax - vmin + 1e-10)
+                norm_val = np.clip(norm_val, 0, 1)
+                
+                if colormap == 'diverging':
+                    color = self._diverging_colormap(norm_val)
+                else:
+                    color = self._sequential_colormap(norm_val)
+                
+                cv2.circle(img, (x, y), 4, color, -1)
+            else:
+                cv2.circle(img, (x, y), 4, (128, 128, 128), -1)
+        
+        return img
 
+    def _draw_strain_field(self, img: np.ndarray, result, strain_type: str,
+                        offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
+        """변형률 필드 시각화"""
+        if result.n_points == 0:
+            return img
+        
+        is_icgn = hasattr(result, 'disp_ux') and result.disp_ux is not None
+        if not is_icgn:
+            cv2.putText(img, "IC-GN 결과 필요", (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            return img
+        
+        from speckle.core.postprocess import compute_strain_from_icgn
+        strain = compute_strain_from_icgn(result)
+        
+        # 필드 선택
+        field_map = {
+            'exx': (strain.exx, "εxx"),
+            'eyy': (strain.eyy, "εyy"),
+            'exy': (strain.exy, "εxy"),
+            'e1': (strain.e1, "ε1"),
+            'von_mises': (strain.von_mises, "ε_vm")
+        }
+        
+        if strain_type not in field_map:
+            return img
+        
+        values, label = field_map[strain_type]
+        valid = strain.valid_mask
+        valid_values = values[valid]
+        
+        if len(valid_values) == 0:
+            return img
+        
+        # 범위 결정
+        color_range = self.view.get_color_range()
+        if color_range is not None:
+            vmin, vmax = color_range
+        else:
+            vmin, vmax = np.min(valid_values), np.max(valid_values)
+            # 대칭 범위 (변형률은 보통 대칭)
+            v_abs_max = max(abs(vmin), abs(vmax))
+            if v_abs_max < 1e-10:
+                v_abs_max = 1e-6
+            vmin, vmax = -v_abs_max, v_abs_max
+        
+        # 컬러바 업데이트
+        self.view.update_colorbar(vmin, vmax, label, 'diverging')
+        
+        # POI 그리기
+        for idx in range(result.n_points):
+            x = int(result.points_x[idx]) + offset_x
+            y = int(result.points_y[idx]) + offset_y
+            
+            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
+                continue
+            
+            if strain.valid_mask[idx]:
+                norm_val = (values[idx] - vmin) / (vmax - vmin + 1e-10)
+                norm_val = np.clip(norm_val, 0, 1)
+                color = self._diverging_colormap(norm_val)
+                cv2.circle(img, (x, y), 4, color, -1)
+            else:
+                cv2.circle(img, (x, y), 4, (128, 128, 128), -1)
+        
+        return img
+
+    def _diverging_colormap(self, norm_value: float) -> tuple:
+        """
+        Diverging colormap (파랑 - 흰색 - 빨강)
+        0.0 = 파랑 (음수)
+        0.5 = 흰색 (0)
+        1.0 = 빨강 (양수)
+        """
+        if norm_value < 0.5:
+            # 파랑 → 흰색
+            t = norm_value * 2
+            r = int(t * 255)
+            g = int(t * 255)
+            b = 255
+        else:
+            # 흰색 → 빨강
+            t = (norm_value - 0.5) * 2
+            r = 255
+            g = int((1 - t) * 255)
+            b = int((1 - t) * 255)
+        
+        return (b, g, r)  # BGR
+    
+    def _draw_colorbar_diverging(self, img: np.ndarray, min_val: float, max_val: float, label: str) -> np.ndarray:
+        """Diverging colorbar"""
+        h, w = img.shape[:2]
+        bar_width, bar_height, margin = 20, 150, 10
+        x_start, y_start = w - bar_width - margin - 50, margin
+        
+        # 배경
+        cv2.rectangle(img, (x_start - 5, y_start - 5), 
+                    (x_start + bar_width + 60, y_start + bar_height + 35), (40, 40, 40), -1)
+        
+        # 컬러바
+        for i in range(bar_height):
+            norm_val = 1 - (i / bar_height)
+            color = self._diverging_colormap(norm_val)
+            cv2.line(img, (x_start, y_start + i), (x_start + bar_width, y_start + i), color, 1)
+        
+        # 라벨
+        cv2.putText(img, f"{max_val:.2e}", (x_start + bar_width + 3, y_start + 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+        cv2.putText(img, "0", (x_start + bar_width + 3, y_start + bar_height // 2 + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+        cv2.putText(img, f"{min_val:.2e}", (x_start + bar_width + 3, y_start + bar_height),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+        cv2.putText(img, label, (x_start, y_start + bar_height + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        return img
+    
     def _draw_vectors(self, img: np.ndarray, result: FFTCCResult,
                     offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
         """변위 벡터 시각화 (자동 스케일)"""
@@ -849,31 +1159,34 @@ class DICController:
         
         return img
     
-    def _draw_magnitude(self, img: np.ndarray, result: FFTCCResult,
+    def _draw_magnitude(self, img: np.ndarray, result,
                         offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        if result.n_points == 0:
-            return img
-        
-        magnitudes = np.sqrt(result.disp_u.astype(float)**2 + result.disp_v.astype(float)**2)
-        max_mag = np.max(magnitudes) if len(magnitudes) > 0 else 1
-        
-        for idx in range(result.n_points):
-            x = int(result.points_x[idx]) + offset_x
-            y = int(result.points_y[idx]) + offset_y
-            
-            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
-                continue
-            
-            if result.valid_mask[idx]:
-                norm_mag = magnitudes[idx] / max_mag if max_mag > 0 else 0
-                color = self._magnitude_to_color(norm_mag)
-                cv2.circle(img, (x, y), 4, color, -1)
-            else:
-                cv2.circle(img, (x, y), 4, (128, 128, 128), -1)
-        
-        img = self._draw_colorbar(img, 0, max_mag, "Displacement (px)")
-        return img
+        """변위 크기 시각화"""
+        return self._draw_scalar_field(img, result, 'magnitude', offset_x, offset_y)
     
+    def _sequential_colormap(self, norm_value: float) -> tuple:
+        """
+        Sequential colormap (파랑 → 초록 → 노랑 → 빨강)
+        """
+        if norm_value < 0.25:
+            r = 0
+            g = int(norm_value * 4 * 255)
+            b = 255
+        elif norm_value < 0.5:
+            r = 0
+            g = 255
+            b = int((1 - (norm_value - 0.25) * 4) * 255)
+        elif norm_value < 0.75:
+            r = int((norm_value - 0.5) * 4 * 255)
+            g = 255
+            b = 0
+        else:
+            r = 255
+            g = int((1 - (norm_value - 0.75) * 4) * 255)
+            b = 0
+        
+        return (b, g, r)  # BGR
+
     def _draw_zncc_map(self, img: np.ndarray, result: FFTCCResult,
                        offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
         if result.n_points == 0:

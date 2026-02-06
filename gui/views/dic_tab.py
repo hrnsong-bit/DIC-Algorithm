@@ -7,7 +7,7 @@ from typing import Optional, Callable, Dict, Any, List
 import numpy as np
 
 from .canvas_view import CanvasView
-
+from ..models.settings import SettingsManager
 
 class DICTab(ttk.Frame):
     """DIC 변위 분석을 위한 탭"""
@@ -263,31 +263,103 @@ class DICTab(ttk.Frame):
         ttk.Button(zoom_frame, text="1:1", width=5, command=self._set_zoom_1to1).pack(side=tk.LEFT)
 
     def _setup_right_panel(self):
-        """오른쪽 패널: 결과 정보 + 파일 목록"""
-        right_frame = ttk.Frame(self.main_paned, width=250)
+        """오른쪽 패널: 표시 옵션 + 결과 + 파일 목록"""
+        right_frame = ttk.Frame(self.main_paned, width=280)
         self.main_paned.add(right_frame, weight=0)
         
         # === 표시 옵션 ===
         display_frame = ttk.LabelFrame(right_frame, text="표시", padding=5)
         display_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        self.display_mode_var = tk.StringVar(value="vectors")
-        modes = [("벡터", "vectors"), ("크기", "magnitude"), ("ZNCC", "zncc"), ("불량", "invalid")]
-        mode_frame = ttk.Frame(display_frame)
-        mode_frame.pack(fill=tk.X)
-        for text, value in modes:
-            ttk.Radiobutton(mode_frame, text=text, value=value,
-                           variable=self.display_mode_var,
-                           command=self._update_display).pack(side=tk.LEFT)
+        self.display_mode_var = tk.StringVar(value="invalid")
+        
+        # 변위 섹션
+        ttk.Label(display_frame, text="변위:", font=("", 8, "bold")).pack(anchor=tk.W)
+        disp_frame = ttk.Frame(display_frame)
+        disp_frame.pack(fill=tk.X)
+        
+        for text, value in [("벡터", "vectors"), ("U", "u_field"), ("V", "v_field"), ("크기", "magnitude")]:
+            ttk.Radiobutton(disp_frame, text=text, value=value,
+                        variable=self.display_mode_var,
+                        command=self._update_display).pack(side=tk.LEFT)
+        
+        # 변형률 섹션
+        ttk.Label(display_frame, text="변형률:", font=("", 8, "bold")).pack(anchor=tk.W, pady=(5, 0))
+        strain_frame1 = ttk.Frame(display_frame)
+        strain_frame1.pack(fill=tk.X)
+        
+        for text, value in [("εxx", "exx"), ("εyy", "eyy"), ("εxy", "exy")]:
+            ttk.Radiobutton(strain_frame1, text=text, value=value,
+                        variable=self.display_mode_var,
+                        command=self._update_display).pack(side=tk.LEFT)
+        
+        strain_frame2 = ttk.Frame(display_frame)
+        strain_frame2.pack(fill=tk.X)
+        
+        for text, value in [("ε1", "e1"), ("von Mises", "von_mises")]:
+            ttk.Radiobutton(strain_frame2, text=text, value=value,
+                        variable=self.display_mode_var,
+                        command=self._update_display).pack(side=tk.LEFT)
+        
+        # 기타 섹션
+        ttk.Label(display_frame, text="기타:", font=("", 8, "bold")).pack(anchor=tk.W, pady=(5, 0))
+        etc_frame = ttk.Frame(display_frame)
+        etc_frame.pack(fill=tk.X)
+        
+        for text, value in [("ZNCC", "zncc"), ("불량", "invalid")]:
+            ttk.Radiobutton(etc_frame, text=text, value=value,
+                        variable=self.display_mode_var,
+                        command=self._update_display).pack(side=tk.LEFT)
+        
+        # === 컬러바 + 범위 조절 ===
+        colorbar_frame = ttk.LabelFrame(right_frame, text="컬러 범위", padding=5)
+        colorbar_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # 컬러바 캔버스
+        self.colorbar_canvas = tk.Canvas(colorbar_frame, width=200, height=25, bg='gray20', highlightthickness=0)
+        self.colorbar_canvas.pack(fill=tk.X, pady=(0, 5))
+        
+        # 자동/수동 범위
+        range_mode_frame = ttk.Frame(colorbar_frame)
+        range_mode_frame.pack(fill=tk.X)
+        
+        self.range_auto_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(range_mode_frame, text="자동 범위", 
+                    variable=self.range_auto_var,
+                    command=self._on_range_mode_changed).pack(side=tk.LEFT)
+        
+        # 수동 범위 입력
+        self.range_frame = ttk.Frame(colorbar_frame)
+        self.range_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        ttk.Label(self.range_frame, text="Min:").pack(side=tk.LEFT)
+        self.range_min_var = tk.StringVar(value="-1.0")
+        self.range_min_entry = ttk.Entry(self.range_frame, textvariable=self.range_min_var, width=8)
+        self.range_min_entry.pack(side=tk.LEFT, padx=(2, 10))
+        
+        ttk.Label(self.range_frame, text="Max:").pack(side=tk.LEFT)
+        self.range_max_var = tk.StringVar(value="1.0")
+        self.range_max_entry = ttk.Entry(self.range_frame, textvariable=self.range_max_var, width=8)
+        self.range_max_entry.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Button(self.range_frame, text="적용", width=4,
+                command=self._update_display).pack(side=tk.LEFT, padx=(5, 0))
+        
+        # 초기에는 수동 범위 비활성화
+        self._on_range_mode_changed()
+        
+        # 현재 범위 표시 라벨
+        self.range_label = ttk.Label(colorbar_frame, text="", font=("Consolas", 8))
+        self.range_label.pack(anchor=tk.W)
         
         # === 결과 정보 ===
         result_frame = ttk.LabelFrame(right_frame, text="결과", padding=5)
         result_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        self.result_text = tk.Text(result_frame, height=10, width=28, 
+        self.result_text = tk.Text(result_frame, height=8, width=28, 
                                     state=tk.DISABLED, font=("Consolas", 8))
         result_scroll = ttk.Scrollbar(result_frame, orient=tk.VERTICAL,
-                                       command=self.result_text.yview)
+                                    command=self.result_text.yview)
         self.result_text.configure(yscrollcommand=result_scroll.set)
         self.result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         result_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -296,8 +368,8 @@ class DICTab(ttk.Frame):
         valid_frame = ttk.LabelFrame(right_frame, text="검증", padding=5)
         valid_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        self.valid_text = tk.Text(valid_frame, height=5, width=28,
-                                   state=tk.DISABLED, font=("Consolas", 8))
+        self.valid_text = tk.Text(valid_frame, height=4, width=28,
+                                state=tk.DISABLED, font=("Consolas", 8))
         self.valid_text.pack(fill=tk.BOTH, expand=True)
         
         # === 파일 목록 ===
@@ -310,12 +382,84 @@ class DICTab(ttk.Frame):
         list_frame = ttk.Frame(file_frame)
         list_frame.pack(fill=tk.BOTH, expand=True)
         
-        self.file_listbox = tk.Listbox(list_frame, height=8, font=("", 8), selectmode=tk.SINGLE)
+        self.file_listbox = tk.Listbox(list_frame, height=6, font=("", 8), selectmode=tk.SINGLE)
         file_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
         self.file_listbox.configure(yscrollcommand=file_scroll.set)
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         file_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.file_listbox.bind('<<ListboxSelect>>', self._on_file_select)
+    
+    def _on_range_mode_changed(self):
+        """자동/수동 범위 모드 변경"""
+        if self.range_auto_var.get():
+            # 자동 모드: 입력 비활성화
+            self.range_min_entry.configure(state='disabled')
+            self.range_max_entry.configure(state='disabled')
+        else:
+            # 수동 모드: 입력 활성화
+            self.range_min_entry.configure(state='normal')
+            self.range_max_entry.configure(state='normal')
+        
+        self._update_display()
+
+    def update_colorbar(self, vmin: float, vmax: float, label: str = "", colormap: str = 'diverging'):
+        """컬러바 업데이트"""
+        self.colorbar_canvas.delete("all")
+        
+        width = self.colorbar_canvas.winfo_width()
+        if width < 10:
+            width = 200
+        height = 25
+        
+        # 컬러바 그리기
+        for i in range(width):
+            norm_val = i / width
+            
+            if colormap == 'diverging':
+                # 파랑 → 흰색 → 빨강
+                if norm_val < 0.5:
+                    t = norm_val * 2
+                    r = int(t * 255)
+                    g = int(t * 255)
+                    b = 255
+                else:
+                    t = (norm_val - 0.5) * 2
+                    r = 255
+                    g = int((1 - t) * 255)
+                    b = int((1 - t) * 255)
+            else:
+                # Sequential (파랑 → 초록 → 노랑 → 빨강)
+                if norm_val < 0.25:
+                    r, g, b = 0, int(norm_val * 4 * 255), 255
+                elif norm_val < 0.5:
+                    r, g, b = 0, 255, int((1 - (norm_val - 0.25) * 4) * 255)
+                elif norm_val < 0.75:
+                    r, g, b = int((norm_val - 0.5) * 4 * 255), 255, 0
+                else:
+                    r, g, b = 255, int((1 - (norm_val - 0.75) * 4) * 255), 0
+            
+            color = f'#{r:02x}{g:02x}{b:02x}'
+            self.colorbar_canvas.create_line(i, 0, i, height, fill=color)
+        
+        # 범위 라벨 업데이트
+        self.range_label.configure(text=f"{label}: [{vmin:.4g}, {vmax:.4g}]")
+        
+        # 자동 모드일 때 입력란도 업데이트
+        if self.range_auto_var.get():
+            self.range_min_var.set(f"{vmin:.4g}")
+            self.range_max_var.set(f"{vmax:.4g}")
+
+    def get_color_range(self):
+        """현재 컬러 범위 반환 (자동이면 None, 수동이면 (min, max))"""
+        if self.range_auto_var.get():
+            return None
+        else:
+            try:
+                vmin = float(self.range_min_var.get())
+                vmax = float(self.range_max_var.get())
+                return (vmin, vmax)
+            except ValueError:
+                return None
     
     # === 콜백 메서드 ===
     
@@ -371,8 +515,8 @@ class DICTab(ttk.Frame):
             self._call('select_image_index', selection[0])
     
     # === 공개 메서드 ===
-    
     def get_parameters(self) -> Dict[str, Any]:
+        """현재 파라미터 반환"""
         gaussian_blur = None
         if self.gaussian_blur_var.get():
             gaussian_blur = self.blur_kernel_var.get()
@@ -382,18 +526,44 @@ class DICTab(ttk.Frame):
             'spacing': self.spacing_var.get(),
             'search_range': self.search_var.get(),
             'zncc_threshold': self.zncc_var.get(),
-            'shape_function': self.shape_func_var.get(),
+            'shape_function': self.shape_func_var.get(),  # 수정
             'interpolation': self.interp_var.get(),
+            'gaussian_blur': gaussian_blur,  # 수정
+            'gaussian_blur_enabled': self.gaussian_blur_var.get(),  # 추가
             'conv_threshold': self.conv_threshold_var.get(),
             'max_iter': self.max_iter_var.get(),
-            'gaussian_blur': gaussian_blur,
         }
-    
+
     def set_parameters(self, params: Dict[str, Any]):
-        if 'subset_size' in params:
-            self.subset_var.set(params['subset_size'])
-        if 'spacing' in params:
-            self.spacing_var.set(params['spacing'])
+        """파라미터 설정"""
+        try:
+            if params.get('subset_size') is not None:
+                self.subset_var.set(params['subset_size'])
+            if params.get('spacing') is not None:
+                self.spacing_var.set(params['spacing'])
+            if params.get('search_range') is not None:
+                self.search_var.set(params['search_range'])
+            if params.get('zncc_threshold') is not None:
+                self.zncc_var.set(params['zncc_threshold'])
+            if params.get('shape_function') is not None:
+                self.shape_func_var.set(params['shape_function'])  # 수정
+            if params.get('interpolation') is not None:
+                self.interp_var.set(params['interpolation'])
+            if params.get('conv_threshold') is not None:
+                self.conv_threshold_var.set(params['conv_threshold'])
+            if params.get('max_iter') is not None:
+                self.max_iter_var.set(params['max_iter'])
+            if params.get('gaussian_blur_enabled'):
+                self.gaussian_blur_var.set(True)  # 수정
+                self._toggle_gaussian_blur()  # 콤보박스 활성화
+                if params.get('gaussian_blur'):
+                    self.blur_kernel_var.set(params['gaussian_blur'])  # 수정
+            else:
+                self.gaussian_blur_var.set(False)
+                self._toggle_gaussian_blur()
+        except Exception as e:
+            print(f"[WARN] 파라미터 설정 중 오류: {e}")
+
     
     def update_reference_label(self, text: str):
         self.ref_label.configure(text=text[:20], foreground="black")
