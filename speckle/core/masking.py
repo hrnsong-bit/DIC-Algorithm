@@ -24,7 +24,7 @@ def create_specimen_mask(image: np.ndarray,
     Parameters
     ----------
     dark_threshold : int
-        이 값 이하 픽셀을 결함으로 판정 (기본 5)
+        이 값 이하 픽셀을 결함으로 판정 (기본 25)
     min_hole_area : int
         결함으로 인정할 최소 면적(px). 노이즈 제거용.
     morph_size : int
