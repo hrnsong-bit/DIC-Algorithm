@@ -296,29 +296,34 @@ def compute_fft_cc(ref_image, def_image,
         (points_y - half >= 0) & (points_y + half < ref_h) &
         (points_x - half >= 0) & (points_x + half < ref_w)
     )
-    # ===== 적응적 search_range (Adaptive Search Range) =====
-    # 시편 마스크 → distance transform → POI별 경계 거리 → search_range 결정
-    # 비용: ~10ms (1회), 이후 FFTCC 성능에 영향 없음
+        # ===== 적응적 search_range =====
+    # 이미지 경계 기반 (기본) + 마스크 기반 홀 제한 (추가)
+    
+    # 1) 이미지 경계 기반 search_range (항상 적용)
+    margin_top = points_y
+    margin_bot = def_h - 1 - points_y
+    margin_left = points_x
+    margin_right = def_w - 1 - points_x
+    max_possible = np.minimum(
+        np.minimum(margin_top, margin_bot),
+        np.minimum(margin_left, margin_right)
+    ) - half
+    poi_search_range = np.clip(max_possible.astype(np.int32), 0, search_range)
+    
+    # 2) 마스크 기반 홀 제한 (성공 시만 추가 적용)
     try:
-        specimen_mask = create_specimen_mask(ref_gray)
+        specimen_mask = create_specimen_mask(ref_gray.astype(np.uint8))
         dist_map = distance_transform_edt(specimen_mask > 0)
         poi_dist = dist_map[points_y.astype(int), points_x.astype(int)]
-        poi_search_range = np.clip(
+        mask_sr = np.clip(
             (poi_dist - half).astype(np.int32),
             0,
             search_range
         )
+        poi_search_range = np.minimum(poi_search_range, mask_sr)
+        poi_search_range[poi_dist <= half] = 0
     except Exception:
-        # 마스크 실패 시 이미지 경계 기반 폴백
-        margin_top = points_y
-        margin_bot = def_h - 1 - points_y
-        margin_left = points_x
-        margin_right = def_w - 1 - points_x
-        max_possible = np.minimum(
-            np.minimum(margin_top, margin_bot),
-            np.minimum(margin_left, margin_right)
-        ) - half
-        poi_search_range = np.clip(max_possible.astype(np.int32), 0, search_range)
+        pass
 
     # 최소 search_range 필터
     MIN_SR = 3
@@ -345,7 +350,6 @@ def compute_fft_cc(ref_image, def_image,
             g_px = points_x[group_idx]
             g_ext_half = half + sr
 
-            # deformed 이미지 경계 검사
             def_valid = (
                 (g_py - g_ext_half >= 0) & (g_py + g_ext_half < def_h) &
                 (g_px - g_ext_half >= 0) & (g_px + g_ext_half < def_w)
@@ -375,6 +379,18 @@ def compute_fft_cc(ref_image, def_image,
         progress_callback(n_points, n_points)
 
     valid_mask = zncc_values >= zncc_threshold
+
+    # ===== 홀 내부 POI 제거 (결과에서 완전 제외) =====
+    analyzable = poi_search_range >= MIN_SR
+    if not np.all(analyzable):
+        keep = analyzable
+        points_y = points_y[keep]
+        points_x = points_x[keep]
+        disp_u = disp_u[keep]
+        disp_v = disp_v[keep]
+        zncc_values = zncc_values[keep]
+        valid_mask = valid_mask[keep]
+
     invalid_points = _collect_invalid_points(
         points_y, points_x, disp_u, disp_v, zncc_values, valid_mask, zncc_threshold
     )
@@ -394,6 +410,7 @@ def compute_fft_cc(ref_image, def_image,
         spacing=spacing,
         processing_time=processing_time
     )
+
 
 def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
                                  subset_size=21, spacing=10, search_range=None,
