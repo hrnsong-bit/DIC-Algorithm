@@ -28,6 +28,8 @@ except ImportError:
     HAS_SCIPY_FFT = False
 
 from .results import MatchResult, FFTCCResult
+from scipy.ndimage import distance_transform_edt
+from speckle.core.masking import create_specimen_mask
 
 
 # ★ CHANGED: 내부 고정 탐색 범위 (UI에서 제어하지 않음)
@@ -223,25 +225,46 @@ def _fft_zncc(template: np.ndarray, search_win: np.ndarray) -> Tuple[int, int, f
 
 # ===== 메인 함수 =====
 
-# ★ CHANGED: search_range 기본값 _SEARCH_RANGE, 실제 사용
+# search_range 기본값 _SEARCH_RANGE, 실제 사용
 def compute_fft_cc(ref_image, def_image,
                    subset_size=21, spacing=10, search_range=None,
                    zncc_threshold=0.6, roi=None,
                    n_workers=None, progress_callback=None) -> FFTCCResult:
     """
-    확장 탐색 범위 FFT-CC
-
-    search_range: 탐색 범위 (±search_range 픽셀). None이면 내부 기본값 사용.
+    적응적 탐색 범위 FFT-CC (Adaptive Search Range FFT Cross-Correlation)
+    
+    시편 마스크의 distance transform을 이용하여 각 POI별 최적 search_range를 
+    자동 결정. 시편 경계 근처 POI는 축소된 범위로, 내부 POI는 전체 범위로 탐색.
+    
+    기존 고정 search_range 방식의 문제:
+        - 경계 근처 POI의 확장 서브셋에 배경(비스페클) 영역이 포함
+        - ZNCC 저하 → 불량 판정 → 유효 POI 손실
+    
+    해결:
+        1. create_specimen_mask()로 시편 영역 검출
+        2. distance_transform_edt()로 각 픽셀의 시편 경계까지 거리 계산 (1회, ~ms)
+        3. POI별 search_range = min(경계거리 - half, 요청값)
+        4. 동일 search_range끼리 그룹화하여 배치 FFT 수행
+    
+    Args:
+        ref_image: 참조 이미지
+        def_image: 변형 이미지  
+        subset_size: 서브셋 크기 (홀수)
+        spacing: POI 간격
+        search_range: 최대 탐색 범위 (±px). None이면 내부 기본값 사용
+        zncc_threshold: ZNCC 유효 판정 임계값
+        roi: 관심 영역 (x, y, w, h)
+    
+    Returns:
+        FFTCCResult: 정수 픽셀 변위 및 ZNCC 점수
     """
     start_time = time.time()
 
-    # ★ CHANGED: search_range 결정
     if search_range is None:
         search_range = _SEARCH_RANGE
 
     ref_gray = _to_gray(ref_image).astype(np.float32)
     def_gray = _to_gray(def_image).astype(np.float32)
-
     ref_h, ref_w = ref_gray.shape
     def_h, def_w = def_gray.shape
 
@@ -257,15 +280,39 @@ def compute_fft_cc(ref_image, def_image,
         progress_callback(0, n_points)
 
     half = subset_size // 2
-    ext_half = half + search_range  # ★ CHANGED: 확장 반경
 
-    # ★ CHANGED: 경계 검사 — ref는 half, tar(def)는 ext_half
-    valid = (
+    # ref 경계 검사 (subset 추출 가능 여부)
+    ref_valid = (
         (points_y - half >= 0) & (points_y + half < ref_h) &
-        (points_x - half >= 0) & (points_x + half < ref_w) &
-        (points_y - ext_half >= 0) & (points_y + ext_half < def_h) &
-        (points_x - ext_half >= 0) & (points_x + ext_half < def_w)
+        (points_x - half >= 0) & (points_x + half < ref_w)
     )
+    # ===== 적응적 search_range (Adaptive Search Range) =====
+    # 시편 마스크 → distance transform → POI별 경계 거리 → search_range 결정
+    # 비용: ~10ms (1회), 이후 FFTCC 성능에 영향 없음
+    try:
+        specimen_mask = create_specimen_mask(ref_gray)
+        dist_map = distance_transform_edt(specimen_mask > 0)
+        poi_dist = dist_map[points_y.astype(int), points_x.astype(int)]
+        poi_search_range = np.clip(
+            (poi_dist - half).astype(np.int32),
+            0,
+            search_range
+        )
+    except Exception:
+        # 마스크 실패 시 이미지 경계 기반 폴백
+        margin_top = points_y
+        margin_bot = def_h - 1 - points_y
+        margin_left = points_x
+        margin_right = def_w - 1 - points_x
+        max_possible = np.minimum(
+            np.minimum(margin_top, margin_bot),
+            np.minimum(margin_left, margin_right)
+        ) - half
+        poi_search_range = np.clip(max_possible.astype(np.int32), 0, search_range)
+
+    # 최소 search_range 필터
+    MIN_SR = 3
+    valid = ref_valid & (poi_search_range >= MIN_SR)
 
     disp_u = np.zeros(n_points, dtype=np.int32)
     disp_v = np.zeros(n_points, dtype=np.int32)
@@ -274,23 +321,45 @@ def compute_fft_cc(ref_image, def_image,
     valid_idx = np.where(valid)[0]
 
     if len(valid_idx) > 0:
-        v_py = points_y[valid_idx]
-        v_px = points_x[valid_idx]
+        valid_sr = poi_search_range[valid_idx]
+        unique_sr = np.unique(valid_sr)
 
-        # ★ CHANGED: ref는 원본 크기, tar는 확장 크기
-        ref_subsets = _extract_subsets_batch(ref_gray, v_py, v_px, half)
-        tar_subsets = _extract_subsets_batch_extended(def_gray, v_py, v_px, ext_half)
-
-        # 배치 FFT-ZNCC
         fft_workers = -1 if HAS_SCIPY_FFT else 1
-        du, dv, scores = _batch_fft_zncc(
-            ref_subsets, tar_subsets,
-            n_workers=fft_workers
-        )
 
-        disp_u[valid_idx] = du
-        disp_v[valid_idx] = dv
-        zncc_values[valid_idx] = scores
+        for sr in unique_sr:
+            sr = int(sr)
+            group_mask = valid_sr == sr
+            group_idx = valid_idx[group_mask]
+
+            g_py = points_y[group_idx]
+            g_px = points_x[group_idx]
+            g_ext_half = half + sr
+
+            # deformed 이미지 경계 검사
+            def_valid = (
+                (g_py - g_ext_half >= 0) & (g_py + g_ext_half < def_h) &
+                (g_px - g_ext_half >= 0) & (g_px + g_ext_half < def_w)
+            )
+
+            def_valid_idx = np.where(def_valid)[0]
+            if len(def_valid_idx) == 0:
+                continue
+
+            final_idx = group_idx[def_valid_idx]
+            f_py = points_y[final_idx]
+            f_px = points_x[final_idx]
+
+            ref_subsets = _extract_subsets_batch(ref_gray, f_py, f_px, half)
+            tar_subsets = _extract_subsets_batch_extended(def_gray, f_py, f_px, g_ext_half)
+
+            du, dv, scores = _batch_fft_zncc(
+                ref_subsets, tar_subsets,
+                n_workers=fft_workers
+            )
+
+            disp_u[final_idx] = du
+            disp_v[final_idx] = dv
+            zncc_values[final_idx] = scores
 
     if progress_callback:
         progress_callback(n_points, n_points)
@@ -316,13 +385,18 @@ def compute_fft_cc(ref_image, def_image,
         processing_time=processing_time
     )
 
-
-# ★ CHANGED: batch_cached도 동일하게 확장
 def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
                                  subset_size=21, spacing=10, search_range=None,
                                  zncc_threshold=0.6, roi=None,
                                  progress_callback=None, should_stop=None):
-    """배치 처리 — 참조 서브셋 캐시, 확장 탐색 범위"""
+    """
+    배치 FFT-CC — 참조 서브셋 캐시 + 적응적 탐색 범위
+    
+    compute_fft_cc의 배치 버전. 추가 최적화:
+        - 시편 마스크 및 distance transform: ref 기준 1회 계산, 전 프레임 공유
+        - ref 서브셋: search_range 그룹별 1회 추출, 전 프레임 재사용
+        - 프레임별로는 tar 서브셋 추출 + FFT만 수행
+    """
     results = {}
     if not def_file_paths:
         return results
@@ -341,20 +415,57 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
         return results
 
     half = subset_size // 2
-    ext_half = half + search_range  # ★ CHANGED
 
-    # 참조 서브셋 경계 검사 (원본 크기)
+    # ref 경계 검사
     ref_valid = (
         (points_y - half >= 0) & (points_y + half < ref_h) &
         (points_x - half >= 0) & (points_x + half < ref_w)
     )
 
-    ref_valid_idx = np.where(ref_valid)[0]
-    ref_subsets = None
-    if len(ref_valid_idx) > 0:
-        ref_subsets = _extract_subsets_batch(
-            ref_gray, points_y[ref_valid_idx], points_x[ref_valid_idx], half
+    # ★ 시편 마스크 기반 적응적 search_range
+    try:
+        specimen_mask = create_specimen_mask(ref_gray)
+        dist_map = distance_transform_edt(specimen_mask > 0)
+        poi_dist = dist_map[points_y.astype(int), points_x.astype(int)]
+        poi_search_range = np.clip(
+            (poi_dist - half).astype(np.int32),
+            0,
+            search_range
         )
+    except Exception:
+        margin_top = points_y
+        margin_bot = ref_h - 1 - points_y
+        margin_left = points_x
+        margin_right = ref_w - 1 - points_x
+        max_possible = np.minimum(
+            np.minimum(margin_top, margin_bot),
+            np.minimum(margin_left, margin_right)
+        ) - half
+        poi_search_range = np.clip(max_possible.astype(np.int32), 0, search_range)
+
+    MIN_SR = 3
+    valid = ref_valid & (poi_search_range >= MIN_SR)
+    valid_idx = np.where(valid)[0]
+
+    # ★ search_range별 그룹 사전 구성 + ref 서브셋 캐시
+    valid_sr = poi_search_range[valid_idx]
+    unique_sr = np.unique(valid_sr)
+
+    # ref 서브셋은 항상 같은 크기 (half 기준) → 그룹별로 캐시
+    ref_subsets_cache = {}
+    for sr in unique_sr:
+        sr = int(sr)
+        group_mask = valid_sr == sr
+        group_idx = valid_idx[group_mask]
+        g_py = points_y[group_idx]
+        g_px = points_x[group_idx]
+        ref_subsets_cache[sr] = {
+            'group_idx': group_idx,
+            'g_py': g_py,
+            'g_px': g_px,
+            'ref_subsets': _extract_subsets_batch(ref_gray, g_py, g_px, half),
+            'ext_half': half + sr
+        }
 
     fft_workers = -1 if HAS_SCIPY_FFT else 1
     total_files = len(def_file_paths)
@@ -364,7 +475,7 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
             break
 
         filename = def_path.name
-        start_time = time.time()
+        file_start_time = time.time()
 
         if progress_callback:
             progress_callback(file_idx, total_files, filename)
@@ -380,33 +491,38 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
         disp_v = np.zeros(n_points, dtype=np.int32)
         zncc_values = np.zeros(n_points, dtype=np.float64)
 
-        if ref_subsets is not None and len(ref_valid_idx) > 0:
-            # ★ CHANGED: 타겟 경계 검사 — ext_half 사용
-            tar_valid = (
-                (points_y[ref_valid_idx] - ext_half >= 0) &
-                (points_y[ref_valid_idx] + ext_half < def_h) &
-                (points_x[ref_valid_idx] - ext_half >= 0) &
-                (points_x[ref_valid_idx] + ext_half < def_w)
+        # ★ 그룹별 배치 처리
+        for sr, cache in ref_subsets_cache.items():
+            group_idx = cache['group_idx']
+            g_py = cache['g_py']
+            g_px = cache['g_px']
+            ref_subsets = cache['ref_subsets']
+            g_ext_half = cache['ext_half']
+
+            # deformed 이미지 경계 검사
+            def_valid = (
+                (g_py - g_ext_half >= 0) & (g_py + g_ext_half < def_h) &
+                (g_px - g_ext_half >= 0) & (g_px + g_ext_half < def_w)
             )
 
-            both_valid = np.where(tar_valid)[0]
+            def_valid_idx = np.where(def_valid)[0]
+            if len(def_valid_idx) == 0:
+                continue
 
-            if len(both_valid) > 0:
-                global_idx = ref_valid_idx[both_valid]
-                v_py = points_y[global_idx]
-                v_px = points_x[global_idx]
+            final_idx = group_idx[def_valid_idx]
+            f_py = points_y[final_idx]
+            f_px = points_x[final_idx]
 
-                # ★ CHANGED: 확장 타겟 서브셋
-                tar_subsets = _extract_subsets_batch_extended(def_gray, v_py, v_px, ext_half)
+            tar_subsets = _extract_subsets_batch_extended(def_gray, f_py, f_px, g_ext_half)
 
-                du, dv, scores = _batch_fft_zncc(
-                    ref_subsets[both_valid], tar_subsets,
-                    n_workers=fft_workers
-                )
+            du, dv, scores = _batch_fft_zncc(
+                ref_subsets[def_valid_idx], tar_subsets,
+                n_workers=fft_workers
+            )
 
-                disp_u[global_idx] = du
-                disp_v[global_idx] = dv
-                zncc_values[global_idx] = scores
+            disp_u[final_idx] = du
+            disp_v[final_idx] = dv
+            zncc_values[final_idx] = scores
 
         valid_mask = zncc_values >= zncc_threshold
         invalid_points = _collect_invalid_points(
@@ -425,14 +541,13 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
             subset_size=subset_size,
             search_range=search_range,
             spacing=spacing,
-            processing_time=time.time() - start_time
+            processing_time=time.time() - file_start_time
         )
 
     if progress_callback:
         progress_callback(total_files, total_files, "완료")
 
     return results
-
 
 # ===== 유틸리티 함수 =====
 
@@ -442,7 +557,6 @@ def _to_gray(img: np.ndarray) -> np.ndarray:
     if len(img.shape) == 3:
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return img
-
 
 def _generate_poi_grid(image_shape: Tuple[int, int],
                        subset_size: int,
@@ -472,7 +586,6 @@ def _generate_poi_grid(image_shape: Tuple[int, int],
     yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
     return yy.ravel().astype(np.int64), xx.ravel().astype(np.int64)
 
-
 def _collect_invalid_points(points_y, points_x, disp_u, disp_v,
                             zncc_values, valid_mask, threshold):
     invalid_indices = np.where(~valid_mask)[0]
@@ -490,7 +603,6 @@ def _collect_invalid_points(points_y, points_x, disp_u, disp_v,
         ))
     return invalid_points
 
-
 def _empty_result(subset_size, search_range, spacing):
     return FFTCCResult(
         points_y=np.array([], dtype=np.int64),
@@ -504,7 +616,6 @@ def _empty_result(subset_size, search_range, spacing):
         search_range=search_range,
         spacing=spacing
     )
-
 
 def warmup_fft_cc():
     dummy = np.random.randint(0, 255, (200, 200), dtype=np.uint8)
