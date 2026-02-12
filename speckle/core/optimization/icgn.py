@@ -145,10 +145,6 @@ def compute_icgn(
         px = points_x[idx]
         py = points_y[idx]
         
-        # FFTCC 결과가 유효하지 않으면 스킵
-        if not initial_guess.valid_mask[idx]:
-            return idx, np.zeros(n_params), 0.0, 0, False
-        
         # Reference subset 추출
         ref_data = _extract_reference_subset(
             ref_gray, grad_x, grad_y, px, py, subset_size
@@ -285,7 +281,7 @@ def _icgn_iterate(
     """
     단일 POI에 대한 IC-GN 반복
     """
-    import time  # 추가
+    import time
     
     n_iter = 0
     conv = False
@@ -298,7 +294,7 @@ def _icgn_iterate(
     time_zncc = 0
     time_solve = 0
     time_update = 0
-    debug_timing = (cx < 100 and cy < 100)  # 처음 몇 개만
+    debug_timing = (cx < 100 and cy < 100)
     
     if shape_function == 'affine':
         u_idx, v_idx = 0, 3
@@ -319,11 +315,17 @@ def _icgn_iterate(
         y_def = cy + eta_w
         t1 = time.perf_counter()
         time_warp += (t1 - t0)
-        
+
         # 보간
         g = target_interp(y_def, x_def)
         t2 = time.perf_counter()
         time_interp += (t2 - t1)
+        
+        # 보간 결과 유효성 검사
+        if np.any(g <= 0.0):
+            zncc = -3.0
+            conv = False
+            break
         
         # ZNCC 계산
         g_mean = np.mean(g)
@@ -354,7 +356,7 @@ def _icgn_iterate(
         if conv:
             break
         
-        if dp_norm > 2.0:
+        if dp_norm > 1.0:
             conv = False
             break
         

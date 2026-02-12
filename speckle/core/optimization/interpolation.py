@@ -7,66 +7,46 @@ Bicubic (3차) 및 Biquintic (5차) B-spline 보간 지원
 """
 
 import numpy as np
-from scipy.ndimage import map_coordinates
-from typing import Callable
-
+from scipy.ndimage import map_coordinates, spline_filter
 
 class ImageInterpolator:
-    """이미지 보간 클래스"""
+    """
+    B-spline 보간기. 생성 시 spline 계수를 사전 계산(precompute)하여
+    이후 보간 호출에서 중복 계산을 제거합니다.
     
-    def __init__(self, image: np.ndarray, order: int = 5):
-        """
-        Args:
-            image: 2D 그레이스케일 이미지
-            order: 보간 차수 (3=bicubic, 5=biquintic)
-        """
+    Pan et al. (2013) "Fast, robust and accurate digital image correlation
+    calculation without redundant computations" 의 핵심 최적화 중 하나로,
+    IC-GN에서 타겟 이미지 보간 계수를 한 번만 계산합니다.
+    
+    OpenCorr(oc_cubic_bspline.cpp)에서도 prepare() 단계에서
+    전체 이미지에 대해 계수 테이블을 사전 계산하는 동일한 접근을 사용합니다.
+    """
+    
+    def __init__(self, image, order=5):
         if order not in (3, 5):
-            raise ValueError("order must be 3 (bicubic) or 5 (biquintic)")
-        
-        self.image = image.astype(np.float64)
+            raise ValueError("order must be 3 or 5")
         self.order = order
-        self.height, self.width = image.shape
-    
-    def __call__(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:
-        """
-        보간된 픽셀값 반환
+        self.image = np.asarray(image, dtype=np.float64)
+        self.height, self.width = self.image.shape
         
-        Args:
-            y: y 좌표 배열
-            x: x 좌표 배열
-        
-        Returns:
-            보간된 intensity 값
-        """
-        coords = np.array([y.ravel(), x.ravel()])
-        result = map_coordinates(
-            self.image, 
-            coords, 
-            order=self.order, 
-            mode='constant', 
-            cval=0.0
-        )
-        return result.reshape(y.shape)
-    
-    def is_inside(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:
-        """좌표가 이미지 내부인지 확인"""
+        # B-spline 계수를 사전 계산 (Pan 2013 / OpenCorr prepare() 방식)
+        # 이후 map_coordinates 호출 시 prefilter=False로 중복 계산 제거
+        self._coeffs = spline_filter(self.image, order=self.order,
+                                     mode='constant')
+
+    def __call__(self, y, x):
+        coords = np.array([y, x])
+        result = map_coordinates(self._coeffs, coords,
+                                 order=self.order,
+                                 mode='constant', cval=0.0,
+                                 prefilter=False)
+        return result.reshape(np.asarray(y).shape)
+
+    def is_inside(self, y, x):
         margin = self.order // 2 + 1
-        inside = (
-            (y >= margin) & (y < self.height - margin) &
-            (x >= margin) & (x < self.width - margin)
-        )
-        return inside
+        return ((y >= margin) & (y < self.height - margin) &
+                (x >= margin) & (x < self.width - margin))
 
 
-def create_interpolator(image: np.ndarray, order: int = 5) -> ImageInterpolator:
-    """
-    보간 함수 생성
-    
-    Args:
-        image: 2D 그레이스케일 이미지
-        order: 보간 차수 (3 or 5)
-    
-    Returns:
-        ImageInterpolator 인스턴스
-    """
-    return ImageInterpolator(image, order)
+def create_interpolator(image, order=5):
+    return ImageInterpolator(image, order=order)

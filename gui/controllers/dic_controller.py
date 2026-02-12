@@ -907,12 +907,8 @@ class DICController:
         
         mode = self.view.display_mode_var.get()
         
-        if self.state.roi:
-            offset_x = self.state.roi[0]  # rx
-            offset_y = self.state.roi[1]  # ry
-        else:
-            offset_x = 0
-            offset_y = 0
+        offset_x = 0
+        offset_y = 0
         
         if mode == "vectors":
             display_img = self._draw_vectors(display_img, result, offset_x, offset_y)

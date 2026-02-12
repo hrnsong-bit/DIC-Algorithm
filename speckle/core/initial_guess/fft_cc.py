@@ -73,102 +73,91 @@ def _fft_zncc(template: np.ndarray, search_win: np.ndarray) -> Tuple[int, int, f
     
     return int(peak_y), int(peak_x), float(zncc_valid[peak_y, peak_x])
 
-def compute_fft_cc(ref_image: np.ndarray,
-                   def_image: np.ndarray,
-                   subset_size: int = 21,
-                   spacing: int = 10,
-                   search_range: int = 50,
-                   zncc_threshold: float = 0.6,
-                   roi: Optional[Tuple[int, int, int, int]] = None,
-                   n_workers: Optional[int] = None,
-                   progress_callback: Optional[Callable[[int, int], None]] = None) -> FFTCCResult:
-    """
-    FFT-CC 기반 전체 필드 초기 변위 추정 (단일 이미지 쌍)
-    """
+def compute_fft_cc(ref_image, def_image,
+                   subset_size=21, spacing=10, search_range=50,
+                   zncc_threshold=0.6, roi=None,
+                   n_workers=None, progress_callback=None) -> FFTCCResult:
+
     start_time = time.time()
-    
-    # 전처리
+
     ref_gray = _to_gray(ref_image).astype(np.float32)
     def_gray = _to_gray(def_image).astype(np.float32)
-    
-    # ROI 처리
-    ref_roi, def_extended, roi_offset = _apply_roi(ref_gray, def_gray, roi, search_range)
-    
-    # POI 그리드 생성
-    points_y, points_x = _generate_poi_grid(ref_roi.shape, subset_size, spacing)
-    
+
+    # 전체 이미지 + ROI 범위 내 글로벌 POI
+    points_y, points_x = _generate_poi_grid(
+        ref_gray.shape, subset_size, spacing, roi=roi
+    )
+
     n_points = len(points_y)
     if n_points == 0:
         return _empty_result(subset_size, search_range, spacing)
-    
+
     if progress_callback:
         progress_callback(0, n_points)
-    
     if n_workers is None:
         n_workers = max(1, os.cpu_count() - 1)
-    
-    # 결과 배열
+
     disp_u = np.zeros(n_points, dtype=np.int32)
     disp_v = np.zeros(n_points, dtype=np.int32)
     zncc_values = np.zeros(n_points, dtype=np.float64)
-    
+
     half = subset_size // 2
-    ox, oy = roi_offset
-    def_h, def_w = def_extended.shape
+    ref_h, ref_w = ref_gray.shape
+    def_h, def_w = def_gray.shape
     
     def process_poi(idx: int) -> Tuple[int, int, int, float]:
         py, px = points_y[idx], points_x[idx]
-        
-        template = ref_roi[py - half:py + half + 1, px - half:px + half + 1]
-        
-        sy1 = max(0, py + oy - search_range)
-        sy2 = min(def_h, py + oy + search_range + subset_size)
-        sx1 = max(0, px + ox - search_range)
-        sx2 = min(def_w, px + ox + search_range + subset_size)
-        
-        search_win = def_extended[sy1:sy2, sx1:sx2]
-        
+
+        # reference subset — 글로벌 좌표에서 직접 추출
+        template = ref_gray[py - half:py + half + 1,
+                            px - half:px + half + 1]
+
+        # search window — 글로벌 좌표 기준으로 search_range 확장
+        sy1 = max(0, py - search_range)
+        sy2 = min(def_h, py + search_range + subset_size)
+        sx1 = max(0, px - search_range)
+        sx2 = min(def_w, px + search_range + subset_size)
+
+        search_win = def_gray[sy1:sy2, sx1:sx2]
+
         if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
             return idx, 0, 0, 0.0
-        
-        # FFT-CC 호출
+
         best_y, best_x, zncc = _fft_zncc(template, search_win)
-        
-        du = (sx1 + best_x + half) - (px + ox)
-        dv = (sy1 + best_y + half) - (py + oy)
-        
+
+        # 변위 = (deformed 위치) - (reference 위치)
+        du = (sx1 + best_x + half) - px
+        dv = (sy1 + best_y + half) - py
+
         return idx, du, dv, zncc
-    
-    # 병렬 처리
+
     completed = 0
     update_interval = max(1, n_points // 50)
-    
+
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(process_poi, i): i for i in range(n_points)}
-        
         for future in as_completed(futures):
             idx, du, dv, zncc = future.result()
             disp_u[idx] = du
             disp_v[idx] = dv
             zncc_values[idx] = zncc
-            
             completed += 1
             if progress_callback and completed % update_interval == 0:
                 progress_callback(completed, n_points)
-    
+
     if progress_callback:
         progress_callback(n_points, n_points)
-    
+
     valid_mask = zncc_values >= zncc_threshold
     invalid_points = _collect_invalid_points(
         points_y, points_x, disp_u, disp_v, zncc_values, valid_mask, zncc_threshold
     )
-    
+
     processing_time = time.time() - start_time
-    
+
     return FFTCCResult(
-        points_y=points_y,
-        points_x=points_x,
+        points_y=points_y,   # ★ 글로벌 좌표
+        points_x=points_x,   # ★ 글로벌 좌표
         disp_u=disp_u,
         disp_v=disp_v,
         zncc_values=zncc_values,
@@ -180,152 +169,102 @@ def compute_fft_cc(ref_image: np.ndarray,
         processing_time=processing_time
     )
 
+def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
+                                 subset_size=21, spacing=10, search_range=50,
+                                 zncc_threshold=0.6, roi=None,
+                                 progress_callback=None, should_stop=None):
 
-def compute_fft_cc_batch_cached(
-    ref_image: np.ndarray,
-    def_file_paths: List[Path],
-    get_image_func: Callable[[Path], Optional[np.ndarray]],
-    subset_size: int = 21,
-    spacing: int = 10,
-    search_range: int = 50,
-    zncc_threshold: float = 0.6,
-    roi: Optional[Tuple[int, int, int, int]] = None,
-    progress_callback: Optional[Callable[[int, int, str], None]] = None,
-    should_stop: Optional[Callable[[], bool]] = None
-) -> Dict[str, FFTCCResult]:
-    """
-    캐시된 이미지를 사용한 배치 FFT-CC 분석
-    """
     results = {}
-    
     if not def_file_paths:
         return results
-    
-    # ===== 사전 처리 (한 번만) =====
+
     ref_gray = _to_gray(ref_image).astype(np.float32)
-    
-    # ROI 처리
-    if roi is not None:
-        rx, ry, rw, rh = roi
-        ref_roi = ref_gray[ry:ry+rh, rx:rx+rw]
-    else:
-        ref_roi = ref_gray
-        rx, ry = 0, 0
-    
-    # POI 그리드 생성
-    h, w = ref_roi.shape
-    half = subset_size // 2
-    margin = half + search_range + 1
-    
-    y_coords = np.arange(margin, h - margin, spacing)
-    x_coords = np.arange(margin, w - margin, spacing)
-    
-    if len(y_coords) == 0 or len(x_coords) == 0:
-        return results
-    
-    yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
-    points_y = yy.ravel().astype(np.int64)
-    points_x = xx.ravel().astype(np.int64)
+    ref_h, ref_w = ref_gray.shape
+
+    # 글로벌 좌표 POI 생성
+    points_y, points_x = _generate_poi_grid(
+        ref_gray.shape, subset_size, spacing, roi=roi
+    )
     n_points = len(points_y)
-    
-    # 템플릿 사전 추출
+    if n_points == 0:
+        return results
+
+    half = subset_size // 2
+
+    # 템플릿 사전 추출 — 글로벌 좌표에서 직접
     templates = []
+    valid_poi = np.ones(n_points, dtype=bool)
     for idx in range(n_points):
         py, px = points_y[idx], points_x[idx]
-        template = ref_roi[py - half:py + half + 1, px - half:px + half + 1].copy()
+        template = ref_gray[py - half:py + half + 1,
+                            px - half:px + half + 1].copy()
         templates.append(template)
-    
-    # ===== 배치 처리 =====
+
     n_workers = max(1, os.cpu_count() - 1)
     total_files = len(def_file_paths)
-    
+
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        
         for file_idx, def_path in enumerate(def_file_paths):
             if should_stop and should_stop():
                 break
-            
+
             filename = def_path.name
             start_time = time.time()
-            
+
             if progress_callback:
                 progress_callback(file_idx, total_files, filename)
-            
+
             def_image = get_image_func(def_path)
             if def_image is None:
                 continue
-            
+
             def_gray = _to_gray(def_image).astype(np.float32)
-            
-            # ROI 영역 + search_range 확장
-            if roi is not None:
-                y1 = max(0, ry - search_range)
-                y2 = min(def_gray.shape[0], ry + rh + search_range)
-                x1 = max(0, rx - search_range)
-                x2 = min(def_gray.shape[1], rx + rw + search_range)
-                def_extended = def_gray[y1:y2, x1:x2]
-                ox, oy = rx - x1, ry - y1
-            else:
-                def_extended = def_gray
-                ox, oy = 0, 0
-            
-            def_h, def_w = def_extended.shape
-            
-            # 결과 배열
+            def_h, def_w = def_gray.shape
+
             disp_u = np.zeros(n_points, dtype=np.int32)
             disp_v = np.zeros(n_points, dtype=np.int32)
             zncc_values = np.zeros(n_points, dtype=np.float64)
-            
-            def make_process_poi(def_ext, offset_x, offset_y, d_h, d_w):
-                def process_poi(idx: int) -> Tuple[int, int, int, float]:
+
+            def make_process_poi(d_gray, d_h, d_w):
+                def process_poi(idx):
                     py, px = points_y[idx], points_x[idx]
+                    
+                    # 참조 템플릿이 무효인 POI 스킵
+                    if not valid_poi[idx]:
+                        return idx, 0, 0, -1.0
+
                     template = templates[idx]
-                    
-                    sy1 = max(0, py + offset_y - search_range)
-                    sy2 = min(d_h, py + offset_y + search_range + subset_size)
-                    sx1 = max(0, px + offset_x - search_range)
-                    sx2 = min(d_w, px + offset_x + search_range + subset_size)
-                    
-                    search_win = def_ext[sy1:sy2, sx1:sx2]
-                    
+
+                    sy1 = max(0, py - search_range)
+                    sy2 = min(d_h, py + search_range + subset_size)
+                    sx1 = max(0, px - search_range)
+                    sx2 = min(d_w, px + search_range + subset_size)
+
+                    search_win = d_gray[sy1:sy2, sx1:sx2]
                     if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
                         return idx, 0, 0, 0.0
-                    
-                    # FFT-CC 호출
+
                     best_y, best_x, zncc = _fft_zncc(template, search_win)
-                    
-                    du = (sx1 + best_x + half) - (px + offset_x)
-                    dv = (sy1 + best_y + half) - (py + offset_y)
-                    
+                    du = (sx1 + best_x + half) - px
+                    dv = (sy1 + best_y + half) - py
                     return idx, du, dv, zncc
                 return process_poi
-            
-            process_poi = make_process_poi(def_extended, ox, oy, def_h, def_w)
-            
+
+            process_poi = make_process_poi(def_gray, def_h, def_w)
             futures = [executor.submit(process_poi, i) for i in range(n_points)]
-            
+
             for future in as_completed(futures):
                 idx, du, dv, zncc = future.result()
                 disp_u[idx] = du
                 disp_v[idx] = dv
                 zncc_values[idx] = zncc
-            
+
             valid_mask = zncc_values >= zncc_threshold
-            
-            invalid_points = []
-            for idx in np.where(~valid_mask)[0]:
-                invalid_points.append(MatchResult(
-                    ref_y=int(points_y[idx]),
-                    ref_x=int(points_x[idx]),
-                    disp_u=int(disp_u[idx]),
-                    disp_v=int(disp_v[idx]),
-                    zncc=float(zncc_values[idx]),
-                    valid=False,
-                    flag='low_zncc'
-                ))
-            
-            processing_time = time.time() - start_time
-            
+            invalid_points = _collect_invalid_points(
+                points_y, points_x, disp_u, disp_v,
+                zncc_values, valid_mask, zncc_threshold
+            )
+
             results[filename] = FFTCCResult(
                 points_y=points_y.copy(),
                 points_x=points_x.copy(),
@@ -337,14 +276,13 @@ def compute_fft_cc_batch_cached(
                 subset_size=subset_size,
                 search_range=search_range,
                 spacing=spacing,
-                processing_time=processing_time
+                processing_time=time.time() - start_time
             )
-    
+
     if progress_callback:
         progress_callback(total_files, total_files, "완료")
-    
-    return results
 
+    return results
 
 # ===== 유틸리티 함수 =====
 
@@ -379,22 +317,33 @@ def _apply_roi(ref: np.ndarray,
     return ref_roi, def_extended, roi_offset
 
 
-def _generate_poi_grid(shape: Tuple[int, int],
+def _generate_poi_grid(image_shape: Tuple[int, int],
                        subset_size: int,
-                       spacing: int) -> Tuple[np.ndarray, np.ndarray]:
-    """POI 그리드 생성"""
-    h, w = shape
+                       spacing: int,
+                       roi: Optional[Tuple[int, int, int, int]] = None
+                       ) -> Tuple[np.ndarray, np.ndarray]:
+    """POI 그리드 생성 — 항상 글로벌 좌표"""
+    h, w = image_shape  # 전체 이미지 크기
     half = subset_size // 2
     margin = half + 1
-    
-    y_coords = np.arange(margin, h - margin, spacing)
-    x_coords = np.arange(margin, w - margin, spacing)
-    
+
+    if roi is not None:
+        rx, ry, rw, rh = roi
+        y_start = max(margin, ry)
+        y_end   = min(h - margin, ry + rh)
+        x_start = max(margin, rx)
+        x_end   = min(w - margin, rx + rw)
+    else:
+        y_start, y_end = margin, h - margin
+        x_start, x_end = margin, w - margin
+
+    y_coords = np.arange(y_start, y_end, spacing)
+    x_coords = np.arange(x_start, x_end, spacing)
+
     if len(y_coords) == 0 or len(x_coords) == 0:
         return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
-    
+
     yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
-    
     return yy.ravel().astype(np.int64), xx.ravel().astype(np.int64)
 
 

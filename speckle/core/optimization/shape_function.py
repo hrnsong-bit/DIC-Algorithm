@@ -307,10 +307,11 @@ def _update_quadratic_matrix_optimized(p: np.ndarray, dp: np.ndarray) -> np.ndar
         [0.5*dvxx,   dvxy,  0.5*dvyy,     dvx,    1+dvy,      dv],
         [0,            0,         0,       0,        0,       1]
     ], dtype=np.float64)
-    
-    # W_new = W_p @ W_dp^(-1) = solve(W_dp, W_p)
+
+    # W_new = W_p @ W_dp^{-1}
     try:
-        W_new = np.linalg.solve(W_dp, W_p)
+        W_dp_inv = np.linalg.inv(W_dp)
+        W_new = W_p @ W_dp_inv
     except np.linalg.LinAlgError:
         return p.copy()
     
@@ -339,29 +340,40 @@ def check_convergence(
     shape_function: str = 'affine'
 ) -> Tuple[bool, float]:
     """
-    수렴 조건 - 변위 성분만 체크 (Pan/SunDIC 방식)
+    수렴 판정 — Jiang et al. (2015) / OpenCorr 방식
     
-    Pan et al. (2013), SunDIC에서 사용하는 표준 방식.
-    Jiang 방식은 subset 크기에 너무 민감하여 실용적이지 않음.
-    
-    Args:
-        dp: 파라미터 증분
-        subset_size: 서브셋 크기 (사용 안 함, 호환성 유지)
-        convergence_threshold: 수렴 임계값 (기본 0.001)
-        shape_function: 'affine' or 'quadratic'
-    
-    Returns:
-        (converged, norm_value): 수렴 여부와 norm 값
+    서브셋 가장자리에서의 최대 변위 변화량을 기준으로 판정.
+    dp_ux * R는 서브셋 끝에서 ux gradient로 인한 변위 기여분.
     """
+    half = subset_size // 2
+    R2 = half * half
+
     if shape_function == 'affine':
         # p = [u, ux, uy, v, vx, vy]
-        # u, v 변위만 체크 (인덱스 0, 3)
-        norm_p = np.sqrt(dp[0]**2 + dp[3]**2)
-    else:  # quadratic
+        norm_sq = (dp[0]**2 
+                 + dp[1]**2 * R2     # ux² × R²
+                 + dp[2]**2 * R2     # uy² × R²
+                 + dp[3]**2 
+                 + dp[4]**2 * R2     # vx² × R²
+                 + dp[5]**2 * R2)    # vy² × R²
+    else:
         # p = [u, ux, uy, uxx, uxy, uyy, v, vx, vy, vxx, vxy, vyy]
-        # u, v 변위만 체크 (인덱스 0, 6)
-        norm_p = np.sqrt(dp[0]**2 + dp[6]**2)
-    
+        R4 = R2 * R2 * 0.25
+        R2R2 = R2 * R2
+        norm_sq = (dp[0]**2 
+                 + dp[1]**2 * R2
+                 + dp[2]**2 * R2
+                 + dp[3]**2 * R4       # uxx² × R⁴/4
+                 + dp[4]**2 * R2R2     # uxy² × R²R²
+                 + dp[5]**2 * R4       # uyy² × R⁴/4
+                 + dp[6]**2 
+                 + dp[7]**2 * R2
+                 + dp[8]**2 * R2
+                 + dp[9]**2 * R4
+                 + dp[10]**2 * R2R2
+                 + dp[11]**2 * R4)
+
+    norm_p = np.sqrt(norm_sq)
     return norm_p < convergence_threshold, norm_p
 
 # ===== 공통 함수 =====
