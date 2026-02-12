@@ -31,10 +31,7 @@ from .results import MatchResult, FFTCCResult
 from scipy.ndimage import distance_transform_edt
 from speckle.core.masking import create_specimen_mask
 
-
-# ★ CHANGED: 내부 고정 탐색 범위 (UI에서 제어하지 않음)
 _SEARCH_RANGE = 50
-
 
 # ===== 배치 서브셋 추출 =====
 
@@ -58,8 +55,7 @@ def _extract_subsets_batch(image: np.ndarray,
     subsets = image[rows, cols]
     return subsets.astype(np.float64)
 
-
-# ★ CHANGED: 확장 타겟 서브셋 추출 함수 추가
+# 확장 타겟 서브셋 추출 함수
 def _extract_subsets_batch_extended(image: np.ndarray,
                                     points_y: np.ndarray,
                                     points_x: np.ndarray,
@@ -81,7 +77,6 @@ def _extract_subsets_batch_extended(image: np.ndarray,
     subsets = image[rows, cols]
     return subsets.astype(np.float64)
 
-# ★ 수정된 _batch_fft_zncc
 def _batch_fft_zncc(ref_subsets: np.ndarray,
                     tar_subsets: np.ndarray,
                     n_workers: int = -1,
@@ -91,77 +86,94 @@ def _batch_fft_zncc(ref_subsets: np.ndarray,
 
     ref_subsets: (n, rs, rs) — 원본 크기
     tar_subsets: (n, ts, ts) — 확장 크기 (ts >= rs)
+    
+    ZNCC 정규화 증명:
+        cc[dy,dx] = sum(r_zm * t_shifted)
+        r_zm은 zero-mean이므로 sum(r_zm) = 0
+        → sum(r_zm * t) = sum(r_zm * (t - t_mean)) = sum(r_zm * t_zm)
+        이 성질은 zero-pad 후에도 유지됨 (0 추가는 합을 변경하지 않음)
+        → ZNCC = sum(r_zm * t_zm) / (r_norm * t_local_norm) ∈ [-1, 1]
+    
+    수치 안정성:
+        local_var = sum_sq/N - mean² 방식 (one-pass)은 catastrophic cancellation에
+        취약할 수 있으나, 8/16-bit 이미지 + float64 연산(유효숫자 ~15자리)에서는
+        실질적 문제 없음. np.maximum(local_var, 0.0)으로 음수 분산 방어 적용.
     """
     n_points = ref_subsets.shape[0]
     ref_h, ref_w = ref_subsets.shape[1], ref_subsets.shape[2]
     tar_h, tar_w = tar_subsets.shape[1], tar_subsets.shape[2]
     ref_n_pixels = ref_h * ref_w
 
-    # FFT 크기 = tar 크기 (ref를 zero-pad)
     fft_h, fft_w = tar_h, tar_w
 
     disp_u_all = np.zeros(n_points, dtype=np.int32)
     disp_v_all = np.zeros(n_points, dtype=np.int32)
     zncc_all = np.zeros(n_points, dtype=np.float64)
 
+    # 슬라이딩 윈도우 출력 크기
+    out_h = tar_h - ref_h + 1
+    out_w = tar_w - ref_w + 1
+
+    # 벡터화된 박스 합을 위한 인덱스 사전 계산 (전 청크 공유)
+    dy = np.arange(out_h)
+    dx = np.arange(out_w)
+    dy_grid, dx_grid = np.meshgrid(dy, dx, indexing='ij')
+    r1 = dy_grid          # (out_h, out_w)
+    c1 = dx_grid
+    r2 = dy_grid + ref_h
+    c2 = dx_grid + ref_w
+
     for start in range(0, n_points, chunk_size):
         end = min(start + chunk_size, n_points)
         n_chunk = end - start
 
-        r = ref_subsets[start:end]  # (n_chunk, rs, rs)
-        t = tar_subsets[start:end]  # (n_chunk, ts, ts)
+        r = ref_subsets[start:end]
+        t = tar_subsets[start:end]
 
-        # === ref: zero-mean (ref 자체 픽셀 기준) ===
+        # === ref: zero-mean ===
         r_mean = r.mean(axis=(1, 2), keepdims=True)
         r_zm = r - r_mean
         r_norm = np.sqrt(np.sum(r_zm ** 2, axis=(1, 2)))
 
-        # === tar: local mean/norm 계산 (적분 이미지 사용) ===
-        # ref 크기 윈도우가 tar 위를 슬라이딩할 때 각 위치의 local sum, sum_sq
-        # 적분 이미지로 O(1) per position
-        t_cumsum = np.cumsum(np.cumsum(t, axis=1), axis=2)
-        t_sq_cumsum = np.cumsum(np.cumsum(t ** 2, axis=1), axis=2)
+        # === tar: 벡터화된 적분 이미지 기반 local norm ===
+        # 패딩된 적분 이미지 (상단/좌측 0행/열 추가로 경계 처리 단순화)
+        t_pad = np.zeros((n_chunk, tar_h + 1, tar_w + 1), dtype=np.float64)
+        t_pad[:, 1:, 1:] = np.cumsum(np.cumsum(t, axis=1), axis=2)
 
-        # 슬라이딩 윈도우 합 계산
-        # 출력 크기 = (tar_h - ref_h + 1, tar_w - ref_w + 1)
-        out_h = tar_h - ref_h + 1
-        out_w = tar_w - ref_w + 1
+        t_sq_pad = np.zeros((n_chunk, tar_h + 1, tar_w + 1), dtype=np.float64)
+        t_sq_pad[:, 1:, 1:] = np.cumsum(np.cumsum(t ** 2, axis=1), axis=2)
 
-        def _box_sum(cumsum, r1, c1, r2, c2):
-            """적분 이미지에서 박스 합 (0-indexed, inclusive r2,c2)"""
-            s = cumsum[:, r2, c2]
-            if r1 > 0:
-                s = s - cumsum[:, r1 - 1, c2]
-            if c1 > 0:
-                s = s - cumsum[:, r2, c1 - 1]
-            if r1 > 0 and c1 > 0:
-                s = s + cumsum[:, r1 - 1, c1 - 1]
-            return s
+        # 벡터화된 박스 합: 모든 (dy, dx) 위치를 루프 없이 한번에 계산
+        # 적분 이미지 공식: sum = I[r2,c2] - I[r1,c2] - I[r2,c1] + I[r1,c1]
+        local_sum = (
+            t_pad[:, r2, c2]
+            - t_pad[:, r1, c2]
+            - t_pad[:, r2, c1]
+            + t_pad[:, r1, c1]
+        )
 
-        # 각 슬라이딩 위치의 local sum, local sum_sq
-        local_sum = np.zeros((n_chunk, out_h, out_w), dtype=np.float64)
-        local_sum_sq = np.zeros((n_chunk, out_h, out_w), dtype=np.float64)
+        local_sum_sq = (
+            t_sq_pad[:, r2, c2]
+            - t_sq_pad[:, r1, c2]
+            - t_sq_pad[:, r2, c1]
+            + t_sq_pad[:, r1, c1]
+        )
 
-        for dy in range(out_h):
-            for dx in range(out_w):
-                r2_y = dy + ref_h - 1
-                r2_x = dx + ref_w - 1
-                local_sum[:, dy, dx] = _box_sum(t_cumsum, dy, dx, r2_y, r2_x)
-                local_sum_sq[:, dy, dx] = _box_sum(t_sq_cumsum, dy, dx, r2_y, r2_x)
-
+        # local variance → local norm
+        # one-pass 분산: var = E[x²] - E[x]²
+        # 8/16-bit + float64에서 catastrophic cancellation 실질적 무해
         local_mean = local_sum / ref_n_pixels
         local_var = local_sum_sq / ref_n_pixels - local_mean ** 2
-        local_var = np.maximum(local_var, 0.0)
-        t_local_norm = np.sqrt(local_var * ref_n_pixels)  # = sqrt(sum((t-t_mean)^2))
+        local_var = np.maximum(local_var, 0.0)  # 부동소수점 음수 방어
+        t_local_norm = np.sqrt(local_var * ref_n_pixels)
 
         # === FFT cross-correlation ===
-        # ref를 tar 크기로 zero-pad
         r_padded = np.zeros((n_chunk, fft_h, fft_w), dtype=np.float64)
         r_padded[:, :ref_h, :ref_w] = r_zm
 
         if HAS_SCIPY_FFT:
             F = scipy_fft2(r_padded, workers=n_workers)
-            G = scipy_fft2(t, workers=n_workers)  # t 원본 (mean 빼지 않음)
+            G = scipy_fft2(t, workers=n_workers)
             cc_raw = scipy_ifft2(np.conj(F) * G, workers=n_workers).real
         else:
             F = np.fft.fft2(r_padded)
@@ -169,15 +181,15 @@ def _batch_fft_zncc(ref_subsets: np.ndarray,
             cc_raw = np.fft.ifft2(np.conj(F) * G).real
         del F, G
 
-        # cc_raw에서 유효 영역만 추출 (out_h × out_w)
+        # 유효 영역 추출 (선형 상관 영역만)
+        # cc_raw는 순환 상관이지만, r_padded의 zero 영역 덕분에
+        # [:out_h, :out_w]에서 wrap-around 없이 선형 상관과 동일
         cc = cc_raw[:, :out_h, :out_w]
+        del cc_raw
 
-        # ZNCC 보정: cc = sum(r_zm * t) 이므로
-        # sum(r_zm * (t - t_mean)) = sum(r_zm * t) - t_mean * sum(r_zm)
-        # sum(r_zm) = 0 이므로 cc = sum(r_zm * t_zm) 그대로!
-        # → ZNCC = cc / (r_norm * t_local_norm)
-
-        # 무효 처리
+        # ZNCC 정규화
+        # sum(r_zm) = 0 이므로 FFT(t_원본) 사용해도
+        # cc = sum(r_zm * t_zm)과 동일 (증명은 docstring 참조)
         zero_mask = (r_norm < 1e-10)
         r_norm[zero_mask] = 1.0
 
@@ -185,7 +197,7 @@ def _batch_fft_zncc(ref_subsets: np.ndarray,
         denom = np.where(denom < 1e-10, 1.0, denom)
 
         zncc = cc / denom
-        del cc, cc_raw
+        del cc
 
         # 피크 찾기
         zncc_flat = zncc.reshape(n_chunk, -1)
@@ -194,16 +206,16 @@ def _batch_fft_zncc(ref_subsets: np.ndarray,
         peak_scores[zero_mask] = 0.0
         del zncc, zncc_flat
 
-        # 피크 → 변위
-        # (0,0) = ref가 tar 좌상단과 일치 = 변위 -(search_range)
-        # 중앙 = 변위 0
+        # 피크 → 변위 변환
+        # (0,0) = ref가 tar 좌상단 정렬 = 변위 -(search_range)
+        # (search_y, search_x) = 중앙 정렬 = 변위 0
         peak_row = peak_flat_idx // out_w
         peak_col = peak_flat_idx % out_w
 
-        search_y = (tar_h - ref_h) // 2  # = search_range
+        search_y = (tar_h - ref_h) // 2
         search_x = (tar_w - ref_w) // 2
 
-        dv = peak_row - search_y  # 변위 = 피크위치 - 중앙오프셋
+        dv = peak_row - search_y
         du = peak_col - search_x
 
         disp_u_all[start:end] = du
@@ -222,10 +234,8 @@ def _fft_zncc(template: np.ndarray, search_win: np.ndarray) -> Tuple[int, int, f
     du, dv, zncc = _batch_fft_zncc(r, t, n_workers=1, chunk_size=1)
     return int(dv[0]), int(du[0]), float(zncc[0])
 
-
 # ===== 메인 함수 =====
 
-# search_range 기본값 _SEARCH_RANGE, 실제 사용
 def compute_fft_cc(ref_image, def_image,
                    subset_size=21, spacing=10, search_range=None,
                    zncc_threshold=0.6, roi=None,
@@ -422,7 +432,7 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
         (points_x - half >= 0) & (points_x + half < ref_w)
     )
 
-    # ★ 시편 마스크 기반 적응적 search_range
+    # 시편 마스크 기반 적응적 search_range
     try:
         specimen_mask = create_specimen_mask(ref_gray)
         dist_map = distance_transform_edt(specimen_mask > 0)
