@@ -259,7 +259,18 @@ def _icgn_iterate(
 
     p_initial_u = p[u_idx]
     p_initial_v = p[v_idx]
-    max_displacement_change = 5.0
+
+    # --- 발산 임계값: subset 크기에 비례 스케일링 ---
+    # check_convergence의 norm은 gradient 성분에 half²을 곱하므로
+    # subset이 커지면 norm도 비례해서 커짐
+    # 기준: subset_size=21(half=10)에서 dp_norm > 1.0이 발산
+    half = subset_size // 2
+    reference_half = 10  # subset_size=21 기준
+    divergence_threshold = 1.0 * (half / reference_half)
+
+    # 변위 변화 허용량도 subset 크기에 비례
+    # 큰 subset은 더 넓은 영역을 커버하므로 보정 범위도 커야 함
+    max_displacement_change = 5.0 * (half / reference_half)
 
     for iteration in range(max_iterations):
         n_iter = iteration + 1
@@ -298,8 +309,8 @@ def _icgn_iterate(
         if conv:
             break
 
-        # 발산 판단
-        if dp_norm > 1.0:
+        # 발산 판단 — subset 크기 비례 임계값 사용
+        if dp_norm > divergence_threshold:
             conv = False
             break
 
@@ -315,7 +326,6 @@ def _icgn_iterate(
             break
 
     return p, zncc, n_iter, conv
-
 
 # ===== 유틸 =====
 
