@@ -49,18 +49,16 @@ class SpeckleQualityGUI:
             
             # 종료 시 설정 저장
             self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
     def _apply_saved_settings(self):
         """저장된 설정 적용"""
         try:
-            # DIC 탭에 파라미터 적용
             dic_params = self.settings.get_dic_params()
             self.dic_tab.set_parameters(dic_params)
             
-            # 품질평가 탭에 파라미터 적용
             from .views.param_panel import Parameters
             quality_params = Parameters(
                 mig_threshold=self.settings.get('mig_threshold', 30.0),
-                sssig_threshold=self.settings.get('sssig_threshold', 1e5),
                 subset_size=self.settings.get('quality_subset_size', 21),
                 spacing=self.settings.get('quality_spacing', 16)
             )
@@ -74,19 +72,15 @@ class SpeckleQualityGUI:
     def _on_closing(self):
         """앱 종료 시 설정 저장"""
         try:
-            # DIC 탭 파라미터 저장
             dic_params = self.dic_tab.get_parameters()
             self.settings.update(dic_params)
             
-            # 품질평가 탭 파라미터 저장
             quality_params = self.param_panel.get_parameters()
             if quality_params:
                 self.settings.set('mig_threshold', quality_params.mig_threshold)
-                self.settings.set('sssig_threshold', quality_params.sssig_threshold)
                 self.settings.set('quality_subset_size', quality_params.subset_size)
                 self.settings.set('quality_spacing', quality_params.spacing)
             
-            # 마지막 폴더 저장
             if self.state.folder_path:
                 self.settings.set('last_folder', str(self.state.folder_path))
             
@@ -96,6 +90,7 @@ class SpeckleQualityGUI:
             print(f"[WARN] 설정 저장 실패: {e}")
         
         self.root.destroy()
+
 
     def _create_menu(self):
         """메뉴바 생성"""
@@ -214,10 +209,15 @@ class SpeckleQualityGUI:
         frame = ttk.LabelFrame(parent, text="파일")
         frame.pack(fill=tk.X, pady=5)
         
-        ttk.Button(frame, text="이미지 열기", 
-                   command=lambda: self.controller.open_image()).pack(fill=tk.X, padx=5, pady=2)
-        ttk.Button(frame, text="폴더 열기", 
-                   command=lambda: self.controller.open_folder()).pack(fill=tk.X, padx=5, pady=2)
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Button(btn_row, text="이미지 열기",
+                command=lambda: self.controller.open_image()
+                ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        ttk.Button(btn_row, text="폴더 열기",
+                command=lambda: self.controller.open_folder()
+                ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
     
     def _create_roi_panel(self, parent):
         """ROI 패널"""

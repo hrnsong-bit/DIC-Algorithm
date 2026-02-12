@@ -563,7 +563,6 @@ class DICTab(ttk.Frame):
                 self._toggle_gaussian_blur()
         except Exception as e:
             print(f"[WARN] 파라미터 설정 중 오류: {e}")
-
     
     def update_reference_label(self, text: str):
         self.ref_label.configure(text=text[:20], foreground="black")

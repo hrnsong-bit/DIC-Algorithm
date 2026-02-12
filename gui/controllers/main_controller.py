@@ -165,7 +165,7 @@ class MainController:
                 x, y, w, h = self.state.roi
                 gray = gray[y:y+h, x:x+w]
 
-            nv = estimate_noise_variance(gray, method='local_std')
+            nv = estimate_noise_variance(gray)
             self._apply_noise_to_assessor(nv, 'single_local_std')
 
             if self.param_panel:

@@ -97,29 +97,25 @@ def compute_gradient(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 # ===== 노이즈 추정 =====
 
-def estimate_noise_variance(image: np.ndarray, method: str = 'local_std') -> float:
+def estimate_noise_variance(image: np.ndarray) -> float:
     """
-    이미지 노이즈 분산 추정
-
+    단일 이미지에서 노이즈 분산 D(η)을 추정합니다.
+    
+    로컬 분산의 하위 0.5% 백분위(가장 평탄한 영역)를 사용하여
+    센서 노이즈를 추정합니다.
+    Reference:
+        Colom & Buades (2013), "Analysis and Extension of the Percentile Method"
+    
     Args:
         image: 그레이스케일 이미지
-        method: 'local_std' (기본), 'laplacian', 또는 기본값 4.0
-
+        
     Returns:
-        노이즈 분산 D(η) [GL² 단위]
+        노이즈 분산 D(η) [GL² 단위] (최소 1.0, 실패 시 기본값 4.0)
     """
-    gray = _ensure_gray_float(image)
-
-    if method == 'laplacian':
-        # Robust Median Estimator (Donoho & Johnstone, 1994)
-        # ⚠ 스페클 패턴에서는 텍스처를 노이즈로 오인하여 과대추정 경향
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        sigma = np.median(np.abs(laplacian)) / 0.6745
-        return float(sigma ** 2)
-
-    elif method == 'local_std':
+    try:
+        gray = _ensure_gray_float(image)
+        
         # 로컬 분산 기반 추정 — 하위 0.5% (가장 평탄한 영역)
-        # 5%에서 0.5%로 보수화: 스페클 텍스처 혼입을 더 엄격하게 배제
         kernel_size = 5
         local_mean = cv2.blur(gray, (kernel_size, kernel_size))
         local_sq_mean = cv2.blur(gray ** 2, (kernel_size, kernel_size))
@@ -129,10 +125,11 @@ def estimate_noise_variance(image: np.ndarray, method: str = 'local_std') -> flo
             return 4.0
         noise_var = float(np.percentile(valid_var, 0.5))
         return max(noise_var, 1.0)
-
-    else:
-        # 기본값: 일반적인 8-bit 카메라 노이즈
+        
+    except Exception as e:
+        logger.error(f"노이즈 분산 추정 실패: {e}, 기본값 4.0 사용")
         return 4.0
+
 
 
 def estimate_noise_from_pair(image1: np.ndarray, image2: np.ndarray,

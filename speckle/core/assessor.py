@@ -1,7 +1,12 @@
 """
-스페클 품질 평가 메인 클래스 (v3.3.0 수정)
+스페클 품질 평가 메인 클래스 (v3.3.1 수정)
 
-수정 사항:
+수정 사항 (v3.3.1):
+- 노이즈 추정을 ROI 적용 전 전체 이미지에서 수행
+- estimate_noise_variance에서 method 파라미터 제거 (Laplacian 삭제)
+- _resolve_noise_variance가 전체 이미지를 받도록 변경
+
+수정 사항 (v3.3.0):
 - 3-tier 노이즈 추정: user override > pair > single(local_std)
 - set_noise_variance / set_noise_pair 사후 설정 메서드
 - noise_method 기록 → QualityReport에 전달
@@ -31,7 +36,7 @@ class SpeckleQualityAssessor:
     스페클 패턴 품질 평가기
 
     평가 흐름:
-    1. 노이즈 분산 결정 (3-tier fallback)
+    1. 노이즈 분산 결정 (3-tier fallback, 전체 이미지 기반)
     2. MIG로 ROI 내 전역 대비 확인
     3. SSSIG 맵으로 ROI 내 로컬 품질 확인
     4. 최적 subset size 추천
@@ -90,7 +95,7 @@ class SpeckleQualityAssessor:
         self._noise_pair = None
         logger.info("노이즈 override 해제")
 
-    def _resolve_noise_variance(self, roi_gray: np.ndarray,
+    def _resolve_noise_variance(self, full_gray: np.ndarray,
                                  roi: Optional[Tuple[int, int, int, int]] = None
                                  ) -> Tuple[float, str]:
         """
@@ -98,7 +103,12 @@ class SpeckleQualityAssessor:
 
         Tier 1: 사용자 직접 지정 (set_noise_variance)
         Tier 2: pair 이미지 차분 (set_noise_pair)
-        Tier 3: 단일 이미지 local_std (fallback)
+        Tier 3: 단일 이미지 local_std (fallback, 전체 이미지 사용)
+
+        Args:
+            full_gray: ROI 적용 전 전체 그레이스케일 이미지
+                       (센서 노이즈는 이미지 전체에서 추정하는 것이 정확)
+            roi: ROI 좌표 (pair 추정 시 전달용, Tier 3에서는 미사용)
 
         Returns:
             (noise_variance, method_name)
@@ -116,8 +126,9 @@ class SpeckleQualityAssessor:
             except Exception as e:
                 logger.warning(f"Pair 노이즈 추정 실패, fallback: {e}")
 
-        # Tier 3: 단일 이미지
-        nv = estimate_noise_variance(roi_gray, method='local_std')
+        # Tier 3: 단일 이미지 — 전체 이미지에서 추정
+        # 배경 등 평탄 영역을 활용하기 위해 ROI가 아닌 전체 이미지 사용
+        nv = estimate_noise_variance(full_gray)
         return nv, 'single_local_std'
 
     # ── 평가 ──
@@ -135,6 +146,18 @@ class SpeckleQualityAssessor:
         else:
             gray = image.copy()
 
+        # ====== 노이즈 분산 결정 (3-tier) ======
+        # 노이즈는 센서 특성이므로 ROI 적용 전 전체 이미지에서 추정
+        noise_variance, noise_method = self._resolve_noise_variance(
+            gray, roi)
+        calculated_threshold = calculate_sssig_threshold(
+            noise_variance, self.desired_accuracy)
+
+        if noise_method == 'single_local_std':
+            logger.info(
+                "노이즈: 단일이미지 추정(local_std) 사용 중. "
+                "pair 추정 권장.")
+
         # ROI 적용
         if roi is not None:
             x, y, w, h = roi
@@ -150,18 +173,6 @@ class SpeckleQualityAssessor:
             warnings.append(
                 f"ROI 평균 밝기가 낮음 ({mean_intensity:.1f}) "
                 f"- 배경 포함 가능성")
-
-        # ====== 노이즈 분산 결정 (3-tier) ======
-        noise_variance, noise_method = self._resolve_noise_variance(
-            roi_gray, roi)
-        calculated_threshold = calculate_sssig_threshold(
-            noise_variance, self.desired_accuracy)
-
-        # 단일 이미지 추정 시 정보 경고 (1회성, 로그로만)
-        if noise_method == 'single_local_std':
-            logger.info(
-                "노이즈: 단일이미지 추정(local_std) 사용 중. "
-                "pair 추정 권장.")
 
         # ====== Stage 1: MIG ======
         mig = compute_mig(roi_gray)

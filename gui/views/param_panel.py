@@ -13,7 +13,6 @@ import numpy as np
 class Parameters:
     """품질평가 파라미터"""
     mig_threshold: float
-    sssig_threshold: float
     subset_size: int
     spacing: int
 
@@ -43,7 +42,7 @@ class ParamPanel:
         self._create_noise_section()
 
     # ================================================================
-    #  기존 파라미터 섹션
+    #  파라미터 섹션
     # ================================================================
 
     def _create_widgets(self):
@@ -79,23 +78,8 @@ class ParamPanel:
             from_=5, to=50, increment=1, width=10)
         self.spacing_spin.grid(row=2, column=1, pady=2)
 
-        # SSSIG Threshold
-        ttk.Label(grid, text="SSSIG 임계값:").grid(
-            row=3, column=0, sticky=tk.W, pady=2)
-        self.sssig_var = tk.StringVar(value="1e5")
-        self.sssig_entry = ttk.Entry(
-            grid, textvariable=self.sssig_var, width=12)
-        self.sssig_entry.grid(row=3, column=1, pady=2)
-        ttk.Label(grid, text="(자동)", font=('Arial', 8),
-                  foreground='gray').grid(row=3, column=2, sticky=tk.W, padx=5)
-
-        # 기본값
-        ttk.Button(grid, text="기본값",
-                   command=self.reset_to_default, width=8).grid(
-            row=4, column=0, columnspan=2, pady=(10, 5))
-
     # ================================================================
-    #  노이즈 추정 섹션 (신규)
+    #  노이즈 추정 섹션
     # ================================================================
 
     def _create_noise_section(self):
@@ -243,7 +227,6 @@ class ParamPanel:
             self.pair_label.config(
                 text="2장을 선택해야 합니다",
                 foreground='red')
-        # 0장이면 무시
 
     # ── manual 적용 ──
 
@@ -273,8 +256,6 @@ class ParamPanel:
         """측정 버튼 클릭 → 컨트롤러에 위임"""
         if self.on_noise_measured:
             method = self.noise_method_var.get()
-            # 컨트롤러에게 method와 pair_paths를 전달
-            # variance=None은 "측정해달라"는 신호
             self.on_noise_measured(None, method)
 
     # ── 결과 표시 ──
@@ -309,14 +290,13 @@ class ParamPanel:
         self._display_noise_result(variance, method)
 
     # ================================================================
-    #  기존 인터페이스 유지
+    #  공개 인터페이스
     # ================================================================
 
     def get_parameters(self) -> Optional[Parameters]:
         try:
             return Parameters(
                 mig_threshold=float(self.mig_var.get()),
-                sssig_threshold=float(self.sssig_var.get()),
                 subset_size=int(self.subset_var.get()),
                 spacing=int(self.spacing_var.get()))
         except ValueError:
@@ -324,13 +304,11 @@ class ParamPanel:
 
     def set_parameters(self, params: Parameters):
         self.mig_var.set(params.mig_threshold)
-        self.sssig_var.set(str(params.sssig_threshold))
         self.subset_var.set(params.subset_size)
         self.spacing_var.set(params.spacing)
 
     def reset_to_default(self):
         self.mig_var.set(30.0)
-        self.sssig_var.set("1e5")
         self.subset_var.set(21)
         self.spacing_var.set(16)
 
