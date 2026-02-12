@@ -38,9 +38,7 @@ def evaluate_single_file(args: Tuple) -> Tuple[str, Optional[QualityReport]]:
         return (Path(file_path).name, report)
     
     except Exception as e:
-        print(f"평가 실패: {file_path}, 오류: {e}")
         return (Path(file_path).name, None)
-
 
 class BatchProcessor:
     """

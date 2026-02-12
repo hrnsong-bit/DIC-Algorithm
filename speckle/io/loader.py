@@ -34,7 +34,6 @@ def load_image(path: Union[str, Path]) -> Optional[np.ndarray]:
         return image
     
     except Exception as e:
-        print(f"이미지 로드 실패: {path}, 오류: {e}")
         return None
 
 
@@ -105,7 +104,6 @@ def save_image(image: np.ndarray, path: Union[str, Path]) -> bool:
         return False
     
     except Exception as e:
-        print(f"이미지 저장 실패: {path}, 오류: {e}")
         return False
 
 

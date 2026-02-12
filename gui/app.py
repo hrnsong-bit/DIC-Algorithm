@@ -63,12 +63,9 @@ class SpeckleQualityGUI:
                 spacing=self.settings.get('quality_spacing', 16)
             )
             self.param_panel.set_parameters(quality_params)
-            
-            print("[INFO] 저장된 설정 적용 완료")
-        except Exception as e:
-            print(f"[WARN] 설정 적용 실패: {e}")
-
-    
+        except Exception:
+            pass
+        
     def _on_closing(self):
         """앱 종료 시 설정 저장"""
         try:
@@ -85,12 +82,10 @@ class SpeckleQualityGUI:
                 self.settings.set('last_folder', str(self.state.folder_path))
             
             self.settings.save()
-            print("[INFO] 설정 저장 완료")
-        except Exception as e:
-            print(f"[WARN] 설정 저장 실패: {e}")
+        except Exception:
+            pass
         
         self.root.destroy()
-
 
     def _create_menu(self):
         """메뉴바 생성"""
