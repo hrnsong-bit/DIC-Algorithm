@@ -1,4 +1,12 @@
-"""스페클 품질 평가 메인 클래스"""
+"""
+스페클 품질 평가 메인 클래스
+
+변경 이력
+---------
+v3.3  - estimate_noise_from_pair 파이프라인 연결
+      - noise_method 추적 (QualityReport에 기록)
+      - threshold 이상치 경고 추가
+"""
 
 import numpy as np
 import cv2
@@ -9,33 +17,40 @@ from ..models.reports import BadPoint, SSSIGResult, QualityReport, BatchReport
 from ..utils.logger import logger
 from .mig import compute_mig
 from .sssig import (
-    compute_sssig_map, 
-    find_optimal_subset_size, 
+    compute_sssig_map,
+    find_optimal_subset_size,
     warmup_numba,
     estimate_noise_variance,
-    calculate_sssig_threshold
+    estimate_noise_from_pair,
+    calculate_sssig_threshold,
+    compute_gradient,
 )
 
 
 class SpeckleQualityAssessor:
     """
     스페클 패턴 품질 평가기
-    
+
     평가 흐름:
-    1. MIG로 ROI 내 전역 대비 확인
-    2. SSSIG 맵으로 ROI 내 로컬 품질 확인
-    3. 최적 subset size 추천
-    
-    Note: ROI를 시편 내부(게이지부)에 정확히 설정해야 함
+      1. 노이즈 분산 D(η) 결정 (pair → single → user 순 우선)
+      2. MIG로 ROI 내 전역 대비 확인
+      3. SSSIG 맵으로 ROI 내 로컬 품질 + 최적 subset size 추천
+
+    노이즈 추정 우선순위:
+      1) 사용자 직접 지정 (noise_variance 파라미터)
+      2) 두 정지 이미지 차분 (noise_ref_pair)
+      3) 단일 이미지 local_std (자동 fallback)
     """
-    
+
     def __init__(self,
                  mig_threshold: float = 30.0,
                  sssig_threshold: float = 1e5,
                  subset_size: int = 21,
                  poi_spacing: int = 10,
                  auto_find_size: bool = True,
-                 desired_accuracy: float = 0.02):
+                 desired_accuracy: float = 0.02,
+                 noise_variance: Optional[float] = None,
+                 noise_ref_pair: Optional[Tuple[np.ndarray, np.ndarray]] = None):
         """
         Args:
             mig_threshold: MIG 임계값 (기본 30.0)
@@ -43,7 +58,9 @@ class SpeckleQualityAssessor:
             subset_size: 초기 subset 크기 (기본 21)
             poi_spacing: POI 간격 (기본 10)
             auto_find_size: 자동 최적 크기 탐색 여부
-            desired_accuracy: 원하는 변위 측정 정확도 (pixels, 기본 0.02)
+            desired_accuracy: 원하는 변위 정확도 (pixels, 기본 0.02)
+            noise_variance: 사용자 지정 D(η). None이면 자동 추정.
+            noise_ref_pair: (image1, image2) 정지 이미지 쌍. 제공 시 pair 추정 사용.
         """
         self.mig_threshold = mig_threshold
         self.sssig_threshold = sssig_threshold
@@ -51,53 +68,139 @@ class SpeckleQualityAssessor:
         self.poi_spacing = poi_spacing
         self.auto_find_size = auto_find_size
         self.desired_accuracy = desired_accuracy
-        
+
+        # ── 노이즈 분산 결정 ──
+        self._noise_variance_override = noise_variance
+        self._noise_ref_pair = noise_ref_pair
+        self._noise_from_pair: Optional[float] = None
+        self._noise_method: str = 'pending'
+
+        if noise_variance is not None:
+            # 최우선: 사용자 직접 지정
+            self._noise_method = 'user'
+            logger.info(f"노이즈 분산: 사용자 지정 D(η)={noise_variance:.2f}")
+        elif noise_ref_pair is not None:
+            # 2순위: pair 추정
+            self._noise_from_pair = estimate_noise_from_pair(
+                noise_ref_pair[0], noise_ref_pair[1]
+            )
+            self._noise_method = 'pair'
+            logger.info(f"노이즈 분산: pair 추정 D(η)={self._noise_from_pair:.2f}")
+
         warmup_numba()
-        logger.debug(f"SpeckleQualityAssessor 초기화: MIG={mig_threshold}, desired_accuracy={desired_accuracy}")
-    
-    def evaluate(self, image: np.ndarray, 
-                 roi: Optional[Tuple[int, int, int, int]] = None) -> QualityReport:
+        logger.debug(
+            f"SpeckleQualityAssessor 초기화: MIG={mig_threshold}, "
+            f"desired_accuracy={desired_accuracy}, noise_method={self._noise_method}"
+        )
+
+    # ── 외부에서 pair 이미지 사후 설정 ──
+    def set_noise_pair(self, image1: np.ndarray, image2: np.ndarray,
+                       roi: Optional[Tuple[int, int, int, int]] = None):
+        """
+        노이즈 참조 이미지 쌍 설정 (GUI에서 사후 호출 가능)
+
+        Args:
+            image1, image2: 동일 조건 정지 이미지 2장
+            roi: 분석 영역 (x, y, w, h)
+        """
+        self._noise_from_pair = estimate_noise_from_pair(image1, image2, roi)
+        self._noise_method = 'pair'
+        logger.info(f"노이즈 pair 설정: D(η)={self._noise_from_pair:.2f}")
+
+    def set_noise_variance(self, variance: float):
+        """사용자 직접 D(η) 지정"""
+        self._noise_variance_override = variance
+        self._noise_method = 'user'
+        logger.info(f"노이즈 분산 수동 설정: D(η)={variance:.2f}")
+
+    # ── 노이즈 분산 결정 로직 ──
+    def _resolve_noise_variance(self,
+                                roi_gray: np.ndarray
+                                ) -> Tuple[float, str]:
+        """
+        우선순위에 따라 노이즈 분산을 결정하고 방법명을 반환
+
+        Returns:
+            (noise_variance, method_name)
+        """
+        if self._noise_variance_override is not None:
+            return self._noise_variance_override, 'user'
+
+        if self._noise_from_pair is not None:
+            return self._noise_from_pair, 'pair'
+
+        # fallback: 단일 이미지
+        nv = estimate_noise_variance(roi_gray, method='local_std')
+        return nv, 'single_local_std'
+
+    # ── 단일 이미지 평가 ──
+    def evaluate(self, image: np.ndarray,
+                 roi: Optional[Tuple[int, int, int, int]] = None
+                 ) -> QualityReport:
         """
         단일 이미지 품질 평가
-        
+
         Args:
             image: 입력 이미지
             roi: ROI 영역 (x, y, w, h) - 시편 내부에 설정 권장
-        
+
         Returns:
-            QualityReport 객체
+            QualityReport
         """
         start_time = time.time()
         warnings = []
-        
-        # 그레이스케일 변환
+
+        # 그레이스케일
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image.copy()
-        
-        # ROI 적용
+
+        # ROI
         if roi is not None:
             x, y, w, h = roi
             roi_gray = gray[y:y+h, x:x+w]
         else:
             roi_gray = gray
-        
+
         image_shape = roi_gray.shape
-        
-        # ROI 밝기 체크 (배경 포함 경고)
+
+        # 밝기 체크
         mean_intensity = np.mean(roi_gray)
         if mean_intensity < 30:
-            warnings.append(f"ROI 평균 밝기가 낮음 ({mean_intensity:.1f}) - 배경 포함 가능성")
-        
-        # ====== 노이즈 분산 추정 ======
-        noise_variance = estimate_noise_variance(roi_gray)
-        calculated_threshold = calculate_sssig_threshold(noise_variance, self.desired_accuracy)
-        
+            warnings.append(
+                f"ROI 평균 밝기가 낮음 ({mean_intensity:.1f}) — 배경 포함 가능성"
+            )
+
+        # ====== 노이즈 분산 ======
+        noise_variance, noise_method = self._resolve_noise_variance(roi_gray)
+
+        if noise_method == 'single_local_std':
+            warnings.append(
+                "노이즈: 단일이미지 추정(local_std) 사용 중. "
+                "정확도를 높이려면 정지 이미지 2장으로 pair 추정을 권장합니다."
+            )
+
+        calculated_threshold = calculate_sssig_threshold(
+            noise_variance, self.desired_accuracy
+        )
+
+        # threshold 이상치 경고
+        if calculated_threshold < 1e3:
+            warnings.append(
+                f"SSSIG threshold가 매우 낮음 ({calculated_threshold:.0f}). "
+                f"D(η)={noise_variance:.2f}가 과소추정 되었을 수 있습니다."
+            )
+        elif calculated_threshold > 5e7:
+            warnings.append(
+                f"SSSIG threshold가 매우 높음 ({calculated_threshold:.2e}). "
+                f"D(η)={noise_variance:.2f}가 과대추정 되었을 수 있습니다."
+            )
+
         # ====== Stage 1: MIG ======
         mig = compute_mig(roi_gray)
         mig_pass = mig >= self.mig_threshold
-        
+
         if not mig_pass:
             logger.warning(f"MIG 실패: {mig:.2f} < {self.mig_threshold}")
             return QualityReport(
@@ -115,66 +218,70 @@ class SpeckleQualityAssessor:
                 image_shape=image_shape,
                 processing_time=time.time() - start_time,
                 noise_variance=noise_variance,
-                predicted_accuracy=None
+                predicted_accuracy=None,
+                noise_method=noise_method,
             )
-        
+
         # ====== Stage 2: SSSIG ======
         if self.auto_find_size:
-            # 1. 최적 size 찾기 (권장용만)
             optimal_size, size_found, _, info = find_optimal_subset_size(
                 roi_gray,
                 spacing=self.poi_spacing,
                 desired_accuracy=self.desired_accuracy,
                 noise_variance=noise_variance,
                 min_size=11,
-                max_size=61
+                max_size=61,
             )
             recommended_size = optimal_size
-            
-            # 2. 현재 설정(GUI) 기준으로 결과 계산 (표시/CSV용)
+
             sssig_result = compute_sssig_map(
                 roi_gray,
                 subset_size=self.subset_size,
                 spacing=self.poi_spacing,
                 noise_variance=noise_variance,
-                desired_accuracy=self.desired_accuracy
+                desired_accuracy=self.desired_accuracy,
             )
-            predicted_accuracy = sssig_result.predicted_accuracy if sssig_result else None
+            predicted_accuracy = (sssig_result.predicted_accuracy
+                                  if sssig_result else None)
         else:
             sssig_result = compute_sssig_map(
                 roi_gray,
                 subset_size=self.subset_size,
                 spacing=self.poi_spacing,
                 noise_variance=noise_variance,
-                desired_accuracy=self.desired_accuracy
+                desired_accuracy=self.desired_accuracy,
             )
             recommended_size = self.subset_size
-            size_found = len(sssig_result.bad_points) == 0
-            predicted_accuracy = sssig_result.predicted_accuracy if sssig_result else None
-        
+            size_found = (sssig_result.n_bad_points == 0)
+            predicted_accuracy = (sssig_result.predicted_accuracy
+                                  if sssig_result else None)
+
         if sssig_result and len(sssig_result.points_y) == 0:
-            warnings.append("유효한 POI가 없음 - ROI 확인 필요")
-        
-        sssig_pass = sssig_result.n_bad_points == 0 if sssig_result else False
-        
+            warnings.append("유효한 POI가 없음 — ROI 확인 필요")
+
+        sssig_pass = (sssig_result.n_bad_points == 0) if sssig_result else False
+
         if not sssig_pass and sssig_result and sssig_result.n_bad_points > 0:
             warnings.append(
                 f"불량 POI {sssig_result.n_bad_points}개 "
-                f"(min: {sssig_result.min:.2e})"
+                f"(min SSSIG: {sssig_result.min:.2e})"
             )
-        
+
         if not size_found:
             warnings.append("최대 크기(61px)로도 모든 POI 통과 불가")
-        
-        # 예상 정확도가 목표보다 나쁘면 경고
+
         if predicted_accuracy and predicted_accuracy > self.desired_accuracy:
             warnings.append(
-                f"예상 정확도 {predicted_accuracy:.4f}px > 목표 {self.desired_accuracy}px"
+                f"예상 정확도 {predicted_accuracy:.4f}px > "
+                f"목표 {self.desired_accuracy}px"
             )
-        
+
         processing_time = time.time() - start_time
-        logger.info(f"평가 완료: MIG={mig:.2f}, 노이즈분산={noise_variance:.2f}, 처리시간={processing_time:.3f}s")
-        
+        logger.info(
+            f"평가 완료: MIG={mig:.2f}, D(η)={noise_variance:.2f} "
+            f"[{noise_method}], 처리시간={processing_time:.3f}s"
+        )
+
         return QualityReport(
             mig=mig,
             mig_pass=mig_pass,
@@ -190,59 +297,63 @@ class SpeckleQualityAssessor:
             image_shape=image_shape,
             processing_time=processing_time,
             noise_variance=noise_variance,
-            predicted_accuracy=predicted_accuracy
+            predicted_accuracy=predicted_accuracy,
+            noise_method=noise_method,
         )
-    
-    def evaluate_batch(self, 
+
+    # ── 배치 평가 ──
+    def evaluate_batch(self,
                        images: Dict[str, np.ndarray],
                        roi: Optional[Tuple[int, int, int, int]] = None,
-                       progress_callback: Optional[Callable[[int, int, str], None]] = None
+                       progress_callback: Optional[
+                           Callable[[int, int, str], None]] = None
                        ) -> BatchReport:
         """배치 평가"""
         start_time = time.time()
-        
+
         total = len(images)
-        individual_reports = {}
+        individual_reports: Dict[str, QualityReport] = {}
         max_recommended_size = 11
         worst_file = ""
         passed = 0
         failed = 0
-        
+
         mig_values = []
         sssig_min_values = []
         noise_variances = []
         predicted_accuracies = []
-        
+
         logger.info(f"배치 평가 시작: {total}개 이미지")
-        
+
         for idx, (filename, image) in enumerate(images.items()):
             if progress_callback:
                 progress_callback(idx + 1, total, filename)
-            
+
             try:
                 report = self.evaluate(image, roi)
                 individual_reports[filename] = report
-                
+
                 mig_values.append(report.mig)
-                
-                if report.noise_variance:
+
+                if report.noise_variance is not None:
                     noise_variances.append(report.noise_variance)
-                
-                if report.predicted_accuracy:
+
+                if report.predicted_accuracy is not None:
                     predicted_accuracies.append(report.predicted_accuracy)
-                
-                if report.sssig_result and len(report.sssig_result.points_y) > 0:
+
+                if (report.sssig_result is not None
+                        and len(report.sssig_result.points_y) > 0):
                     sssig_min_values.append(report.sssig_result.min)
-                
+
                 if report.analyzable:
                     passed += 1
                 else:
                     failed += 1
-                
+
                 if report.recommended_subset_size > max_recommended_size:
                     max_recommended_size = report.recommended_subset_size
                     worst_file = filename
-                    
+
             except cv2.error as e:
                 logger.error(f"OpenCV 오류 ({filename}): {e}")
                 failed += 1
@@ -252,14 +363,26 @@ class SpeckleQualityAssessor:
             except Exception as e:
                 logger.exception(f"예상치 못한 오류 ({filename})")
                 failed += 1
-        
+
         global_size_found = all(
             r.subset_size_found for r in individual_reports.values()
         )
-        
+
+        def _stats(arr):
+            if not arr:
+                return {'mean': 0.0, 'min': 0.0, 'max': 0.0}
+            return {
+                'mean': float(np.mean(arr)),
+                'min': float(np.min(arr)),
+                'max': float(np.max(arr)),
+            }
+
         total_time = time.time() - start_time
-        logger.info(f"배치 평가 완료: {passed}/{total} 통과, 처리시간={total_time:.2f}s")
-        
+        logger.info(
+            f"배치 평가 완료: {passed}/{total} 통과, "
+            f"처리시간={total_time:.2f}s"
+        )
+
         return BatchReport(
             total_images=total,
             passed_images=passed,
@@ -268,25 +391,9 @@ class SpeckleQualityAssessor:
             global_size_found=global_size_found,
             worst_case_file=worst_file,
             individual_reports=individual_reports,
-            mig_stats={
-                'mean': float(np.mean(mig_values)) if mig_values else 0.0,
-                'min': float(np.min(mig_values)) if mig_values else 0.0,
-                'max': float(np.max(mig_values)) if mig_values else 0.0
-            },
-            sssig_stats={
-                'mean': float(np.mean(sssig_min_values)) if sssig_min_values else 0.0,
-                'min': float(np.min(sssig_min_values)) if sssig_min_values else 0.0,
-                'max': float(np.max(sssig_min_values)) if sssig_min_values else 0.0
-            },
-            noise_stats={
-                'mean': float(np.mean(noise_variances)) if noise_variances else 0.0,
-                'min': float(np.min(noise_variances)) if noise_variances else 0.0,
-                'max': float(np.max(noise_variances)) if noise_variances else 0.0
-            },
-            accuracy_stats={
-                'mean': float(np.mean(predicted_accuracies)) if predicted_accuracies else 0.0,
-                'min': float(np.min(predicted_accuracies)) if predicted_accuracies else 0.0,
-                'max': float(np.max(predicted_accuracies)) if predicted_accuracies else 0.0
-            },
-            total_processing_time=total_time
+            mig_stats=_stats(mig_values),
+            sssig_stats=_stats(sssig_min_values),
+            noise_stats=_stats(noise_variances),
+            accuracy_stats=_stats(predicted_accuracies),
+            total_processing_time=total_time,
         )
