@@ -2,88 +2,180 @@
 FFT-CC (FFT-based Cross Correlation) 초기 추정 모듈
 
 고속 정수 픽셀 변위 추정을 위한 FFT 기반 정규화 상호상관
+
+OpenCorr 방식: 동일 크기 ref/tar 서브셋, search_range 없음
+- ref_subset과 tar_subset을 동일 위치, 동일 크기로 추출
+- 양쪽 모두 zero-mean 후 FFT 상호상관
+- ZNCC = max(cc) / (ref_norm * tar_norm * N)
+- 탐색 범위 = ±(subset_size // 2)
+
+References:
+    - Jiang, Z., et al. "Path-independent digital image correlation with
+      high accuracy, speed and robustness." Optics and Lasers in Engineering, 2015.
+    - Pan, B., et al. "Fast, robust and accurate DIC calculation without
+      redundant computations." Experimental Mechanics, 2013.
 """
 
 import numpy as np
 import cv2
 from typing import Tuple, Optional, Callable, List, Dict
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
+
+try:
+    from scipy.fft import fft2 as scipy_fft2, ifft2 as scipy_ifft2
+    HAS_SCIPY_FFT = True
+except ImportError:
+    HAS_SCIPY_FFT = False
 
 from .results import MatchResult, FFTCCResult
 
 
-# ===== FFT 기반 ZNCC =====
+# ===== 배치 서브셋 추출 =====
+
+def _extract_subsets_batch(image: np.ndarray,
+                           points_y: np.ndarray,
+                           points_x: np.ndarray,
+                           half: int) -> np.ndarray:
+    """
+    모든 POI에서 서브셋을 일괄 추출 → (n_points, subset_size, subset_size)
+    """
+    subset_size = 2 * half + 1
+    n_points = len(points_y)
+
+    offsets = np.arange(-half, half + 1)
+    row_idx = points_y[:, None] + offsets[None, :]
+    col_idx = points_x[:, None] + offsets[None, :]
+
+    rows = row_idx[:, :, None].repeat(subset_size, axis=2)
+    cols = col_idx[:, None, :].repeat(subset_size, axis=1)
+
+    subsets = image[rows, cols]
+    return subsets.astype(np.float64)
+
+
+# ===== 배치 FFT-ZNCC (OpenCorr 방식) =====
+
+def _batch_fft_zncc(ref_subsets: np.ndarray,
+                    tar_subsets: np.ndarray,
+                    n_workers: int = -1,
+                    chunk_size: int = 256) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    배치 FFT 기반 ZNCC (OpenCorr 방식, 동일 크기 서브셋)
+
+    ref와 tar 모두 zero-mean → FFT → 상호상관 → ZNCC
+    적분 이미지 불필요 (전체 서브셋 정규화)
+
+    Args:
+        ref_subsets: (n_points, ss, ss) — 참조 서브셋
+        tar_subsets: (n_points, ss, ss) — 타겟 서브셋 (동일 크기)
+        n_workers: scipy FFT worker 수 (-1 = 모든 코어)
+        chunk_size: 한 번에 처리할 POI 수 (메모리 제어)
+
+    Returns:
+        disp_u, disp_v, zncc_scores: 각 (n_points,)
+    """
+    n_points, ss_h, ss_w = ref_subsets.shape
+    half_y = ss_h // 2
+    half_x = ss_w // 2
+    subset_size = ss_h * ss_w
+
+    disp_u_all = np.zeros(n_points, dtype=np.int32)
+    disp_v_all = np.zeros(n_points, dtype=np.int32)
+    zncc_all = np.zeros(n_points, dtype=np.float64)
+
+    for start in range(0, n_points, chunk_size):
+        end = min(start + chunk_size, n_points)
+        n_chunk = end - start
+
+        r = ref_subsets[start:end]
+        t = tar_subsets[start:end]
+
+        # Zero-mean
+        r_mean = r.mean(axis=(1, 2), keepdims=True)
+        t_mean = t.mean(axis=(1, 2), keepdims=True)
+        r_zm = r - r_mean
+        t_zm = t - t_mean
+
+        # Norm
+        r_norm = np.sqrt(np.sum(r_zm ** 2, axis=(1, 2)))
+        t_norm = np.sqrt(np.sum(t_zm ** 2, axis=(1, 2)))
+
+        # 무효 처리 (균일 영역)
+        zero_mask = (r_norm < 1e-10) | (t_norm < 1e-10)
+        r_norm[zero_mask] = 1.0
+        t_norm[zero_mask] = 1.0
+
+        # 배치 FFT (3회)
+        if HAS_SCIPY_FFT:
+            F = scipy_fft2(r_zm, workers=n_workers)
+            G = scipy_fft2(t_zm, workers=n_workers)
+            cc = scipy_ifft2(np.conj(F) * G, workers=n_workers).real
+        else:
+            F = np.fft.fft2(r_zm)
+            G = np.fft.fft2(t_zm)
+            cc = np.fft.ifft2(np.conj(F) * G).real
+        del F, G
+
+        # ZNCC = cc / (r_norm * t_norm * N)
+        denom = (r_norm * t_norm * subset_size)[:, None, None]
+        zncc = cc / (denom + 1e-10)
+        del cc
+
+        # 피크 찾기
+        zncc_flat = zncc.reshape(n_chunk, -1)
+        peak_flat_idx = np.argmax(zncc_flat, axis=1)
+        peak_scores = zncc_flat[np.arange(n_chunk), peak_flat_idx]
+        peak_scores[zero_mask] = 0.0
+        del zncc, zncc_flat
+
+        # 피크 → 변위 (wrap-around 보정)
+        peak_row = peak_flat_idx // ss_w
+        peak_col = peak_flat_idx % ss_w
+
+        # 순환 FFT 보정: 피크가 절반을 넘으면 음수 변위
+        dv = np.where(peak_row > half_y, peak_row - ss_h, peak_row)
+        du = np.where(peak_col > half_x, peak_col - ss_w, peak_col)
+
+        disp_u_all[start:end] = du
+        disp_v_all[start:end] = dv
+        zncc_all[start:end] = peak_scores
+
+    return disp_u_all, disp_v_all, zncc_all
+
+
+# ===== 단일 POI ZNCC (하위 호환) =====
+
 def _fft_zncc(template: np.ndarray, search_win: np.ndarray) -> Tuple[int, int, float]:
-    """
-    FFT 기반 Zero-mean Normalized Cross-Correlation
-    
-    올바른 ZNCC: 각 위치에서 로컬 평균과 로컬 에너지를 계산하여 정규화
-    """
-    sh, sw = search_win.shape
-    th, tw = template.shape
-    
-    # Template zero-mean & 정규화
-    t = template.astype(np.float64)
-    t_mean = np.mean(t)
-    t_zm = t - t_mean
-    t_norm = np.sqrt(np.sum(t_zm ** 2))
-    if t_norm < 1e-10:
-        return 0, 0, 0.0
-    
-    n_pixels = th * tw  # subset 내 픽셀 수
-    s = search_win.astype(np.float64)
-    
-    # FFT cross-correlation: Σ(t_zm * s) 
-    F = np.fft.fft2(t_zm, s=(sh, sw))
-    G = np.fft.fft2(s)
-    cc = np.fft.ifft2(np.conj(F) * G).real
-    
-    # 로컬 합 계산 (FFT 활용)
-    ones = np.ones((th, tw), dtype=np.float64)
-    Ones_fft = np.fft.fft2(ones, s=(sh, sw))
-    
-    # Σs (각 위치에서의 로컬 합)
-    local_sum = np.fft.ifft2(np.fft.fft2(s) * np.conj(Ones_fft)).real
-    
-    # Σs² (각 위치에서의 로컬 제곱합)
-    local_sum_sq = np.fft.ifft2(np.fft.fft2(s ** 2) * np.conj(Ones_fft)).real
-    
-    # 로컬 분산: Σ(s - s_mean)² = Σs² - (Σs)²/n
-    local_var = local_sum_sq - (local_sum ** 2) / n_pixels
-    local_var = np.maximum(local_var, 0.0)  # 수치 오차 보정
-    local_norm = np.sqrt(local_var)
-    
-    # ZNCC: cc에서 t_zm과 s의 상관이므로
-    # Σ(t_zm * s) = Σ(t_zm * (s - s_mean)) + Σ(t_zm * s_mean)
-    # Σ(t_zm) = 0 이므로 Σ(t_zm * s_mean) = s_mean * Σ(t_zm) = 0
-    # 따라서 cc = Σ(t_zm * (s - s_mean)) → 정확한 zero-mean cross-correlation
-    
-    zncc = cc / (t_norm * local_norm + 1e-10)
-    
-    # 유효 영역에서 피크 찾기
-    valid_h = sh - th + 1
-    valid_w = sw - tw + 1
-    zncc_valid = zncc[:valid_h, :valid_w]
-    
-    peak_idx = np.argmax(zncc_valid)
-    peak_y, peak_x = np.unravel_index(peak_idx, zncc_valid.shape)
-    
-    return int(peak_y), int(peak_x), float(zncc_valid[peak_y, peak_x])
+    """단일 POI용 FFT-ZNCC (OpenCorr 방식, 동일 크기)"""
+    r = template[None, ...].astype(np.float64)
+    t = search_win[None, ...].astype(np.float64)
+
+    du, dv, zncc = _batch_fft_zncc(r, t, n_workers=1, chunk_size=1)
+    return int(dv[0]), int(du[0]), float(zncc[0])
+
+
+# ===== 메인 함수 =====
 
 def compute_fft_cc(ref_image, def_image,
                    subset_size=21, spacing=10, search_range=50,
                    zncc_threshold=0.6, roi=None,
                    n_workers=None, progress_callback=None) -> FFTCCResult:
+    """
+    벡터화된 FFT-CC (OpenCorr 방식)
 
+    search_range 파라미터는 호환성을 위해 유지되지만 내부에서 사용되지 않음.
+    탐색 범위는 subset_size에 의해 결정됨 (±subset_size//2).
+    """
     start_time = time.time()
 
     ref_gray = _to_gray(ref_image).astype(np.float32)
     def_gray = _to_gray(def_image).astype(np.float32)
 
-    # 전체 이미지 + ROI 범위 내 글로벌 POI
+    ref_h, ref_w = ref_gray.shape
+    def_h, def_w = def_gray.shape
+
     points_y, points_x = _generate_poi_grid(
         ref_gray.shape, subset_size, spacing, roi=roi
     )
@@ -94,56 +186,41 @@ def compute_fft_cc(ref_image, def_image,
 
     if progress_callback:
         progress_callback(0, n_points)
-    if n_workers is None:
-        n_workers = max(1, os.cpu_count() - 1)
+
+    half = subset_size // 2
+
+    # 경계 검사: ref와 tar 모두에서 서브셋 추출 가능한 POI만 유지
+    valid = (
+        (points_y - half >= 0) & (points_y + half < ref_h) &
+        (points_x - half >= 0) & (points_x + half < ref_w) &
+        (points_y - half >= 0) & (points_y + half < def_h) &
+        (points_x - half >= 0) & (points_x + half < def_w)
+    )
 
     disp_u = np.zeros(n_points, dtype=np.int32)
     disp_v = np.zeros(n_points, dtype=np.int32)
     zncc_values = np.zeros(n_points, dtype=np.float64)
 
-    half = subset_size // 2
-    ref_h, ref_w = ref_gray.shape
-    def_h, def_w = def_gray.shape
-    
-    def process_poi(idx: int) -> Tuple[int, int, int, float]:
-        py, px = points_y[idx], points_x[idx]
+    valid_idx = np.where(valid)[0]
 
-        # reference subset — 글로벌 좌표에서 직접 추출
-        template = ref_gray[py - half:py + half + 1,
-                            px - half:px + half + 1]
+    if len(valid_idx) > 0:
+        v_py = points_y[valid_idx]
+        v_px = points_x[valid_idx]
 
-        # search window — 글로벌 좌표 기준으로 search_range 확장
-        sy1 = max(0, py - search_range)
-        sy2 = min(def_h, py + search_range + subset_size)
-        sx1 = max(0, px - search_range)
-        sx2 = min(def_w, px + search_range + subset_size)
+        # 배치 서브셋 추출 (동일 크기)
+        ref_subsets = _extract_subsets_batch(ref_gray, v_py, v_px, half)
+        tar_subsets = _extract_subsets_batch(def_gray, v_py, v_px, half)
 
-        search_win = def_gray[sy1:sy2, sx1:sx2]
+        # 배치 FFT-ZNCC
+        fft_workers = -1 if HAS_SCIPY_FFT else 1
+        du, dv, scores = _batch_fft_zncc(
+            ref_subsets, tar_subsets,
+            n_workers=fft_workers
+        )
 
-        if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
-            return idx, 0, 0, 0.0
-
-        best_y, best_x, zncc = _fft_zncc(template, search_win)
-
-        # 변위 = (deformed 위치) - (reference 위치)
-        du = (sx1 + best_x + half) - px
-        dv = (sy1 + best_y + half) - py
-
-        return idx, du, dv, zncc
-
-    completed = 0
-    update_interval = max(1, n_points // 50)
-
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        futures = {executor.submit(process_poi, i): i for i in range(n_points)}
-        for future in as_completed(futures):
-            idx, du, dv, zncc = future.result()
-            disp_u[idx] = du
-            disp_v[idx] = dv
-            zncc_values[idx] = zncc
-            completed += 1
-            if progress_callback and completed % update_interval == 0:
-                progress_callback(completed, n_points)
+        disp_u[valid_idx] = du
+        disp_v[valid_idx] = dv
+        zncc_values[valid_idx] = scores
 
     if progress_callback:
         progress_callback(n_points, n_points)
@@ -156,8 +233,8 @@ def compute_fft_cc(ref_image, def_image,
     processing_time = time.time() - start_time
 
     return FFTCCResult(
-        points_y=points_y,   # ★ 글로벌 좌표
-        points_x=points_x,   # ★ 글로벌 좌표
+        points_y=points_y,
+        points_x=points_x,
         disp_u=disp_u,
         disp_v=disp_v,
         zncc_values=zncc_values,
@@ -169,11 +246,14 @@ def compute_fft_cc(ref_image, def_image,
         processing_time=processing_time
     )
 
+
 def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
                                  subset_size=21, spacing=10, search_range=50,
                                  zncc_threshold=0.6, roi=None,
                                  progress_callback=None, should_stop=None):
-
+    """
+    배치 처리 — 참조 서브셋 캐시, OpenCorr 방식
+    """
     results = {}
     if not def_file_paths:
         return results
@@ -181,7 +261,6 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
     ref_gray = _to_gray(ref_image).astype(np.float32)
     ref_h, ref_w = ref_gray.shape
 
-    # 글로벌 좌표 POI 생성
     points_y, points_x = _generate_poi_grid(
         ref_gray.shape, subset_size, spacing, roi=roi
     )
@@ -191,98 +270,96 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
 
     half = subset_size // 2
 
-    # 템플릿 사전 추출 — 글로벌 좌표에서 직접
-    templates = []
-    valid_poi = np.ones(n_points, dtype=bool)
-    for idx in range(n_points):
-        py, px = points_y[idx], points_x[idx]
-        template = ref_gray[py - half:py + half + 1,
-                            px - half:px + half + 1].copy()
-        templates.append(template)
+    # 참조 서브셋에 대한 경계 검사
+    ref_valid = (
+        (points_y - half >= 0) & (points_y + half < ref_h) &
+        (points_x - half >= 0) & (points_x + half < ref_w)
+    )
 
-    n_workers = max(1, os.cpu_count() - 1)
+    # 참조 서브셋 사전 추출 (1회, 전체 배치에서 재사용)
+    ref_valid_idx = np.where(ref_valid)[0]
+    ref_subsets = None
+    if len(ref_valid_idx) > 0:
+        ref_subsets = _extract_subsets_batch(
+            ref_gray, points_y[ref_valid_idx], points_x[ref_valid_idx], half
+        )
+
+    fft_workers = -1 if HAS_SCIPY_FFT else 1
     total_files = len(def_file_paths)
 
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        for file_idx, def_path in enumerate(def_file_paths):
-            if should_stop and should_stop():
-                break
+    for file_idx, def_path in enumerate(def_file_paths):
+        if should_stop and should_stop():
+            break
 
-            filename = def_path.name
-            start_time = time.time()
+        filename = def_path.name
+        start_time = time.time()
 
-            if progress_callback:
-                progress_callback(file_idx, total_files, filename)
+        if progress_callback:
+            progress_callback(file_idx, total_files, filename)
 
-            def_image = get_image_func(def_path)
-            if def_image is None:
-                continue
+        def_image = get_image_func(def_path)
+        if def_image is None:
+            continue
 
-            def_gray = _to_gray(def_image).astype(np.float32)
-            def_h, def_w = def_gray.shape
+        def_gray = _to_gray(def_image).astype(np.float32)
+        def_h, def_w = def_gray.shape
 
-            disp_u = np.zeros(n_points, dtype=np.int32)
-            disp_v = np.zeros(n_points, dtype=np.int32)
-            zncc_values = np.zeros(n_points, dtype=np.float64)
+        disp_u = np.zeros(n_points, dtype=np.int32)
+        disp_v = np.zeros(n_points, dtype=np.int32)
+        zncc_values = np.zeros(n_points, dtype=np.float64)
 
-            def make_process_poi(d_gray, d_h, d_w):
-                def process_poi(idx):
-                    py, px = points_y[idx], points_x[idx]
-                    
-                    # 참조 템플릿이 무효인 POI 스킵
-                    if not valid_poi[idx]:
-                        return idx, 0, 0, -1.0
-
-                    template = templates[idx]
-
-                    sy1 = max(0, py - search_range)
-                    sy2 = min(d_h, py + search_range + subset_size)
-                    sx1 = max(0, px - search_range)
-                    sx2 = min(d_w, px + search_range + subset_size)
-
-                    search_win = d_gray[sy1:sy2, sx1:sx2]
-                    if search_win.shape[0] < subset_size or search_win.shape[1] < subset_size:
-                        return idx, 0, 0, 0.0
-
-                    best_y, best_x, zncc = _fft_zncc(template, search_win)
-                    du = (sx1 + best_x + half) - px
-                    dv = (sy1 + best_y + half) - py
-                    return idx, du, dv, zncc
-                return process_poi
-
-            process_poi = make_process_poi(def_gray, def_h, def_w)
-            futures = [executor.submit(process_poi, i) for i in range(n_points)]
-
-            for future in as_completed(futures):
-                idx, du, dv, zncc = future.result()
-                disp_u[idx] = du
-                disp_v[idx] = dv
-                zncc_values[idx] = zncc
-
-            valid_mask = zncc_values >= zncc_threshold
-            invalid_points = _collect_invalid_points(
-                points_y, points_x, disp_u, disp_v,
-                zncc_values, valid_mask, zncc_threshold
+        if ref_subsets is not None and len(ref_valid_idx) > 0:
+            # 타겟 경계 검사
+            tar_valid = (
+                (points_y[ref_valid_idx] - half >= 0) &
+                (points_y[ref_valid_idx] + half < def_h) &
+                (points_x[ref_valid_idx] - half >= 0) &
+                (points_x[ref_valid_idx] + half < def_w)
             )
 
-            results[filename] = FFTCCResult(
-                points_y=points_y.copy(),
-                points_x=points_x.copy(),
-                disp_u=disp_u.copy(),
-                disp_v=disp_v.copy(),
-                zncc_values=zncc_values.copy(),
-                valid_mask=valid_mask.copy(),
-                invalid_points=invalid_points,
-                subset_size=subset_size,
-                search_range=search_range,
-                spacing=spacing,
-                processing_time=time.time() - start_time
-            )
+            both_valid = np.where(tar_valid)[0]
+
+            if len(both_valid) > 0:
+                global_idx = ref_valid_idx[both_valid]
+                v_py = points_y[global_idx]
+                v_px = points_x[global_idx]
+
+                tar_subsets = _extract_subsets_batch(def_gray, v_py, v_px, half)
+
+                du, dv, scores = _batch_fft_zncc(
+                    ref_subsets[both_valid], tar_subsets,
+                    n_workers=fft_workers
+                )
+
+                disp_u[global_idx] = du
+                disp_v[global_idx] = dv
+                zncc_values[global_idx] = scores
+
+        valid_mask = zncc_values >= zncc_threshold
+        invalid_points = _collect_invalid_points(
+            points_y, points_x, disp_u, disp_v,
+            zncc_values, valid_mask, zncc_threshold
+        )
+
+        results[filename] = FFTCCResult(
+            points_y=points_y.copy(),
+            points_x=points_x.copy(),
+            disp_u=disp_u.copy(),
+            disp_v=disp_v.copy(),
+            zncc_values=zncc_values.copy(),
+            valid_mask=valid_mask.copy(),
+            invalid_points=invalid_points,
+            subset_size=subset_size,
+            search_range=search_range,
+            spacing=spacing,
+            processing_time=time.time() - start_time
+        )
 
     if progress_callback:
         progress_callback(total_files, total_files, "완료")
 
     return results
+
 
 # ===== 유틸리티 함수 =====
 
@@ -295,35 +372,13 @@ def _to_gray(img: np.ndarray) -> np.ndarray:
     return img
 
 
-def _apply_roi(ref: np.ndarray, 
-               defm: np.ndarray,
-               roi: Optional[Tuple[int, int, int, int]],
-               search_range: int) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
-    """ROI 적용 및 확장 영역 계산"""
-    if roi is None:
-        return ref, defm, (0, 0)
-    
-    x, y, w, h = roi
-    ref_roi = ref[y:y+h, x:x+w]
-    
-    y1 = max(0, y - search_range)
-    y2 = min(defm.shape[0], y + h + search_range)
-    x1 = max(0, x - search_range)
-    x2 = min(defm.shape[1], x + w + search_range)
-    def_extended = defm[y1:y2, x1:x2]
-    
-    roi_offset = (x - x1, y - y1)
-    
-    return ref_roi, def_extended, roi_offset
-
-
 def _generate_poi_grid(image_shape: Tuple[int, int],
                        subset_size: int,
                        spacing: int,
                        roi: Optional[Tuple[int, int, int, int]] = None
                        ) -> Tuple[np.ndarray, np.ndarray]:
     """POI 그리드 생성 — 항상 글로벌 좌표"""
-    h, w = image_shape  # 전체 이미지 크기
+    h, w = image_shape
     half = subset_size // 2
     margin = half + 1
 
@@ -347,16 +402,10 @@ def _generate_poi_grid(image_shape: Tuple[int, int],
     return yy.ravel().astype(np.int64), xx.ravel().astype(np.int64)
 
 
-def _collect_invalid_points(points_y: np.ndarray,
-                            points_x: np.ndarray,
-                            disp_u: np.ndarray,
-                            disp_v: np.ndarray,
-                            zncc_values: np.ndarray,
-                            valid_mask: np.ndarray,
-                            threshold: float) -> list:
+def _collect_invalid_points(points_y, points_x, disp_u, disp_v,
+                            zncc_values, valid_mask, threshold):
     """불량 포인트 수집"""
     invalid_indices = np.where(~valid_mask)[0]
-    
     invalid_points = []
     for idx in invalid_indices:
         flag = 'low_zncc' if zncc_values[idx] < threshold else 'unknown'
@@ -369,11 +418,10 @@ def _collect_invalid_points(points_y: np.ndarray,
             valid=False,
             flag=flag
         ))
-    
     return invalid_points
 
 
-def _empty_result(subset_size: int, search_range: int, spacing: int) -> FFTCCResult:
+def _empty_result(subset_size, search_range, spacing):
     """빈 결과"""
     return FFTCCResult(
         points_y=np.array([], dtype=np.int64),
@@ -392,4 +440,4 @@ def _empty_result(subset_size: int, search_range: int, spacing: int) -> FFTCCRes
 def warmup_fft_cc():
     """워밍업"""
     dummy = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
-    compute_fft_cc(dummy, dummy, subset_size=21, spacing=30, search_range=20, n_workers=2)
+    compute_fft_cc(dummy, dummy, subset_size=21, spacing=30, search_range=20)

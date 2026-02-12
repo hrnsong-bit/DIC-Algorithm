@@ -223,7 +223,7 @@ def compute_icgn(
             zncc_values[idx] = zncc
             iterations[idx] = n_iter
             converged[idx] = conv
-            valid_mask[idx] = conv and (zncc >= zncc_threshold)
+            valid_mask[idx] = zncc >= zncc_threshold
             
             completed += 1
             if progress_callback and completed % update_interval == 0:
@@ -320,13 +320,7 @@ def _icgn_iterate(
         g = target_interp(y_def, x_def)
         t2 = time.perf_counter()
         time_interp += (t2 - t1)
-        
-        # 보간 결과 유효성 검사
-        if np.any(g <= 0.0):
-            zncc = -3.0
-            conv = False
-            break
-        
+
         # ZNCC 계산
         g_mean = np.mean(g)
         g_tilde = np.linalg.norm(g - g_mean)
@@ -352,6 +346,8 @@ def _icgn_iterate(
         
         # 수렴 체크
         conv, dp_norm = check_convergence(dp, subset_size, convergence_threshold, shape_function)
+        if iteration >= max_iterations - 5:
+            print(f"[CONV] POI({cx},{cy}) iter={iteration+1} dp_norm={dp_norm:.8f} threshold={convergence_threshold} zncc={zncc:.4f}")
         
         if conv:
             break
