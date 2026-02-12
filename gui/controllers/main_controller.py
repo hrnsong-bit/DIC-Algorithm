@@ -414,7 +414,6 @@ class MainController:
 
         self.assessor = SpeckleQualityAssessor(
             mig_threshold=params.mig_threshold,
-            sssig_threshold=params.sssig_threshold,
             subset_size=params.subset_size,
             poi_spacing=params.spacing,
             noise_variance=noise_var,
@@ -432,7 +431,6 @@ class MainController:
             if params:
                 return {
                     'mig_threshold': params.mig_threshold,
-                    'sssig_threshold': params.sssig_threshold,
                     'subset_size': params.subset_size,
                     'spacing': params.spacing,
                 }

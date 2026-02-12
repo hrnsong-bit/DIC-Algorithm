@@ -213,7 +213,7 @@ class SpeckleQualityAssessor:
 
             sssig_result = compute_sssig_map(
                 roi_gray,
-                subset_size=self.subset_size,
+                subset_size=recommended_size,
                 spacing=self.poi_spacing,
                 noise_variance=noise_variance,
                 desired_accuracy=self.desired_accuracy,
@@ -278,98 +278,116 @@ class SpeckleQualityAssessor:
         )
 
     # ── 배치 평가 ──
+def evaluate_batch(self,
+                   images: Dict[str, np.ndarray],
+                   roi: Optional[Tuple[int, int, int, int]] = None,
+                   progress_callback: Optional[
+                       Callable[[int, int, str], None]] = None
+                   ) -> BatchReport:
+    """배치 평가
+    
+    노이즈 분산은 첫 이미지에서 한 번만 추정하고 나머지에 재사용합니다.
+    (같은 카메라/조명 세팅의 시퀀스에서 노이즈 특성은 동일)
+    """
+    start_time = time.time()
 
-    def evaluate_batch(self,
-                       images: Dict[str, np.ndarray],
-                       roi: Optional[Tuple[int, int, int, int]] = None,
-                       progress_callback: Optional[
-                           Callable[[int, int, str], None]] = None
-                       ) -> BatchReport:
-        """배치 평가"""
-        start_time = time.time()
+    total = len(images)
+    individual_reports = {}
+    max_recommended_size = 11
+    worst_file = ""
+    passed = 0
+    failed = 0
 
-        total = len(images)
-        individual_reports = {}
-        max_recommended_size = 11
-        worst_file = ""
-        passed = 0
-        failed = 0
+    mig_values = []
+    sssig_min_values = []
+    noise_variances = []
+    predicted_accuracies = []
 
-        mig_values = []
-        sssig_min_values = []
-        noise_variances = []
-        predicted_accuracies = []
+    # 배치 시작 전 원래 override 상태 저장
+    original_override = self._noise_variance_override
 
-        logger.info(f"배치 평가 시작: {total}개 이미지")
+    logger.info(f"배치 평가 시작: {total}개 이미지")
 
-        for idx, (filename, image) in enumerate(images.items()):
-            if progress_callback:
-                progress_callback(idx + 1, total, filename)
+    for idx, (filename, image) in enumerate(images.items()):
+        if progress_callback:
+            progress_callback(idx + 1, total, filename)
 
-            try:
-                report = self.evaluate(image, roi)
-                individual_reports[filename] = report
+        try:
+            report = self.evaluate(image, roi)
+            individual_reports[filename] = report
 
-                mig_values.append(report.mig)
+            # 첫 이미지에서 노이즈 추정 → 이후 재사용
+            if idx == 0 and report.noise_variance is not None:
+                if original_override is None and self._noise_pair is None:
+                    self._noise_variance_override = report.noise_variance
+                    logger.info(
+                        f"배치 노이즈 고정: D(η)={report.noise_variance:.2f} "
+                        f"(첫 이미지 '{filename}'에서 추정)")
 
-                if report.noise_variance is not None:
-                    noise_variances.append(report.noise_variance)
+            mig_values.append(report.mig)
 
-                if report.predicted_accuracy is not None:
-                    predicted_accuracies.append(report.predicted_accuracy)
+            if report.noise_variance is not None:
+                noise_variances.append(report.noise_variance)
 
-                if (report.sssig_result
-                        and len(report.sssig_result.points_y) > 0):
-                    sssig_min_values.append(report.sssig_result.min)
+            if report.predicted_accuracy is not None:
+                predicted_accuracies.append(report.predicted_accuracy)
 
-                if report.analyzable:
-                    passed += 1
-                else:
-                    failed += 1
+            if (report.sssig_result
+                    and len(report.sssig_result.points_y) > 0):
+                sssig_min_values.append(report.sssig_result.min)
 
-                if report.recommended_subset_size > max_recommended_size:
-                    max_recommended_size = report.recommended_subset_size
-                    worst_file = filename
-
-            except cv2.error as e:
-                logger.error(f"OpenCV 오류 ({filename}): {e}")
+            if report.analyzable:
+                passed += 1
+            else:
                 failed += 1
-            except ValueError as e:
-                logger.error(f"값 오류 ({filename}): {e}")
-                failed += 1
-            except Exception as e:
-                logger.exception(f"예상치 못한 오류 ({filename})")
-                failed += 1
 
-        global_size_found = all(
-            r.subset_size_found for r in individual_reports.values()
-        )
+            if report.recommended_subset_size > max_recommended_size:
+                max_recommended_size = report.recommended_subset_size
+                worst_file = filename
 
-        total_time = time.time() - start_time
-        logger.info(
-            f"배치 평가 완료: {passed}/{total} 통과, "
-            f"처리시간={total_time:.2f}s")
+        except cv2.error as e:
+            logger.error(f"OpenCV 오류 ({filename}): {e}")
+            failed += 1
+        except ValueError as e:
+            logger.error(f"값 오류 ({filename}): {e}")
+            failed += 1
+        except Exception as e:
+            logger.exception(f"예상치 못한 오류 ({filename})")
+            failed += 1
 
-        def _stats(values):
-            if not values:
-                return {'mean': 0.0, 'min': 0.0, 'max': 0.0}
-            return {
-                'mean': float(np.mean(values)),
-                'min': float(np.min(values)),
-                'max': float(np.max(values)),
-            }
+    # 배치 종료 후 원래 override 상태 복원
+    self._noise_variance_override = original_override
+    logger.debug("배치 종료: 노이즈 override 원래 상태 복원")
 
-        return BatchReport(
-            total_images=total,
-            passed_images=passed,
-            failed_images=failed,
-            global_recommended_size=max_recommended_size,
-            global_size_found=global_size_found,
-            worst_case_file=worst_file,
-            individual_reports=individual_reports,
-            mig_stats=_stats(mig_values),
-            sssig_stats=_stats(sssig_min_values),
-            noise_stats=_stats(noise_variances),
-            accuracy_stats=_stats(predicted_accuracies),
-            total_processing_time=total_time,
-        )
+    global_size_found = all(
+        r.subset_size_found for r in individual_reports.values()
+    )
+
+    total_time = time.time() - start_time
+    logger.info(
+        f"배치 평가 완료: {passed}/{total} 통과, "
+        f"처리시간={total_time:.2f}s")
+
+    def _stats(values):
+        if not values:
+            return {'mean': 0.0, 'min': 0.0, 'max': 0.0}
+        return {
+            'mean': float(np.mean(values)),
+            'min': float(np.min(values)),
+            'max': float(np.max(values)),
+        }
+
+    return BatchReport(
+        total_images=total,
+        passed_images=passed,
+        failed_images=failed,
+        global_recommended_size=max_recommended_size,
+        global_size_found=global_size_found,
+        worst_case_file=worst_file,
+        individual_reports=individual_reports,
+        mig_stats=_stats(mig_values),
+        sssig_stats=_stats(sssig_min_values),
+        noise_stats=_stats(noise_variances),
+        accuracy_stats=_stats(predicted_accuracies),
+        total_processing_time=total_time,
+    )

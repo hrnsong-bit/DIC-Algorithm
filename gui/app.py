@@ -191,7 +191,6 @@ class SpeckleQualityGUI:
         self.param_panel = ParamPanel(left_panel)
         self._create_roi_panel(left_panel)
         self._create_eval_buttons(left_panel)
-        self._create_export_buttons(left_panel)
         self._create_viz_options(left_panel)
         self._create_status_panel(left_panel)
         self._create_result_panel(left_panel)
