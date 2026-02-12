@@ -411,7 +411,6 @@ def compute_fft_cc(ref_image, def_image,
         processing_time=processing_time
     )
 
-
 def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
                                  subset_size=21, spacing=10, search_range=None,
                                  zncc_threshold=0.6, roi=None,
@@ -423,6 +422,12 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
         - 시편 마스크 및 distance transform: ref 기준 1회 계산, 전 프레임 공유
         - ref 서브셋: search_range 그룹별 1회 추출, 전 프레임 재사용
         - 프레임별로는 tar 서브셋 추출 + FFT만 수행
+    
+    적응적 search_range 전략:
+        1) 이미지 경계 기반 (항상 적용) — 시편 외곽 처리
+        2) 마스크 기반 홀 제한 (추가) — 내부 결함(홀, 노치) 처리
+        3) np.minimum으로 두 값 중 작은 쪽 적용
+        4) 홀 내부 POI는 결과에서 완전 제외
     """
     results = {}
     if not def_file_paths:
@@ -449,36 +454,46 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
         (points_x - half >= 0) & (points_x + half < ref_w)
     )
 
-    # 시편 마스크 기반 적응적 search_range
+    # ===== 적응적 search_range =====
+    # 이미지 경계 기반 (기본) + 마스크 기반 홀 제한 (추가)
+    
+    # 1) 이미지 경계 기반 search_range (항상 적용)
+    margin_top = points_y
+    margin_bot = ref_h - 1 - points_y
+    margin_left = points_x
+    margin_right = ref_w - 1 - points_x
+    max_possible = np.minimum(
+        np.minimum(margin_top, margin_bot),
+        np.minimum(margin_left, margin_right)
+    ) - half
+    poi_search_range = np.clip(max_possible.astype(np.int32), 0, search_range)
+    
+    # 2) 마스크 기반 홀 제한 (성공 시만 추가 적용)
     try:
-        specimen_mask = create_specimen_mask(ref_gray)
+        specimen_mask = create_specimen_mask(ref_gray.astype(np.uint8))
         dist_map = distance_transform_edt(specimen_mask > 0)
         poi_dist = dist_map[points_y.astype(int), points_x.astype(int)]
-        poi_search_range = np.clip(
+        mask_sr = np.clip(
             (poi_dist - half).astype(np.int32),
             0,
             search_range
         )
+        poi_search_range = np.minimum(poi_search_range, mask_sr)
+        poi_search_range[poi_dist <= half] = 0
     except Exception:
-        margin_top = points_y
-        margin_bot = ref_h - 1 - points_y
-        margin_left = points_x
-        margin_right = ref_w - 1 - points_x
-        max_possible = np.minimum(
-            np.minimum(margin_top, margin_bot),
-            np.minimum(margin_left, margin_right)
-        ) - half
-        poi_search_range = np.clip(max_possible.astype(np.int32), 0, search_range)
+        pass
 
     MIN_SR = 3
     valid = ref_valid & (poi_search_range >= MIN_SR)
     valid_idx = np.where(valid)[0]
 
+    # ===== 홀 내부 POI 식별 (결과에서 제외할 인덱스) =====
+    analyzable = poi_search_range >= MIN_SR
+
     # ★ search_range별 그룹 사전 구성 + ref 서브셋 캐시
     valid_sr = poi_search_range[valid_idx]
     unique_sr = np.unique(valid_sr)
 
-    # ref 서브셋은 항상 같은 크기 (half 기준) → 그룹별로 캐시
     ref_subsets_cache = {}
     for sr in unique_sr:
         sr = int(sr)
@@ -552,18 +567,36 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
             zncc_values[final_idx] = scores
 
         valid_mask = zncc_values >= zncc_threshold
+
+        # ===== 홀 내부 POI 제거 (결과에서 완전 제외) =====
+        if not np.all(analyzable):
+            keep = analyzable
+            r_points_y = points_y[keep]
+            r_points_x = points_x[keep]
+            r_disp_u = disp_u[keep]
+            r_disp_v = disp_v[keep]
+            r_zncc_values = zncc_values[keep]
+            r_valid_mask = valid_mask[keep]
+        else:
+            r_points_y = points_y
+            r_points_x = points_x
+            r_disp_u = disp_u
+            r_disp_v = disp_v
+            r_zncc_values = zncc_values
+            r_valid_mask = valid_mask
+
         invalid_points = _collect_invalid_points(
-            points_y, points_x, disp_u, disp_v,
-            zncc_values, valid_mask, zncc_threshold
+            r_points_y, r_points_x, r_disp_u, r_disp_v,
+            r_zncc_values, r_valid_mask, zncc_threshold
         )
 
         results[filename] = FFTCCResult(
-            points_y=points_y.copy(),
-            points_x=points_x.copy(),
-            disp_u=disp_u.copy(),
-            disp_v=disp_v.copy(),
-            zncc_values=zncc_values.copy(),
-            valid_mask=valid_mask.copy(),
+            points_y=r_points_y.copy(),
+            points_x=r_points_x.copy(),
+            disp_u=r_disp_u.copy(),
+            disp_v=r_disp_v.copy(),
+            zncc_values=r_zncc_values.copy(),
+            valid_mask=r_valid_mask.copy(),
             invalid_points=invalid_points,
             subset_size=subset_size,
             search_range=search_range,
