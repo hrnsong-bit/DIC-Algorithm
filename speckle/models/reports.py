@@ -1,9 +1,7 @@
 """
-스페클 품질 평가 데이터 모델
+스페클 품질 평가 데이터 모델 (v3.3.0 수정)
 
-변경 이력
----------
-v3.3  - QualityReport에 noise_method 필드 추가
+수정: QualityReport에 noise_method 필드 추가
 """
 
 from dataclasses import dataclass, field
@@ -66,7 +64,7 @@ class QualityReport:
     sssig_pass: bool
     sssig_threshold: float
 
-    # Subset 추천
+    # Subset 크기
     recommended_subset_size: int
     subset_size_found: bool
     current_subset_size: int
@@ -83,7 +81,7 @@ class QualityReport:
     # 노이즈
     noise_variance: Optional[float] = None
     predicted_accuracy: Optional[float] = None
-    noise_method: str = 'unknown'       # ← 추가: 'user' | 'pair' | 'single_local_std'
+    noise_method: str = 'unknown'  # ← 신규: 'user', 'pair', 'single_local_std'
 
     def __post_init__(self):
         self._update_grade()

@@ -355,3 +355,4 @@ def compute_strain_from_icgn_smoothed(
     result.grid_x = unique_x
     result.grid_y = unique_y
     
+    return result 
