@@ -215,7 +215,7 @@ class DICController:
                 self._refresh_display()
     
     def _update_result_ui(self, result):
-        """결과 UI 업데이트 (깔끔한 버전)"""
+        """결과 UI 업데이트"""
         if result is None:
             return
         
@@ -228,6 +228,17 @@ class DICController:
         
         is_icgn = hasattr(result, 'converged')
         filename = self.state.def_path.name if self.state.def_path else "N/A"
+        
+        # ===== 빈 배열 방어 =====
+        if len(u_valid) == 0:
+            self.view.update_result_text(
+                f"유효한 POI가 없습니다.\n"
+                f"전체 POI: {len(u)}개\n"
+                f"유효 POI: 0개\n\n"
+                f"원인: search_range 부족 또는 이미지 품질 문제"
+            )
+            return
+        # ==========================
         
         if is_icgn:
             lines = []
@@ -242,7 +253,6 @@ class DICController:
             lines.append(f"V: {np.mean(v_valid):.4f} ± {np.std(v_valid):.4f}")
             lines.append(f"   [{np.min(v_valid):.4f} ~ {np.max(v_valid):.4f}]")
             
-            # 변형률
             if hasattr(result, 'disp_ux') and result.disp_ux is not None:
                 ux = result.disp_ux[valid]
                 uy = result.disp_uy[valid]
@@ -262,24 +272,21 @@ class DICController:
             text = "\n".join(lines)
         
         else:
-            # FFTCCResult
-            text = f"""파일: {filename}
-
-    POI: {result.n_valid}/{result.n_points} ({result.valid_ratio*100:.1f}%)
-    ZNCC: {result.mean_zncc:.4f}
-
-    ── 변위 ──
-    U: {np.mean(u_valid):.4f} ± {np.std(u_valid):.4f}
-    [{np.min(u_valid):.4f} ~ {np.max(u_valid):.4f}]
-    V: {np.mean(v_valid):.4f} ± {np.std(v_valid):.4f}
-    [{np.min(v_valid):.4f} ~ {np.max(v_valid):.4f}]
-
-    시간: {result.processing_time:.2f}초"""
+            text = (
+                f"파일: {filename}\n\n"
+                f"POI: {result.n_valid}/{result.n_points} ({result.valid_ratio*100:.1f}%)\n"
+                f"ZNCC: {result.mean_zncc:.4f}\n\n"
+                f"── 변위 ──\n"
+                f"U: {np.mean(u_valid):.4f} ± {np.std(u_valid):.4f}\n"
+                f"[{np.min(u_valid):.4f} ~ {np.max(u_valid):.4f}]\n"
+                f"V: {np.mean(v_valid):.4f} ± {np.std(v_valid):.4f}\n"
+                f"[{np.min(v_valid):.4f} ~ {np.max(v_valid):.4f}]\n\n"
+                f"시간: {result.processing_time:.2f}초"
+            )
         
         self.view.update_result_text(text)
 
-
-    # ===== 동기화 (핵심 수정) =====
+    # ===== 동기화 =====
     
     def sync_from_quality_tab(self):
         """품질평가 탭에서 동기화 (캐시 사용)"""
@@ -395,10 +402,8 @@ class DICController:
                     self.state.def_image,
                     subset_size=params['subset_size'],
                     spacing=params['spacing'],
-                    search_range=params['search_range'],
                     zncc_threshold=params['zncc_threshold'],
                     roi=self.state.roi,
-                    progress_callback=fftcc_progress
                 )
                 
                 print(f"[DEBUG] FFTCC 완료 - POI: {fftcc_result.n_points}, Valid: {fftcc_result.n_valid}")
@@ -596,9 +601,8 @@ class DICController:
                         def_image,
                         subset_size=params['subset_size'],
                         spacing=params['spacing'],
-                        search_range=params['search_range'],
                         zncc_threshold=params['zncc_threshold'],
-                        roi=self.state.roi
+                        roi=self.state.roi,
                     )
                     t_fftcc_end = time.time()
                     timings['fftcc'].append(t_fftcc_end - t_fftcc_start)
@@ -714,7 +718,6 @@ class DICController:
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-
     def _run_batch_streaming(self, params: Dict[str, Any]):
             """스트리밍 배치 분석 (FFTCC + IC-GN)"""
             if not self.state.sequence_files or len(self.state.sequence_files) < 2:
@@ -762,7 +765,6 @@ class DICController:
                             def_image,
                             subset_size=params['subset_size'],
                             spacing=params['spacing'],
-                            search_range=params['search_range'],
                             zncc_threshold=params['zncc_threshold'],
                             roi=self.state.roi
                         )
