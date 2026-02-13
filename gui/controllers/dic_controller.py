@@ -1,24 +1,28 @@
-"""DIC 분석 컨트롤러"""
+"""
+DIC 분석 메인 컨트롤러
+
+역할: 상태 관리, 콜백 설정, 모듈 간 조율
+분석/렌더링/결과처리/내보내기는 각각 별도 모듈에 위임
+"""
 
 import logging
-import threading
-import time
 import numpy as np
 import cv2
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox
+
 from speckle.core.initial_guess import (
-    compute_fft_cc, compute_fft_cc_batch_cached, warmup_fft_cc,
-    validate_displacement_field,
-    FFTCCResult, ValidationResult
+    warmup_fft_cc, FFTCCResult, ValidationResult
 )
 from speckle.io import load_image, get_image_files
 from ..models.app_state import AppState
-from speckle.core.optimization import compute_icgn
-from speckle.core.postprocess import compute_strain_from_icgn, StrainResult
-from speckle.core.postprocess.strain_smoothing import compute_strain_savgol, SmoothedStrainResult
+
+from .analysis_runner import AnalysisRunner
+from .result_handler import ResultHandler
+from .renderers import FieldRenderer
+from .export_handler import ExportHandler
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,12 @@ class DICController:
         self.main_controller = main_controller
         self.state = DICState()
 
+        # 위임 객체 생성
+        self.runner = AnalysisRunner(self)
+        self.result_handler = ResultHandler(self)
+        self.renderer = FieldRenderer(self)
+        self.exporter = ExportHandler(self)
+
         self._setup_callbacks()
         self._setup_canvas_callbacks()
         self._warmup()
@@ -68,11 +78,11 @@ class DICController:
         self.view.set_callback('select_deformed', self.select_deformed)
         self.view.set_callback('select_sequence', self.select_sequence)
         self.view.set_callback('sync_from_quality', self.sync_from_quality_tab)
-        self.view.set_callback('run_analysis', self.run_fft_cc)
-        self.view.set_callback('run_batch_analysis', self.run_batch_fft_cc)
-        self.view.set_callback('stop_analysis', self.stop_analysis)
-        self.view.set_callback('export_csv', self.export_csv)
-        self.view.set_callback('export_image', self.export_image)
+        self.view.set_callback('run_analysis', self.runner.run_fft_cc)
+        self.view.set_callback('run_batch_analysis', self.runner.run_batch_fft_cc)
+        self.view.set_callback('stop_analysis', self.runner.stop_analysis)
+        self.view.set_callback('export_csv', self.exporter.export_csv)
+        self.view.set_callback('export_image', self.exporter.export_image)
         self.view.set_callback('update_display', self.update_display)
         self.view.set_callback('fit_to_canvas', self.fit_to_canvas)
         self.view.set_callback('select_image_index', self.select_image_index)
@@ -110,7 +120,6 @@ class DICController:
     # ===== 이미지 선택 =====
 
     def select_reference(self):
-        """Reference 이미지 선택"""
         path = filedialog.askopenfilename(
             title="Reference 이미지 선택",
             filetypes=[
@@ -122,12 +131,10 @@ class DICController:
             self._load_reference(Path(path))
 
     def _load_reference(self, path: Path):
-        """Reference 이미지 로드"""
         try:
             img = self.app_state.get_image(path.name)
             if img is None:
                 img = load_image(path)
-
             if img is not None:
                 self.state.ref_image = img
                 self.state.ref_path = path
@@ -138,7 +145,6 @@ class DICController:
             messagebox.showerror("오류", f"이미지 로드 실패: {e}")
 
     def select_deformed(self):
-        """Deformed 이미지 선택"""
         path = filedialog.askopenfilename(
             title="Deformed 이미지 선택",
             filetypes=[
@@ -150,12 +156,10 @@ class DICController:
             self._load_deformed(Path(path))
 
     def _load_deformed(self, path: Path):
-        """Deformed 이미지 로드"""
         try:
             img = self.app_state.get_image(path.name)
             if img is None:
                 img = load_image(path)
-
             if img is not None:
                 self.state.def_image = img
                 self.state.def_path = path
@@ -165,131 +169,49 @@ class DICController:
             messagebox.showerror("오류", f"이미지 로드 실패: {e}")
 
     def select_sequence(self):
-        """시퀀스 폴더 선택"""
         folder = filedialog.askdirectory(title="이미지 시퀀스 폴더 선택")
         if folder:
             self._load_sequence(Path(folder))
 
     def _load_sequence(self, folder: Path):
-        """시퀀스 폴더 로드"""
         try:
             files = get_image_files(folder)
             if len(files) < 2:
                 messagebox.showwarning("경고", "폴더에 2개 이상의 이미지가 필요합니다.")
                 return
-
             self.state.sequence_folder = folder
             self.state.sequence_files = files
             self.state.current_index = 0
-
             self._load_reference(files[0])
-
             if len(files) > 1:
                 self._load_deformed(files[1])
                 self.state.current_index = 1
-
             self.view.update_sequence_label(f"{folder.name} ({len(files)} files)")
             self.view.update_file_list(files, self.state.current_index)
-
         except Exception as e:
             messagebox.showerror("오류", f"폴더 로드 실패: {e}")
 
     def select_image_index(self, index: int):
-        """파일 목록에서 이미지 선택"""
         if not self.state.sequence_files:
             return
-
         if 0 <= index < len(self.state.sequence_files):
             self.state.current_index = index
             self.view.current_index = index
             path = self.state.sequence_files[index]
-
             self._load_deformed(path)
             self.view.set_current_index(index)
-
             if path.name in self.state.batch_results:
                 result = self.state.batch_results[path.name]
                 self.state.fft_cc_result = result
                 self._refresh_display()
-                self._update_result_ui(result)
+                self.result_handler.update_result_ui(result)
             else:
                 self.state.fft_cc_result = None
                 self._refresh_display()
 
-    def _update_result_ui(self, result):
-        """결과 UI 업데이트"""
-        if result is None:
-            return
-
-        u = result.disp_u
-        v = result.disp_v
-        valid = result.valid_mask if hasattr(result, 'valid_mask') else np.ones(len(u), bool)
-
-        u_valid = u[valid]
-        v_valid = v[valid]
-
-        is_icgn = hasattr(result, 'converged')
-        filename = self.state.def_path.name if self.state.def_path else "N/A"
-
-        if len(u_valid) == 0:
-            self.view.update_result_text(
-                f"유효한 POI가 없습니다.\n"
-                f"전체 POI: {len(u)}개\n"
-                f"유효 POI: 0개\n\n"
-                f"원인: search_range 부족 또는 이미지 품질 문제"
-            )
-            return
-
-        if is_icgn:
-            lines = []
-            lines.append(f"Shape: {result.shape_function}")
-            lines.append("")
-            lines.append(f"POI: {result.n_converged}/{result.n_points} ({result.convergence_rate*100:.1f}%)")
-            lines.append(f"반복: {result.mean_iterations:.1f}회 | ZNCC: {result.mean_zncc:.4f}")
-            lines.append("")
-            lines.append("── 변위 ──")
-            lines.append(f"U: {np.mean(u_valid):.4f} ± {np.std(u_valid):.4f}")
-            lines.append(f"   [{np.min(u_valid):.4f} ~ {np.max(u_valid):.4f}]")
-            lines.append(f"V: {np.mean(v_valid):.4f} ± {np.std(v_valid):.4f}")
-            lines.append(f"   [{np.min(v_valid):.4f} ~ {np.max(v_valid):.4f}]")
-
-            if hasattr(result, 'disp_ux') and result.disp_ux is not None:
-                ux = result.disp_ux[valid]
-                uy = result.disp_uy[valid]
-                vx = result.disp_vx[valid]
-                vy = result.disp_vy[valid]
-
-                lines.append("")
-                lines.append("── 변형률 ──")
-                lines.append(f"ux: {np.mean(ux): .5f} ± {np.std(ux):.5f}")
-                lines.append(f"uy: {np.mean(uy): .5f} ± {np.std(uy):.5f}")
-                lines.append(f"vx: {np.mean(vx): .5f} ± {np.std(vx):.5f}")
-                lines.append(f"vy: {np.mean(vy): .5f} ± {np.std(vy):.5f}")
-
-            lines.append("")
-            lines.append(f"시간: {result.processing_time:.2f}초")
-
-            text = "\n".join(lines)
-
-        else:
-            text = (
-                f"파일: {filename}\n\n"
-                f"POI: {result.n_valid}/{result.n_points} ({result.valid_ratio*100:.1f}%)\n"
-                f"ZNCC: {result.mean_zncc:.4f}\n\n"
-                f"── 변위 ──\n"
-                f"U: {np.mean(u_valid):.4f} ± {np.std(u_valid):.4f}\n"
-                f"[{np.min(u_valid):.4f} ~ {np.max(u_valid):.4f}]\n"
-                f"V: {np.mean(v_valid):.4f} ± {np.std(v_valid):.4f}\n"
-                f"[{np.min(v_valid):.4f} ~ {np.max(v_valid):.4f}]\n\n"
-                f"시간: {result.processing_time:.2f}초"
-            )
-
-        self.view.update_result_text(text)
-
     # ===== 동기화 =====
 
     def sync_from_quality_tab(self):
-        """품질평가 탭에서 동기화 (캐시 사용)"""
         if not self.app_state.has_images():
             messagebox.showinfo("정보", "품질평가 탭에서 폴더를 먼저 열어주세요.")
             return
@@ -349,369 +271,8 @@ class DICController:
                 f"메모리: {self.app_state.memory_usage_mb:.1f}MB\n"
                 f"ROI: {self.state.roi}"
             )
-
         except Exception as e:
             messagebox.showerror("오류", f"동기화 실패: {e}")
-
-    # ===== 분석 =====
-
-    def run_fft_cc(self, params: Dict[str, Any]):
-        """FFT-CC + IC-GN 분석 실행"""
-        if self.state.ref_image is None or self.state.def_image is None:
-            messagebox.showwarning("경고", "Reference와 Deformed 이미지를 모두 선택해주세요.")
-            return
-
-        if self.state.is_running:
-            return
-
-        self.state.is_running = True
-        self.state.should_stop = False
-        self.view.set_analysis_state(True)
-
-        def worker():
-            error_msg = None
-            fftcc_result = None
-            icgn_result = None
-
-            try:
-                # === 1단계: FFTCC ===
-                def fftcc_progress(current, total):
-                    if self.state.should_stop:
-                        raise InterruptedError("사용자 중단")
-                    progress = (current / total) * 50
-                    self.view.after(0, lambda p=progress, c=current, t=total:
-                                    self.view.update_progress(p, f"FFTCC: {c}/{t}"))
-
-                fftcc_result = compute_fft_cc(
-                    self.state.ref_image,
-                    self.state.def_image,
-                    subset_size=params['subset_size'],
-                    spacing=params['spacing'],
-                    zncc_threshold=params['zncc_threshold'],
-                    roi=self.state.roi,
-                )
-
-                if self.state.should_stop:
-                    raise InterruptedError("사용자 중단")
-
-                # === 2단계: IC-GN ===
-                self.view.after(0, lambda: self.view.update_progress(50, "IC-GN 시작..."))
-
-                def icgn_progress(current, total):
-                    if self.state.should_stop:
-                        raise InterruptedError("사용자 중단")
-                    progress = 50 + (current / total) * 50
-                    self.view.after(0, lambda p=progress, c=current, t=total:
-                                    self.view.update_progress(p, f"IC-GN: {c}/{t}"))
-
-                interp_order = 5 if params['interpolation'] == 'biquintic' else 3
-
-                icgn_result = compute_icgn(
-                    self.state.ref_image,
-                    self.state.def_image,
-                    initial_guess=fftcc_result,
-                    subset_size=params['subset_size'],
-                    shape_function=params['shape_function'],
-                    interpolation_order=interp_order,
-                    convergence_threshold=params['conv_threshold'],
-                    max_iterations=params['max_iter'],
-                    gaussian_blur=params.get('gaussian_blur'),
-                    progress_callback=icgn_progress
-                )
-
-                self.state.fft_cc_result = fftcc_result
-                self.state.icgn_result = icgn_result
-
-                if self.state.def_path:
-                    self.state.batch_results[self.state.def_path.name] = icgn_result
-
-            except InterruptedError:
-                self.view.after(0, lambda: self.view.update_progress(0, "중단됨"))
-            except Exception as ex:
-                error_msg = str(ex)
-                logger.error(f"분석 오류: {error_msg}", exc_info=True)
-            finally:
-                self.state.is_running = False
-
-                if error_msg:
-                    self.view.after(0, lambda msg=error_msg: self._show_error(msg))
-                elif icgn_result:
-                    self.view.after(0, lambda r=icgn_result: self._on_icgn_complete(r))
-
-                self.view.after(0, lambda: self.view.set_analysis_state(False))
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-
-    def _on_icgn_complete(self, result):
-        """IC-GN 분석 완료 처리"""
-        self.view.update_progress(100, "완료")
-
-        self.state.fft_cc_result = result
-        self._refresh_display()
-        self._update_result_ui(result)
-
-        valid_text = (
-            f"수렴율: {result.convergence_rate * 100:.1f}%\n"
-            f"유효 POI: {result.n_valid}/{result.n_points}\n"
-            f"평균 반복: {result.mean_iterations:.1f}회\n"
-            f"평균 ZNCC: {result.mean_zncc:.4f}"
-        )
-        self.view.update_validation_text(valid_text)
-
-    def _show_error(self, msg: str):
-        messagebox.showerror("오류", f"분석 실패: {msg}")
-
-    def run_batch_fft_cc(self, params: Dict[str, Any]):
-        """전체 시퀀스 배치 분석"""
-        use_cache = self.app_state.has_images() and len(self.app_state.images) > 1
-
-        if use_cache:
-            self._run_batch_cached(params)
-        else:
-            self._run_batch_streaming(params)
-
-    def _run_batch_cached(self, params: Dict[str, Any]):
-        """캐시된 이미지로 배치 분석 (FFTCC + IC-GN)"""
-        if self.state.is_running:
-            return
-
-        if self.app_state.loading_state.is_loading:
-            result = messagebox.askyesno(
-                "로딩 중",
-                f"이미지 로딩 중입니다.\n"
-                f"({self.app_state.loading_state.loaded_files}/{self.app_state.loading_state.total_files})\n\n"
-                f"로드된 이미지만 분석하시겠습니까?"
-            )
-            if not result:
-                return
-
-        self.state.is_running = True
-        self.state.should_stop = False
-        self.state.batch_results.clear()
-        self.view.set_analysis_state(True)
-
-        def worker():
-            error_msg = None
-            batch_start = time.time()
-
-            try:
-                all_files = self.state.sequence_files if self.state.sequence_files else self.app_state.file_paths
-                cached_files = [f for f in all_files if f.name in self.app_state.images]
-
-                if not cached_files:
-                    raise ValueError("분석할 캐시된 이미지가 없습니다.")
-
-                total_files = len(cached_files)
-
-                for file_idx, def_path in enumerate(cached_files):
-                    if self.state.should_stop:
-                        break
-
-                    filename = def_path.name
-
-                    # 진행률 업데이트
-                    progress = (file_idx / total_files) * 100
-                    self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
-                                self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
-                    self.view.after(0, lambda idx=file_idx+1: self.view.set_current_index(idx))
-
-                    # 캐시에서 이미지 가져오기
-                    def_image = self.app_state.get_image(filename)
-                    if def_image is None:
-                        continue
-
-                    # === 1단계: FFTCC ===
-                    fftcc_result = compute_fft_cc(
-                        self.state.ref_image,
-                        def_image,
-                        subset_size=params['subset_size'],
-                        spacing=params['spacing'],
-                        zncc_threshold=params['zncc_threshold'],
-                        roi=self.state.roi,
-                    )
-
-                    # === 2단계: IC-GN ===
-                    interp_order = 5 if params['interpolation'] == 'biquintic' else 3
-
-                    icgn_result = compute_icgn(
-                        self.state.ref_image,
-                        def_image,
-                        initial_guess=fftcc_result,
-                        subset_size=params['subset_size'],
-                        shape_function=params['shape_function'],
-                        interpolation_order=interp_order,
-                        convergence_threshold=params['conv_threshold'],
-                        max_iterations=params['max_iter'],
-                        gaussian_blur=params.get('gaussian_blur')
-                    )
-
-                    self.state.batch_results[filename] = icgn_result
-
-                # 마지막 결과 저장
-                if self.state.batch_results:
-                    last_key = list(self.state.batch_results.keys())[-1]
-                    self.state.icgn_result = self.state.batch_results[last_key]
-                    self.state.fft_cc_result = self.state.batch_results[last_key]
-
-                batch_elapsed = time.time() - batch_start
-                logger.info(f"배치 완료: {len(self.state.batch_results)}개 파일, {batch_elapsed:.1f}초")
-
-            except InterruptedError:
-                self.view.after(0, lambda: self.view.update_progress(0, "중단됨"))
-            except Exception as ex:
-                error_msg = str(ex)
-                logger.error(f"배치 오류: {error_msg}", exc_info=True)
-            finally:
-                self.state.is_running = False
-
-                if error_msg:
-                    self.view.after(0, lambda msg=error_msg: self._show_error(msg))
-                else:
-                    self.view.after(0, self._on_batch_complete)
-
-                self.view.after(0, lambda: self.view.set_analysis_state(False))
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-
-    def _run_batch_streaming(self, params: Dict[str, Any]):
-        """스트리밍 배치 분석 (FFTCC + IC-GN)"""
-        if not self.state.sequence_files or len(self.state.sequence_files) < 2:
-            messagebox.showwarning("경고", "시퀀스 폴더를 먼저 선택해주세요.")
-            return
-
-        if self.state.is_running:
-            return
-
-        self.state.is_running = True
-        self.state.should_stop = False
-        self.state.batch_results.clear()
-        self.view.set_analysis_state(True)
-
-        def worker():
-            error_msg = None
-
-            try:
-                files = self.state.sequence_files
-                total_files = len(files)
-
-                for file_idx, def_path in enumerate(files):
-                    if self.state.should_stop:
-                        break
-
-                    filename = def_path.name
-
-                    progress = (file_idx / total_files) * 100
-                    self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
-                                self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
-
-                    def_image = self.app_state.get_image(filename)
-                    if def_image is None:
-                        def_image = load_image(def_path)
-                    if def_image is None:
-                        continue
-
-                    # === 1단계: FFTCC ===
-                    fftcc_result = compute_fft_cc(
-                        self.state.ref_image,
-                        def_image,
-                        subset_size=params['subset_size'],
-                        spacing=params['spacing'],
-                        zncc_threshold=params['zncc_threshold'],
-                        roi=self.state.roi
-                    )
-
-                    # === 2단계: IC-GN ===
-                    interp_order = 5 if params['interpolation'] == 'biquintic' else 3
-
-                    icgn_result = compute_icgn(
-                        self.state.ref_image,
-                        def_image,
-                        initial_guess=fftcc_result,
-                        subset_size=params['subset_size'],
-                        shape_function=params['shape_function'],
-                        interpolation_order=interp_order,
-                        convergence_threshold=params['conv_threshold'],
-                        max_iterations=params['max_iter'],
-                        gaussian_blur=params.get('gaussian_blur')
-                    )
-
-                    self.state.batch_results[filename] = icgn_result
-
-                # 마지막 결과 저장
-                if self.state.batch_results:
-                    last_key = list(self.state.batch_results.keys())[-1]
-                    self.state.icgn_result = self.state.batch_results[last_key]
-                    self.state.fft_cc_result = self.state.batch_results[last_key]
-
-            except Exception as ex:
-                error_msg = str(ex)
-                logger.error(f"배치 오류: {error_msg}", exc_info=True)
-            finally:
-                self.state.is_running = False
-
-                if error_msg:
-                    self.view.after(0, lambda msg=error_msg: self._show_error(msg))
-                else:
-                    self.view.after(0, self._on_batch_complete)
-
-                self.view.after(0, lambda: self.view.set_analysis_state(False))
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-
-    def stop_analysis(self):
-        """분석 중지"""
-        self.state.should_stop = True
-
-    def _on_analysis_complete(self, result: FFTCCResult, validation: ValidationResult):
-        """분석 완료 처리"""
-        self.view.update_progress(100, "완료")
-        self._display_result(result)
-        self._update_result_ui(result)
-
-        valid_text = (
-            f"이상치 비율: {validation.outlier_ratio * 100:.1f}%\n"
-            f"불연속 영역: {validation.discontinuity_ratio * 100:.1f}%\n"
-            f"전체 유효: {'예' if validation.is_valid else '아니오'}\n"
-            f"권장 조치: {validation.suggested_action}"
-        )
-        self.view.update_validation_text(valid_text)
-
-    def _on_batch_complete(self):
-        """배치 분석 완료"""
-        n_results = len(self.state.batch_results)
-        self.view.update_progress(100, f"완료: {n_results} 파일 처리됨")
-        self._refresh_display()
-
-        if self.state.batch_results:
-            last_key = list(self.state.batch_results.keys())[-1]
-            last_result = self.state.batch_results[last_key]
-            self._update_result_ui(last_result)
-
-        total_time = sum(r.processing_time for r in self.state.batch_results.values())
-        avg_time = total_time / n_results if n_results > 0 else 0
-
-        first_result = list(self.state.batch_results.values())[0] if self.state.batch_results else None
-        is_icgn = first_result and hasattr(first_result, 'convergence_rate')
-
-        if is_icgn:
-            avg_conv_rate = np.mean([r.convergence_rate for r in self.state.batch_results.values()]) * 100
-            messagebox.showinfo(
-                "배치 분석 완료",
-                f"처리된 파일: {n_results}개\n"
-                f"총 소요 시간: {total_time:.1f}초\n"
-                f"평균 처리 시간: {avg_time:.2f}초/파일\n"
-                f"평균 수렴율: {avg_conv_rate:.1f}%"
-            )
-        else:
-            messagebox.showinfo(
-                "배치 분석 완료",
-                f"처리된 파일: {n_results}개\n"
-                f"총 소요 시간: {total_time:.1f}초\n"
-                f"평균 처리 시간: {avg_time:.2f}초/파일"
-            )
 
     # ===== 표시 =====
 
@@ -726,7 +287,7 @@ class DICController:
             return
 
         if self.state.fft_cc_result is not None:
-            display_img = self._create_overlay_image(img)
+            display_img = self.renderer.create_overlay_image(img, self.state.fft_cc_result)
         else:
             display_img = img
 
@@ -740,506 +301,18 @@ class DICController:
             show_bad_poi=False
         )
 
-    def _create_overlay_image(self, base_img: np.ndarray) -> np.ndarray:
-        result = self.state.fft_cc_result
-        if result is None:
-            return base_img
-
-        if len(base_img.shape) == 2:
-            display_img = cv2.cvtColor(base_img, cv2.COLOR_GRAY2BGR)
-        else:
-            display_img = base_img.copy()
-
-        mode = self.view.display_mode_var.get()
-
-        offset_x = 0
-        offset_y = 0
-
-        if mode == "vectors":
-            display_img = self._draw_vectors(display_img, result, offset_x, offset_y)
-        elif mode == "u_field":
-            display_img = self._draw_scalar_field(display_img, result, 'u', offset_x, offset_y)
-        elif mode == "v_field":
-            display_img = self._draw_scalar_field(display_img, result, 'v', offset_x, offset_y)
-        elif mode == "magnitude":
-            display_img = self._draw_magnitude(display_img, result, offset_x, offset_y)
-        elif mode == "exx":
-            display_img = self._draw_strain_field(display_img, result, 'exx', offset_x, offset_y)
-        elif mode == "eyy":
-            display_img = self._draw_strain_field(display_img, result, 'eyy', offset_x, offset_y)
-        elif mode == "exy":
-            display_img = self._draw_strain_field(display_img, result, 'exy', offset_x, offset_y)
-        elif mode == "e1":
-            display_img = self._draw_strain_field(display_img, result, 'e1', offset_x, offset_y)
-        elif mode == "von_mises":
-            display_img = self._draw_strain_field(display_img, result, 'von_mises', offset_x, offset_y)
-        elif mode == "zncc":
-            display_img = self._draw_zncc_map(display_img, result, offset_x, offset_y)
-        elif mode == "invalid":
-            display_img = self._draw_invalid_points(display_img, result, offset_x, offset_y)
-
-        return display_img
-
-    def _draw_scalar_field(self, img: np.ndarray, result, field_type: str,
-                           offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """변위 필드 시각화 (U 또는 V)"""
-        if result.n_points == 0:
-            return img
-
-        if field_type == 'u':
-            values = result.disp_u
-            label = "U (px)"
-        elif field_type == 'v':
-            values = result.disp_v
-            label = "V (px)"
-        else:
-            values = np.sqrt(result.disp_u**2 + result.disp_v**2)
-            label = "|D| (px)"
-
-        valid = result.valid_mask
-        valid_values = values[valid]
-
-        if len(valid_values) == 0:
-            return img
-
-        color_range = self.view.get_color_range()
-        if color_range is not None:
-            vmin, vmax = color_range
-        else:
-            vmin, vmax = np.min(valid_values), np.max(valid_values)
-            if field_type in ['u', 'v']:
-                v_abs_max = max(abs(vmin), abs(vmax))
-                if v_abs_max < 1e-10:
-                    v_abs_max = 1.0
-                vmin, vmax = -v_abs_max, v_abs_max
-
-        colormap = 'diverging' if field_type in ['u', 'v'] else 'sequential'
-        self.view.update_colorbar(vmin, vmax, label, colormap)
-
-        for idx in range(result.n_points):
-            x = int(result.points_x[idx]) + offset_x
-            y = int(result.points_y[idx]) + offset_y
-
-            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
-                continue
-
-            if result.valid_mask[idx]:
-                norm_val = (values[idx] - vmin) / (vmax - vmin + 1e-10)
-                norm_val = np.clip(norm_val, 0, 1)
-
-                if colormap == 'diverging':
-                    color = self._diverging_colormap(norm_val)
-                else:
-                    color = self._sequential_colormap(norm_val)
-
-                cv2.circle(img, (x, y), 4, color, -1)
-            else:
-                cv2.circle(img, (x, y), 4, (128, 128, 128), -1)
-
-        return img
-
-    def _draw_strain_field(self, img: np.ndarray, result, strain_type: str,
-                           offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """변형률 필드 시각화 (Savitzky-Golay + 부드러운 보간)"""
-        if result.n_points == 0:
-            return img
-
-        is_icgn = hasattr(result, 'disp_ux') and result.disp_ux is not None
-        if not is_icgn:
-            cv2.putText(img, "IC-GN 결과 필요", (50, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return img
-
-        valid = result.valid_mask
-        px, py = result.points_x, result.points_y
-
-        px_valid = px[valid]
-        py_valid = py[valid]
-
-        unique_x = np.unique(px_valid)
-        unique_y = np.unique(py_valid)
-        nx, ny = len(unique_x), len(unique_y)
-
-        if nx < 5 or ny < 5:
-            return self._draw_strain_field_points(img, result, strain_type, offset_x, offset_y)
-
-        grid_step = float(np.median(np.diff(unique_x))) if len(unique_x) > 1 else 1.0
-
-        x_to_idx = {x: i for i, x in enumerate(unique_x)}
-        y_to_idx = {y: i for i, y in enumerate(unique_y)}
-
-        disp_u_grid = np.full((ny, nx), np.nan)
-        disp_v_grid = np.full((ny, nx), np.nan)
-
-        for i in range(len(px)):
-            if valid[i]:
-                xi = x_to_idx.get(px[i])
-                yi = y_to_idx.get(py[i])
-                if xi is not None and yi is not None:
-                    disp_u_grid[yi, xi] = result.disp_u[i]
-                    disp_v_grid[yi, xi] = result.disp_v[i]
-
-        try:
-            from speckle.core.postprocess.strain_smoothing import compute_strain_savgol
-            strain_smooth = compute_strain_savgol(
-                disp_u_grid, disp_v_grid,
-                window_size=11,
-                poly_order=2,
-                grid_step=grid_step
-            )
-        except Exception as e:
-            logger.warning(f"Savitzky-Golay 실패: {e}")
-            return self._draw_strain_field_points(img, result, strain_type, offset_x, offset_y)
-
-        field_map = {
-            'exx': (strain_smooth.exx, "εxx"),
-            'eyy': (strain_smooth.eyy, "εyy"),
-            'exy': (strain_smooth.exy, "εxy"),
-            'e1': (strain_smooth.e1, "ε1"),
-            'von_mises': (strain_smooth.von_mises, "ε_vm")
-        }
-
-        if strain_type not in field_map:
-            return img
-
-        strain_2d, label = field_map[strain_type]
-
-        valid_strain = ~np.isnan(strain_2d)
-        valid_values = strain_2d[valid_strain]
-        if len(valid_values) == 0:
-            return img
-
-        color_range = self.view.get_color_range()
-        if color_range is not None:
-            vmin, vmax = color_range
-        else:
-            vmin = np.percentile(valid_values, 1)
-            vmax = np.percentile(valid_values, 99)
-            v_abs_max = max(abs(vmin), abs(vmax))
-            if v_abs_max < 1e-10:
-                v_abs_max = 1e-6
-            vmin, vmax = -v_abs_max, v_abs_max
-
-        self.view.update_colorbar(vmin, vmax, label, 'diverging')
-
-        from scipy.interpolate import RegularGridInterpolator
-
-        strain_filled = strain_2d.copy()
-        strain_filled[np.isnan(strain_filled)] = 0
-
-        grid_y_coords = unique_y
-        grid_x_coords = unique_x
-
-        interp = RegularGridInterpolator(
-            (grid_y_coords, grid_x_coords),
-            strain_filled,
-            method='linear',
-            bounds_error=False,
-            fill_value=np.nan
-        )
-
-        x_min, x_max = int(unique_x[0]), int(unique_x[-1])
-        y_min, y_max = int(unique_y[0]), int(unique_y[-1])
-
-        target_y = np.arange(y_min, y_max + 1)
-        target_x = np.arange(x_min, x_max + 1)
-        target_yy, target_xx = np.meshgrid(target_y, target_x, indexing='ij')
-        target_points = np.stack([target_yy.ravel(), target_xx.ravel()], axis=-1)
-
-        strain_interp = interp(target_points).reshape(len(target_y), len(target_x))
-
-        strain_norm = (strain_interp - vmin) / (vmax - vmin + 1e-10)
-        strain_norm = np.clip(strain_norm, 0, 1)
-
-        h, w = strain_norm.shape
-        strain_color = np.zeros((h, w, 3), dtype=np.uint8)
-
-        for j in range(h):
-            for i in range(w):
-                if not np.isnan(strain_interp[j, i]):
-                    strain_color[j, i] = self._diverging_colormap(strain_norm[j, i])
-
-        alpha = 0.6
-        x_start = x_min + offset_x
-        y_start = y_min + offset_y
-
-        x_end = min(x_start + w, img.shape[1])
-        y_end = min(y_start + h, img.shape[0])
-        x_start = max(0, x_start)
-        y_start = max(0, y_start)
-
-        crop_x = x_start - (x_min + offset_x)
-        crop_y = y_start - (y_min + offset_y)
-        crop_w = x_end - x_start
-        crop_h = y_end - y_start
-
-        if crop_w > 0 and crop_h > 0:
-            strain_crop = strain_color[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-            interp_crop = strain_interp[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-
-            roi = img[y_start:y_end, x_start:x_end].copy()
-
-            valid_mask = ~np.isnan(interp_crop)
-            for c in range(3):
-                roi[:, :, c] = np.where(
-                    valid_mask,
-                    (alpha * strain_crop[:, :, c] + (1 - alpha) * roi[:, :, c]).astype(np.uint8),
-                    roi[:, :, c]
-                )
-
-            img[y_start:y_end, x_start:x_end] = roi
-
-        return img
-
-    def _draw_strain_field_points(self, img: np.ndarray, result, strain_type: str,
-                                  offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """변형률 필드 점 시각화 (폴백용)"""
-        from speckle.core.postprocess import compute_strain_from_icgn
-        strain = compute_strain_from_icgn(result)
-
-        field_map = {
-            'exx': (strain.exx, "εxx"),
-            'eyy': (strain.eyy, "εyy"),
-            'exy': (strain.exy, "εxy"),
-            'e1': (strain.e1, "ε1"),
-            'von_mises': (strain.von_mises, "ε_vm")
-        }
-
-        if strain_type not in field_map:
-            return img
-
-        values, label = field_map[strain_type]
-        valid = strain.valid_mask
-        valid_values = values[valid]
-
-        if len(valid_values) == 0:
-            return img
-
-        color_range = self.view.get_color_range()
-        if color_range is not None:
-            vmin, vmax = color_range
-        else:
-            vmin, vmax = np.min(valid_values), np.max(valid_values)
-            v_abs_max = max(abs(vmin), abs(vmax))
-            if v_abs_max < 1e-10:
-                v_abs_max = 1e-6
-            vmin, vmax = -v_abs_max, v_abs_max
-
-        self.view.update_colorbar(vmin, vmax, label, 'diverging')
-
-        for idx in range(result.n_points):
-            x = int(result.points_x[idx]) + offset_x
-            y = int(result.points_y[idx]) + offset_y
-
-            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
-                continue
-
-            if strain.valid_mask[idx]:
-                norm_val = (values[idx] - vmin) / (vmax - vmin + 1e-10)
-                norm_val = np.clip(norm_val, 0, 1)
-                color = self._diverging_colormap(norm_val)
-                cv2.circle(img, (x, y), 4, color, -1)
-            else:
-                cv2.circle(img, (x, y), 4, (128, 128, 128), -1)
-
-        return img
-
-    def _diverging_colormap(self, norm_value: float) -> tuple:
-        """Diverging colormap (파랑 - 흰색 - 빨강)"""
-        if norm_value < 0.5:
-            t = norm_value * 2
-            r = int(t * 255)
-            g = int(t * 255)
-            b = 255
-        else:
-            t = (norm_value - 0.5) * 2
-            r = 255
-            g = int((1 - t) * 255)
-            b = int((1 - t) * 255)
-
-        return (b, g, r)
-
-    def _draw_colorbar_diverging(self, img: np.ndarray, min_val: float, max_val: float, label: str) -> np.ndarray:
-        """Diverging colorbar"""
-        h, w = img.shape[:2]
-        bar_width, bar_height, margin = 20, 150, 10
-        x_start, y_start = w - bar_width - margin - 50, margin
-
-        cv2.rectangle(img, (x_start - 5, y_start - 5),
-                      (x_start + bar_width + 60, y_start + bar_height + 35), (40, 40, 40), -1)
-
-        for i in range(bar_height):
-            norm_val = 1 - (i / bar_height)
-            color = self._diverging_colormap(norm_val)
-            cv2.line(img, (x_start, y_start + i), (x_start + bar_width, y_start + i), color, 1)
-
-        cv2.putText(img, f"{max_val:.2e}", (x_start + bar_width + 3, y_start + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
-        cv2.putText(img, "0", (x_start + bar_width + 3, y_start + bar_height // 2 + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
-        cv2.putText(img, f"{min_val:.2e}", (x_start + bar_width + 3, y_start + bar_height),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
-        cv2.putText(img, label, (x_start, y_start + bar_height + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-        return img
-
-    def _draw_vectors(self, img: np.ndarray, result: FFTCCResult,
-                      offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """변위 벡터 시각화 (자동 스케일)"""
-        if result.n_points == 0:
-            return img
-
-        max_disp = max(np.max(np.abs(result.disp_u)), np.max(np.abs(result.disp_v)), 1)
-        auto_scale = 30.0 / max_disp
-
-        for idx in range(result.n_points):
-            if not result.valid_mask[idx]:
-                continue
-
-            x = int(result.points_x[idx]) + offset_x
-            y = int(result.points_y[idx]) + offset_y
-            u = result.disp_u[idx]
-            v = result.disp_v[idx]
-
-            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
-                continue
-
-            end_x = int(x + u * auto_scale)
-            end_y = int(y + v * auto_scale)
-
-            magnitude = np.sqrt(u*u + v*v)
-            ratio = min(magnitude / max_disp, 1.0)
-            hue = int((1 - ratio) * 120)
-            color = self._hsv_to_bgr(hue, 255, 255)
-
-            cv2.arrowedLine(img, (x, y), (end_x, end_y), color, 1, tipLength=0.3)
-
-        return img
-
-    def _draw_magnitude(self, img: np.ndarray, result,
-                        offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        """변위 크기 시각화"""
-        return self._draw_scalar_field(img, result, 'magnitude', offset_x, offset_y)
-
-    def _sequential_colormap(self, norm_value: float) -> tuple:
-        """Sequential colormap (파랑 → 초록 → 노랑 → 빨강)"""
-        if norm_value < 0.25:
-            r = 0
-            g = int(norm_value * 4 * 255)
-            b = 255
-        elif norm_value < 0.5:
-            r = 0
-            g = 255
-            b = int((1 - (norm_value - 0.25) * 4) * 255)
-        elif norm_value < 0.75:
-            r = int((norm_value - 0.5) * 4 * 255)
-            g = 255
-            b = 0
-        else:
-            r = 255
-            g = int((1 - (norm_value - 0.75) * 4) * 255)
-            b = 0
-
-        return (b, g, r)
-
-    def _draw_zncc_map(self, img: np.ndarray, result: FFTCCResult,
-                       offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        if result.n_points == 0:
-            return img
-
-        for idx in range(result.n_points):
-            x = int(result.points_x[idx]) + offset_x
-            y = int(result.points_y[idx]) + offset_y
-
-            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
-                continue
-
-            zncc = result.zncc_values[idx]
-            ratio = max(0, min(1, zncc))
-
-            r = int((1 - ratio) * 255)
-            g = int(ratio * 255)
-            b = 0
-
-            cv2.circle(img, (x, y), 4, (b, g, r), -1)
-
-        img = self._draw_colorbar(img, 0, 1, "ZNCC")
-        return img
-
-    def _draw_invalid_points(self, img: np.ndarray, result: FFTCCResult,
-                             offset_x: int = 0, offset_y: int = 0) -> np.ndarray:
-        if result.n_points == 0:
-            return img
-
-        for idx in range(result.n_points):
-            x = int(result.points_x[idx]) + offset_x
-            y = int(result.points_y[idx]) + offset_y
-
-            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
-                continue
-
-            if result.valid_mask[idx]:
-                cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
-            else:
-                cv2.circle(img, (x, y), 6, (0, 0, 255), -1)
-                cv2.drawMarker(img, (x, y), (255, 255, 255), cv2.MARKER_CROSS, 10, 2)
-
-        return img
-
-    def _hsv_to_bgr(self, h: int, s: int, v: int) -> tuple:
-        hsv = np.uint8([[[h, s, v]]])
-        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-        return int(bgr[0, 0, 0]), int(bgr[0, 0, 1]), int(bgr[0, 0, 2])
-
-    def _magnitude_to_color(self, norm_value: float) -> tuple:
-        if norm_value < 0.25:
-            r, g, b = 0, int(255 * (norm_value / 0.25)), 255
-        elif norm_value < 0.5:
-            r, g, b = 0, 255, int(255 * (1 - (norm_value - 0.25) / 0.25))
-        elif norm_value < 0.75:
-            r, g, b = int(255 * ((norm_value - 0.5) / 0.25)), 255, 0
-        else:
-            r, g, b = 255, int(255 * (1 - (norm_value - 0.75) / 0.25)), 0
-        return (b, g, r)
-
-    def _draw_colorbar(self, img: np.ndarray, min_val: float, max_val: float, label: str) -> np.ndarray:
-        h, w = img.shape[:2]
-        bar_width, bar_height, margin = 20, 150, 10
-        x_start, y_start = w - bar_width - margin, margin
-
-        cv2.rectangle(img, (x_start - 5, y_start - 5),
-                      (x_start + bar_width + 40, y_start + bar_height + 25), (40, 40, 40), -1)
-
-        for i in range(bar_height):
-            norm_val = 1 - (i / bar_height)
-            color = self._magnitude_to_color(norm_val)
-            cv2.line(img, (x_start, y_start + i), (x_start + bar_width, y_start + i), color, 1)
-
-        cv2.putText(img, f"{max_val:.1f}", (x_start + bar_width + 5, y_start + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-        cv2.putText(img, f"{min_val:.1f}", (x_start + bar_width + 5, y_start + bar_height),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-        return img
-
-    def _display_result(self, result: FFTCCResult):
-        self.state.fft_cc_result = result
+    def update_display(self):
         self._refresh_display()
-
-    def update_display(self, mode: str):
-        """표시 모드 변경"""
-        self._refresh_display()
-
-    # ===== 줌/캔버스 =====
 
     def fit_to_canvas(self):
-        img = self.state.def_image if self.state.def_image is not None else self.state.ref_image
-        if img is not None:
-            zoom = self.view.canvas_view.fit_to_canvas(img.shape[:2])
-            self.state.zoom_level = zoom
-            self.state.pan_offset = (0, 0)
-            self._refresh_display()
-            self.view.zoom_label.configure(text=f"{int(zoom * 100)}%")
+        img = self.state.ref_image
+        if img is None:
+            return
+        zoom = self.view.canvas_view.fit_to_canvas(img.shape[:2])
+        self.state.zoom_level = zoom
+        self.state.pan_offset = (0, 0)
+        self.view.zoom_label.configure(text=f"{int(zoom * 100)}%")
+        self._refresh_display()
 
     def zoom_in(self):
         self._handle_zoom(1.2)
@@ -1250,108 +323,5 @@ class DICController:
     def set_zoom_1to1(self):
         self.state.zoom_level = 1.0
         self.state.pan_offset = (0, 0)
-        self._refresh_display()
         self.view.zoom_label.configure(text="100%")
-
-    # ===== 내보내기 =====
-
-    def export_csv(self):
-        """IC-GN 결과 CSV 저장"""
-        result = self.state.icgn_result if self.state.icgn_result else self.state.fft_cc_result
-
-        if result is None:
-            messagebox.showwarning("경고", "내보낼 결과가 없습니다.")
-            return
-
-        if self.state.def_path:
-            default_name = f"dic_result_{self.state.def_path.stem}.csv"
-        else:
-            default_name = "dic_result.csv"
-
-        path = filedialog.asksaveasfilename(
-            title="CSV 저장",
-            defaultextension=".csv",
-            initialfile=default_name,
-            filetypes=[("CSV 파일", "*.csv")]
-        )
-
-        if not path:
-            return
-
-        try:
-            is_icgn = hasattr(result, 'converged')
-
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                f.write(f"# DIC Analysis Result\n")
-                f.write(f"# Reference: {self.state.ref_path.name if self.state.ref_path else 'N/A'}\n")
-                f.write(f"# Deformed: {self.state.def_path.name if self.state.def_path else 'N/A'}\n")
-                f.write(f"# ROI: {self.state.roi}\n")
-                f.write(f"# Subset Size: {result.subset_size}\n")
-
-                if is_icgn:
-                    f.write(f"# Shape Function: {result.shape_function}\n")
-                    f.write(f"# Convergence Threshold: {result.convergence_threshold}\n")
-                    f.write(f"# Max Iterations: {result.max_iterations}\n")
-                    f.write(f"# Total POI: {result.n_points}\n")
-                    f.write(f"# Converged: {result.n_converged} ({result.convergence_rate*100:.1f}%)\n")
-                    f.write(f"# Valid: {result.n_valid}\n")
-                    f.write(f"# Mean Iterations: {result.mean_iterations:.1f}\n")
-                else:
-                    f.write(f"# Total POI: {result.n_points}\n")
-                    f.write(f"# Valid: {result.n_valid}\n")
-
-                f.write(f"# Mean ZNCC: {result.mean_zncc:.6f}\n")
-                f.write(f"# Processing Time: {result.processing_time:.2f}s\n")
-                f.write(f"#\n")
-
-                import csv
-                writer = csv.writer(f)
-
-                if is_icgn:
-                    if result.shape_function == 'affine':
-                        writer.writerow(['x', 'y', 'u', 'v', 'ux', 'uy', 'vx', 'vy', 'zncc', 'converged', 'iterations'])
-                        for i in range(result.n_points):
-                            writer.writerow([
-                                result.points_x[i], result.points_y[i],
-                                f"{result.disp_u[i]:.6f}", f"{result.disp_v[i]:.6f}",
-                                f"{result.disp_ux[i]:.6f}", f"{result.disp_uy[i]:.6f}",
-                                f"{result.disp_vx[i]:.6f}", f"{result.disp_vy[i]:.6f}",
-                                f"{result.zncc_values[i]:.6f}",
-                                result.converged[i], result.iterations[i]
-                            ])
-                    else:
-                        if result.disp_uxx is not None:
-                            writer.writerow(['x', 'y', 'u', 'v', 'ux', 'uy', 'uxx', 'uxy', 'uyy',
-                                            'vx', 'vy', 'vxx', 'vxy', 'vyy', 'zncc', 'converged', 'iterations'])
-                            for i in range(result.n_points):
-                                writer.writerow([
-                                    result.points_x[i], result.points_y[i],
-                                    f"{result.disp_u[i]:.6f}", f"{result.disp_v[i]:.6f}",
-                                    f"{result.disp_ux[i]:.6f}", f"{result.disp_uy[i]:.6f}",
-                                    f"{result.disp_uxx[i]:.6f}", f"{result.disp_uxy[i]:.6f}",
-                                    f"{result.disp_uyy[i]:.6f}",
-                                    f"{result.disp_vx[i]:.6f}", f"{result.disp_vy[i]:.6f}",
-                                    f"{result.disp_vxx[i]:.6f}", f"{result.disp_vxy[i]:.6f}",
-                                    f"{result.disp_vyy[i]:.6f}",
-                                    f"{result.zncc_values[i]:.6f}",
-                                    result.converged[i], result.iterations[i]
-                                ])
-                        else:
-                            writer.writerow(['x', 'y', 'u', 'v', 'ux', 'uy', 'vx', 'vy', 'zncc', 'converged', 'iterations'])
-                            for i in range(result.n_points):
-                                writer.writerow([
-                                    result.points_x[i], result.points_y[i],
-                                    f"{result.disp_u[i]:.6f}", f"{result.disp_v[i]:.6f}",
-                                    f"{result.disp_ux[i]:.6f}", f"{result.disp_uy[i]:.6f}",
-                                    f"{result.disp_vx[i]:.6f}", f"{result.disp_vy[i]:.6f}",
-                                    f"{result.zncc_values[i]:.6f}",
-                                    result.converged[i], result.iterations[i]
-                                ])
-
-            messagebox.showinfo("완료", f"CSV 저장 완료\n{path}")
-
-        except Exception as e:
-            messagebox.showerror("오류", f"저장 실패: {e}")
-
-    def export_image(self):
-        messagebox.showinfo("정보", "이미지 내보내기 기능은 추후 구현 예정입니다.")
+        self._refresh_display()
