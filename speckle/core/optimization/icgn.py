@@ -16,7 +16,17 @@ import os
 import logging
 
 from ..initial_guess.results import FFTCCResult
-from .results import ICGNResult
+from .results import (
+    ICGNResult,
+    ICGN_SUCCESS,
+    ICGN_FAIL_LOW_ZNCC,
+    ICGN_FAIL_DIVERGED,
+    ICGN_FAIL_OUT_OF_BOUNDS,
+    ICGN_FAIL_SINGULAR_HESSIAN,
+    ICGN_FAIL_FLAT_SUBSET,
+    ICGN_FAIL_MAX_DISPLACEMENT,
+    ICGN_FAIL_FLAT_TARGET,
+)
 from .interpolation import create_interpolator, ImageInterpolator
 from .shape_function import (
     generate_local_coordinates,
@@ -106,6 +116,7 @@ def compute_icgn(
     iterations = np.zeros(n_points, dtype=np.int32)
     converged = np.zeros(n_points, dtype=bool)
     valid_mask = np.zeros(n_points, dtype=bool)
+    failure_reason = np.zeros(n_points, dtype=np.int32)
 
     if n_workers is None:
         n_workers = max(1, os.cpu_count() - 1)
@@ -113,7 +124,7 @@ def compute_icgn(
     if progress_callback:
         progress_callback(0, n_points)
 
-    def process_poi(idx: int) -> Tuple[int, np.ndarray, float, int, bool]:
+    def process_poi(idx: int) -> Tuple[int, np.ndarray, float, int, bool, int]:
         px = points_x[idx]
         py = points_y[idx]
 
@@ -121,7 +132,7 @@ def compute_icgn(
             ref_gray, grad_x, grad_y, px, py, subset_size)
 
         if ref_data is None:
-            return idx, np.zeros(n_params), 0.0, 0, False
+            return idx, np.zeros(n_params), 0.0, 0, False, ICGN_FAIL_FLAT_SUBSET
 
         f, dfdx, dfdy, f_mean, f_tilde = ref_data
 
@@ -131,7 +142,7 @@ def compute_icgn(
         try:
             H_inv = np.linalg.inv(H)
         except np.linalg.LinAlgError:
-            return idx, np.zeros(n_params), 0.0, 0, False
+            return idx, np.zeros(n_params), 0.0, 0, False, ICGN_FAIL_SINGULAR_HESSIAN
 
         p = get_initial_params(shape_function)
         if shape_function == 'affine':
@@ -141,7 +152,7 @@ def compute_icgn(
             p[0] = float(initial_guess.disp_u[idx])
             p[6] = float(initial_guess.disp_v[idx])
 
-        p_final, zncc, n_iter, conv = _icgn_iterate(
+        p_final, zncc, n_iter, conv, fail_code = _icgn_iterate(
             f, f_mean, f_tilde,
             J, H_inv,
             target_interp,
@@ -154,7 +165,7 @@ def compute_icgn(
             shape_function,
         )
 
-        return idx, p_final, zncc, n_iter, conv
+        return idx, p_final, zncc, n_iter, conv, fail_code
 
     # 병렬 처리
     completed = 0
@@ -165,7 +176,7 @@ def compute_icgn(
             executor.submit(process_poi, i): i for i in range(n_points)}
 
         for future in as_completed(futures):
-            idx, p_final, zncc, n_iter, conv = future.result()
+            idx, p_final, zncc, n_iter, conv, fail_code = future.result()
 
             if shape_function == 'affine':
                 disp_u[idx] = p_final[0]
@@ -192,10 +203,19 @@ def compute_icgn(
             iterations[idx] = n_iter
             converged[idx] = conv
             valid_mask[idx] = zncc >= zncc_threshold
+            failure_reason[idx] = fail_code
+
+            # valid인데 fail_code가 0이 아닌 경우 보정
+            # (수렴했지만 ZNCC가 threshold 미만일 수 있음)
+            if valid_mask[idx] and fail_code != ICGN_SUCCESS:
+                valid_mask[idx] = False
+            if not valid_mask[idx] and fail_code == ICGN_SUCCESS:
+                failure_reason[idx] = ICGN_FAIL_LOW_ZNCC
 
             completed += 1
             if progress_callback and completed % update_interval == 0:
                 progress_callback(completed, n_points)
+
 
     if progress_callback:
         progress_callback(n_points, n_points)
@@ -221,6 +241,7 @@ def compute_icgn(
         iterations=iterations,
         converged=converged,
         valid_mask=valid_mask,
+        failure_reason=failure_reason,
         subset_size=subset_size,
         max_iterations=max_iterations,
         convergence_threshold=convergence_threshold,
@@ -230,7 +251,6 @@ def compute_icgn(
 
 
 # ===== IC-GN 반복 =====
-
 def _icgn_iterate(
     f: np.ndarray,
     f_mean: float,
@@ -246,11 +266,19 @@ def _icgn_iterate(
     max_iterations: int,
     convergence_threshold: float,
     shape_function: str = 'affine',
-) -> Tuple[np.ndarray, float, int, bool]:
-    """단일 POI에 대한 IC-GN 반복"""
+) -> Tuple[np.ndarray, float, int, bool, int]:
+    """
+    단일 POI에 대한 IC-GN 반복
+
+    Returns:
+        (p_final, zncc, n_iter, converged, fail_code)
+        fail_code: 0=success, 1=low_zncc, 2=diverged,
+                   3=out_of_bounds, 6=max_displacement, 7=flat_target
+    """
     n_iter = 0
     conv = False
     zncc = 0.0
+    fail_code = ICGN_SUCCESS
 
     if shape_function == 'affine':
         u_idx, v_idx = 0, 3
@@ -260,16 +288,9 @@ def _icgn_iterate(
     p_initial_u = p[u_idx]
     p_initial_v = p[v_idx]
 
-    # --- 발산 임계값: subset 크기에 비례 스케일링 ---
-    # check_convergence의 norm은 gradient 성분에 half²을 곱하므로
-    # subset이 커지면 norm도 비례해서 커짐
-    # 기준: subset_size=21(half=10)에서 dp_norm > 1.0이 발산
     half = subset_size // 2
-    reference_half = 10  # subset_size=21 기준
+    reference_half = 10
     divergence_threshold = 1.0 * (half / reference_half)
-
-    # 변위 변화 허용량도 subset 크기에 비례
-    # 큰 subset은 더 넓은 영역을 커버하므로 보정 범위도 커야 함
     max_displacement_change = 5.0 * (half / reference_half)
 
     for iteration in range(max_iterations):
@@ -280,20 +301,28 @@ def _icgn_iterate(
         x_def = cx + xsi_w
         y_def = cy + eta_w
 
+        # 경계 체크
+        if not np.all(target_interp.is_inside(y_def, x_def)):
+            fail_code = ICGN_FAIL_OUT_OF_BOUNDS
+            conv = False
+            break
+
         # 보간
         g = target_interp(y_def, x_def)
 
-        # ZNCC
+        # target subset이 평탄한 경우
         g_mean = np.mean(g)
         g_tilde = np.linalg.norm(g - g_mean)
 
         if g_tilde < 1e-10:
+            fail_code = ICGN_FAIL_FLAT_TARGET
             break
 
         znssd = _compute_znssd(f, f_mean, f_tilde, g, g_mean, g_tilde)
         zncc = 1.0 - 0.5 * znssd
 
         if zncc < 0.5:
+            fail_code = ICGN_FAIL_LOW_ZNCC
             conv = False
             break
 
@@ -307,10 +336,12 @@ def _icgn_iterate(
             dp, subset_size, convergence_threshold, shape_function)
 
         if conv:
+            fail_code = ICGN_SUCCESS
             break
 
-        # 발산 판단 — subset 크기 비례 임계값 사용
+        # 발산 판단
         if dp_norm > divergence_threshold:
+            fail_code = ICGN_FAIL_DIVERGED
             conv = False
             break
 
@@ -322,10 +353,11 @@ def _icgn_iterate(
 
         if (displacement_change_u > max_displacement_change
                 or displacement_change_v > max_displacement_change):
+            fail_code = ICGN_FAIL_MAX_DISPLACEMENT
             conv = False
             break
 
-    return p, zncc, n_iter, conv
+    return p, zncc, n_iter, conv, fail_code
 
 # ===== 유틸 =====
 
@@ -413,6 +445,7 @@ def _empty_result(
         iterations=np.array([], dtype=np.int32),
         converged=np.array([], dtype=bool),
         valid_mask=np.array([], dtype=bool),
+        failure_reason=np.array([], dtype=np.int32),
         subset_size=subset_size,
         max_iterations=max_iterations,
         convergence_threshold=convergence_threshold,
