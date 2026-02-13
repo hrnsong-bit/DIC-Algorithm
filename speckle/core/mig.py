@@ -15,11 +15,22 @@ def compute_mig(image: np.ndarray) -> float:
     """
     Mean Intensity Gradient 계산
     
-    Args:
-        image: 그레이스케일 이미지 (2D numpy array)
+    Sobel ksize=3을 정규화 없이 사용.
     
-    Returns:
-        MIG 값 (float)
+    MIG는 스페클 패턴 간 상대적 품질 비교 지표이므로 (Pan et al., 2010),
+    gradient의 절대 스케일이 아닌 상대 크기만 의미를 가짐.
+    따라서 SSSIG/IC-GN의 gradient (ksize=5, /32.0)와 의도적으로 다름:
+    - ksize=3: 스페클 미세 구조(고주파)에 더 민감 → 품질 변별력 향상
+    - 정규화 없음: 상대 비교 지표이므로 불필요
+    
+    SSSIG/IC-GN은 σ(Δu) ≈ √[D(η)/SSSIG] 관계를 위해
+    동일한 gradient 설정(ksize=5, /32.0)을 사용해야 하며,
+    이는 sssig.py와 icgn.py에서 보장됨.
+    
+    References:
+        Pan et al. (2010) "Mean intensity gradient: An effective global parameter
+        for quality assessment of the speckle patterns used in DIC"
+        Optics and Lasers in Engineering, 48(4), 469-477.
     """
     if image is None or image.size == 0:
         return 0.0

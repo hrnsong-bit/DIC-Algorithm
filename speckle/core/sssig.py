@@ -79,13 +79,10 @@ def compute_gradient(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     이미지 gradient 계산 — IC-GN과 동일한 Sobel ksize=5, /32.0
 
     SSSIG와 IC-GN이 동일한 gradient를 사용해야
-    σ(Δu) ≈ √[D(η) / SSSIG] 관계가 성립함.
-
-    Args:
-        image: 그레이스케일 또는 BGR 이미지
-
-    Returns:
-        (gx, gy) float64 gradient 배열
+    σ(Δu) ≈ √[D(η) / SSSIG] 관계가 성립함 (Pan et al., 2008, Eq. 18-19).
+    
+    MIG용 gradient(mig.py, ksize=3, 정규화 없음)와는 의도적으로 다름.
+    MIG는 상대적 품질 비교 지표이므로 gradient 스케일에 무관.
     """
     img_float = _ensure_gray_float(image)
     ksize = 5
