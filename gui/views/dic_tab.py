@@ -402,49 +402,38 @@ class DICTab(ttk.Frame):
         
         self._update_display()
 
-    def update_colorbar(self, vmin: float, vmax: float, label: str = "", colormap: str = 'diverging'):
+    def update_colorbar(self, vmin: float, vmax: float, label: str = "", colormap: str = 'turbo'):
         """컬러바 업데이트"""
         self.colorbar_canvas.delete("all")
-        
+
         width = self.colorbar_canvas.winfo_width()
         if width < 10:
             width = 200
         height = 25
-        
-        # 컬러바 그리기
-        for i in range(width):
-            norm_val = i / width
-            
-            if colormap == 'diverging':
-                # 파랑 → 흰색 → 빨강
-                if norm_val < 0.5:
-                    t = norm_val * 2
-                    r = int(t * 255)
-                    g = int(t * 255)
-                    b = 255
-                else:
-                    t = (norm_val - 0.5) * 2
-                    r = 255
-                    g = int((1 - t) * 255)
-                    b = int((1 - t) * 255)
-            else:
-                # Sequential (파랑 → 초록 → 노랑 → 빨강)
-                if norm_val < 0.25:
-                    r, g, b = 0, int(norm_val * 4 * 255), 255
-                elif norm_val < 0.5:
-                    r, g, b = 0, 255, int((1 - (norm_val - 0.25) * 4) * 255)
-                elif norm_val < 0.75:
-                    r, g, b = int((norm_val - 0.5) * 4 * 255), 255, 0
-                else:
-                    r, g, b = 255, int((1 - (norm_val - 0.75) * 4) * 255), 0
-            
-            color = f'#{r:02x}{g:02x}{b:02x}'
-            self.colorbar_canvas.create_line(i, 0, i, height, fill=color)
-        
-        # 범위 라벨 업데이트
+
+        # matplotlib turbo colormap 사용
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            cmap = plt.get_cmap('turbo')
+
+            for i in range(width):
+                norm_val = i / width
+                r, g, b, _ = cmap(norm_val)
+                r, g, b = int(r * 255), int(g * 255), int(b * 255)
+                color = f'#{r:02x}{g:02x}{b:02x}'
+                self.colorbar_canvas.create_line(i, 0, i, height, fill=color)
+        except Exception:
+            # fallback: 수동 그라데이션
+            for i in range(width):
+                norm_val = i / width
+                r = int(norm_val * 255)
+                color = f'#{r:02x}00{255-r:02x}'
+                self.colorbar_canvas.create_line(i, 0, i, height, fill=color)
+
         self.range_label.configure(text=f"{label}: [{vmin:.4g}, {vmax:.4g}]")
-        
-        # 자동 모드일 때 입력란도 업데이트
+
         if self.range_auto_var.get():
             self.range_min_var.set(f"{vmin:.4g}")
             self.range_max_var.set(f"{vmax:.4g}")
