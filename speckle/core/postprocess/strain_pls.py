@@ -4,6 +4,10 @@ Pointwise Least Squares (PLS) 변형률 계산 모듈
 각 POI에서 로컬 윈도우 내 변위 데이터에 다항식을 최소자승 피팅하고,
 피팅 계수로부터 변형률(미분)을 직접 추출합니다.
 
+두 가지 실행 경로:
+    1. Numba (기본): prange 병렬화 — ~17x 빠름
+    2. 기존 Python: lstsq 기반 (fallback)
+
 Savitzky-Golay 대비 장점:
     - 불규칙 간격 POI 및 NaN(결측) 데이터 자연스럽게 처리
     - Gaussian 가중함수로 거리 기반 가중치 적용
@@ -21,6 +25,14 @@ from dataclasses import dataclass
 from typing import Tuple, Optional
 
 _logger = logging.getLogger(__name__)
+
+# Numba 가속 모듈 (선택적)
+try:
+    from .strain_pls_numba import compute_strain_pls_numba as _numba_pls
+    _NUMBA_PLS_AVAILABLE = True
+except ImportError:
+    _NUMBA_PLS_AVAILABLE = False
+    _logger.info("Numba PLS not available, using original implementation")
 
 
 @dataclass
@@ -59,10 +71,14 @@ def compute_strain_pls(
     window_size: int = 15,
     poly_order: int = 2,
     grid_step: float = 1.0,
-    strain_type: str = 'engineering'
+    strain_type: str = 'engineering',
+    use_numba: bool = True,
 ) -> PLSStrainResult:
     """
     Pointwise Least Squares (PLS) 변형률 계산
+
+    use_numba=True (기본): Numba prange 병렬화 (~17x 빠름)
+    use_numba=False: 기존 Python lstsq 기반 (fallback)
 
     각 격자점에서 window_size × window_size 영역 내의 유효 변위 데이터에
     2D 다항식을 Gaussian 가중 최소자승 피팅하고, 피팅 계수에서 변형률을 추출.
@@ -81,10 +97,21 @@ def compute_strain_pls(
         poly_order: 다항식 차수 (1 또는 2, 기본 2)
         grid_step: POI 간격 (pixels)
         strain_type: 'engineering' 또는 'green-lagrange'
+        use_numba: True이면 Numba 병렬화 (기본값), False이면 기존 구현
 
     Returns:
         PLSStrainResult
     """
+    # === Numba 경로 ===
+    if use_numba and _NUMBA_PLS_AVAILABLE:
+        return _compute_strain_pls_numba_wrapper(
+            disp_u, disp_v, window_size, poly_order, grid_step, strain_type
+        )
+
+    # === 기존 Python 경로 (fallback) ===
+    if use_numba and not _NUMBA_PLS_AVAILABLE:
+        _logger.warning("Numba PLS not available, falling back to original")
+
     # === 입력 검증 ===
     if disp_u.ndim != 2 or disp_v.ndim != 2:
         raise ValueError(f"변위 필드는 2D 배열이어야 합니다: u={disp_u.ndim}D, v={disp_v.ndim}D")
@@ -311,6 +338,32 @@ def get_vsg_size(window_size: int, step_size: int, subset_size: int) -> int:
 
 
 # ===== 내부 유틸리티 =====
+
+def _compute_strain_pls_numba_wrapper(
+    disp_u, disp_v, window_size, poly_order, grid_step, strain_type
+) -> PLSStrainResult:
+    """Numba PLS 결과를 PLSStrainResult로 래핑"""
+    result = _numba_pls(
+        disp_u, disp_v,
+        window_size=window_size,
+        poly_order=poly_order,
+        grid_step=grid_step,
+        strain_type=strain_type
+    )
+
+    return PLSStrainResult(
+        exx=result['exx'],
+        eyy=result['eyy'],
+        exy=result['exy'],
+        e1=result['e1'],
+        e2=result['e2'],
+        angle=result['angle'],
+        von_mises=result['von_mises'],
+        window_size=window_size,
+        poly_order=poly_order,
+        grid_step=grid_step,
+    )
+
 
 def _compute_principal_strains(
     exx: np.ndarray,

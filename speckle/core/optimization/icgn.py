@@ -67,6 +67,64 @@ except ImportError:
     _logger.info("Numba modules not available, using original implementation")
 
 
+# ===== 참조 이미지 전처리 캐시 =====
+
+def prepare_ref_cache(
+    ref_image: np.ndarray,
+    subset_size: int = 21,
+    interpolation_order: int = 5,
+    shape_function: str = 'affine',
+    gaussian_blur: Optional[int] = None,
+    use_numba: bool = True,
+) -> dict:
+    """
+    참조 이미지 전처리 결과를 캐시용 딕셔너리로 반환.
+
+    배치 분석 시 매 프레임마다 반복되는 전처리를 1회로 줄임:
+        - 그레이스케일 변환
+        - Gaussian blur (선택)
+        - Sobel gradient
+        - Numba: B-spline prefilter, 로컬 좌표
+        - Original: ImageInterpolator, 로컬 좌표
+
+    Args:
+        ref_image: 참조 이미지
+        subset_size: 서브셋 크기
+        interpolation_order: B-spline 차수
+        shape_function: 'affine' 또는 'quadratic'
+        gaussian_blur: Gaussian 블러 커널 크기
+        use_numba: Numba 경로 사용 여부
+
+    Returns:
+        dict: 캐시 데이터 (compute_icgn에 ref_cache로 전달)
+    """
+    ref_gray = _to_gray(ref_image).astype(np.float64)
+
+    if gaussian_blur is not None and gaussian_blur > 0:
+        if gaussian_blur % 2 == 0:
+            gaussian_blur += 1
+        ref_gray = cv2.GaussianBlur(
+            ref_gray, (gaussian_blur, gaussian_blur), 0)
+
+    grad_x, grad_y = _compute_gradient(ref_gray)
+
+    cache = {
+        'ref_gray': ref_gray,
+        'grad_x': grad_x,
+        'grad_y': grad_y,
+        'subset_size': subset_size,
+        'interpolation_order': interpolation_order,
+        'shape_function': shape_function,
+    }
+
+    if use_numba and _NUMBA_AVAILABLE:
+        cache['xsi'], cache['eta'] = _numba_gen_coords(subset_size)
+    else:
+        cache['xsi'], cache['eta'] = generate_local_coordinates(subset_size)
+
+    return cache
+
+
 # ===== 메인 함수 =====
 
 def compute_icgn(
@@ -83,6 +141,7 @@ def compute_icgn(
     n_workers: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     use_numba: bool = True,
+    ref_cache: Optional[dict] = None,
 ) -> ICGNResult:
     """
     IC-GN 서브픽셀 최적화
@@ -102,6 +161,7 @@ def compute_icgn(
         progress_callback: 진행 콜백 함수 (current, total)
         use_numba: True이면 Numba JIT + prange 병렬화 사용 (기본값)
                    False이면 기존 ThreadPoolExecutor 사용
+        ref_cache: prepare_ref_cache()로 생성한 캐시 (배치 분석용, None이면 내부 계산)
 
     Returns:
         ICGNResult 객체
@@ -116,13 +176,13 @@ def compute_icgn(
             ref_image, def_image, initial_guess,
             subset_size, max_iterations, convergence_threshold,
             zncc_threshold, interpolation_order, shape_function,
-            gaussian_blur, progress_callback)
+            gaussian_blur, progress_callback, ref_cache)
     else:
         return _compute_icgn_original(
             ref_image, def_image, initial_guess,
             subset_size, max_iterations, convergence_threshold,
             zncc_threshold, interpolation_order, shape_function,
-            gaussian_blur, n_workers, progress_callback)
+            gaussian_blur, n_workers, progress_callback, ref_cache)
 
 
 # ===== Numba 경로 =====
@@ -131,7 +191,7 @@ def _compute_icgn_numba(
     ref_image, def_image, initial_guess,
     subset_size, max_iterations, convergence_threshold,
     zncc_threshold, interpolation_order, shape_function,
-    gaussian_blur, progress_callback
+    gaussian_blur, progress_callback, ref_cache=None
 ) -> ICGNResult:
     """Numba JIT + prange 병렬화 경로"""
     start_time = time.time()
@@ -144,25 +204,36 @@ def _compute_icgn_numba(
     shape_type = _NUMBA_AFFINE if shape_function == 'affine' else _NUMBA_QUADRATIC
     n_params = get_num_params(shape_function)
 
-    # 전처리
-    ref_gray = _to_gray(ref_image).astype(np.float64)
-    def_gray = _to_gray(def_image).astype(np.float64)
+    # 참조 전처리 (캐시 사용 가능 시 건너뜀)
+    if ref_cache is not None:
+        ref_gray = ref_cache['ref_gray']
+        grad_x = ref_cache['grad_x']
+        grad_y = ref_cache['grad_y']
+        xsi = ref_cache['xsi']
+        eta = ref_cache['eta']
+    else:
+        ref_gray = _to_gray(ref_image).astype(np.float64)
+        if gaussian_blur is not None and gaussian_blur > 0:
+            if gaussian_blur % 2 == 0:
+                gaussian_blur += 1
+            ref_gray = cv2.GaussianBlur(
+                ref_gray, (gaussian_blur, gaussian_blur), 0)
+        grad_x, grad_y = _compute_gradient(ref_gray)
+        xsi, eta = _numba_gen_coords(subset_size)
 
-    if gaussian_blur is not None and gaussian_blur > 0:
+    # 변형 이미지 전처리 (매 프레임)
+    def_gray = _to_gray(def_image).astype(np.float64)
+    if ref_cache is None and gaussian_blur is not None and gaussian_blur > 0:
+        def_gray = cv2.GaussianBlur(
+            def_gray, (gaussian_blur, gaussian_blur), 0)
+    elif ref_cache is not None and gaussian_blur is not None and gaussian_blur > 0:
         if gaussian_blur % 2 == 0:
             gaussian_blur += 1
-        ref_gray = cv2.GaussianBlur(
-            ref_gray, (gaussian_blur, gaussian_blur), 0)
         def_gray = cv2.GaussianBlur(
             def_gray, (gaussian_blur, gaussian_blur), 0)
 
-    grad_x, grad_y = _compute_gradient(ref_gray)
-
-    # Numba용 prefilter (B-spline 계수)
+    # Numba용 prefilter (B-spline 계수) — 변형 이미지만
     coeffs = prefilter_image(def_gray, order=interpolation_order)
-
-    # Numba용 로컬 좌표
-    xsi, eta = _numba_gen_coords(subset_size)
 
     points_x = initial_guess.points_x
     points_y = initial_guess.points_y
@@ -288,7 +359,7 @@ def _compute_icgn_original(
     ref_image, def_image, initial_guess,
     subset_size, max_iterations, convergence_threshold,
     zncc_threshold, interpolation_order, shape_function,
-    gaussian_blur, n_workers, progress_callback
+    gaussian_blur, n_workers, progress_callback, ref_cache=None
 ) -> ICGNResult:
     """기존 ThreadPoolExecutor 기반 구현 (fallback)"""
     start_time = time.time()
@@ -300,21 +371,35 @@ def _compute_icgn_original(
 
     n_params = get_num_params(shape_function)
 
-    # 전처리
-    ref_gray = _to_gray(ref_image).astype(np.float64)
-    def_gray = _to_gray(def_image).astype(np.float64)
+    # 참조 전처리 (캐시 사용 가능 시 건너뜀)
+    if ref_cache is not None:
+        ref_gray = ref_cache['ref_gray']
+        grad_x = ref_cache['grad_x']
+        grad_y = ref_cache['grad_y']
+        xsi = ref_cache['xsi']
+        eta = ref_cache['eta']
+    else:
+        ref_gray = _to_gray(ref_image).astype(np.float64)
+        if gaussian_blur is not None and gaussian_blur > 0:
+            if gaussian_blur % 2 == 0:
+                gaussian_blur += 1
+            ref_gray = cv2.GaussianBlur(
+                ref_gray, (gaussian_blur, gaussian_blur), 0)
+        grad_x, grad_y = _compute_gradient(ref_gray)
+        xsi, eta = generate_local_coordinates(subset_size)
 
-    if gaussian_blur is not None and gaussian_blur > 0:
+    # 변형 이미지 전처리 (매 프레임)
+    def_gray = _to_gray(def_image).astype(np.float64)
+    if ref_cache is None and gaussian_blur is not None and gaussian_blur > 0:
+        def_gray = cv2.GaussianBlur(
+            def_gray, (gaussian_blur, gaussian_blur), 0)
+    elif ref_cache is not None and gaussian_blur is not None and gaussian_blur > 0:
         if gaussian_blur % 2 == 0:
             gaussian_blur += 1
-        ref_gray = cv2.GaussianBlur(
-            ref_gray, (gaussian_blur, gaussian_blur), 0)
         def_gray = cv2.GaussianBlur(
             def_gray, (gaussian_blur, gaussian_blur), 0)
 
-    grad_x, grad_y = _compute_gradient(ref_gray)
     target_interp = create_interpolator(def_gray, order=interpolation_order)
-    xsi, eta = generate_local_coordinates(subset_size)
 
     points_x = initial_guess.points_x
     points_y = initial_guess.points_y

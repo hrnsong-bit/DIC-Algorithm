@@ -17,6 +17,9 @@ class FieldRenderer:
 
     def __init__(self, ctrl):
         self.ctrl = ctrl
+        # PLS 변형률 캐시: (result_id, window_size, poly_order, grid_step) → PLSStrainResult
+        self._strain_cache = {}
+        self._strain_cache_key = None
 
     @property
     def view(self):
@@ -177,8 +180,42 @@ class FieldRenderer:
         symmetric = field_type in ('u', 'v')
         return self._render_field_matplotlib(img, grid, ux, uy, label, symmetric)
 
+    def _get_strain_cache_key(self, result):
+        """결과 객체의 고유 캐시 키 생성"""
+        return (id(result), result.n_points, result.processing_time)
+
+    def _get_cached_strain(self, result, grid_step):
+        """캐시된 PLS 변형률 결과 반환 (없으면 계산 후 캐시)"""
+        cache_key = (self._get_strain_cache_key(result), 11, 2, grid_step)
+
+        if cache_key == self._strain_cache_key and self._strain_cache:
+            return self._strain_cache.get('strain')
+
+        # 캐시 미스: 새로 계산
+        u_grid, _, _ = self._to_grid(result, result.disp_u)
+        v_grid, _, _ = self._to_grid(result, result.disp_v)
+
+        try:
+            from speckle.core.postprocess.strain_pls import compute_strain_pls
+            strain = compute_strain_pls(
+                u_grid, v_grid,
+                window_size=11, poly_order=2, grid_step=grid_step
+            )
+            # 캐시 저장 (이전 캐시 제거)
+            self._strain_cache = {'strain': strain}
+            self._strain_cache_key = cache_key
+            return strain
+        except Exception as e:
+            logger.warning(f"PLS 실패: {e}")
+            return None
+
+    def invalidate_strain_cache(self):
+        """변형률 캐시 무효화 (새 분석 결과 시 호출)"""
+        self._strain_cache = {}
+        self._strain_cache_key = None
+
     def _draw_strain_field(self, img, result, strain_type):
-        """변형률 필드 시각화 (PLS)"""
+        """변형률 필드 시각화 (PLS, 캐시 적용)"""
         if result.n_points == 0:
             return img
 
@@ -198,17 +235,8 @@ class FieldRenderer:
 
         grid_step = float(np.median(np.diff(unique_x))) if len(unique_x) > 1 else 1.0
 
-        u_grid, _, _ = self._to_grid(result, result.disp_u)
-        v_grid, _, _ = self._to_grid(result, result.disp_v)
-
-        try:
-            from speckle.core.postprocess.strain_pls import compute_strain_pls
-            strain = compute_strain_pls(
-                u_grid, v_grid,
-                window_size=11, poly_order=2, grid_step=grid_step
-            )
-        except Exception as e:
-            logger.warning(f"PLS 실패: {e}")
+        strain = self._get_cached_strain(result, grid_step)
+        if strain is None:
             return self._draw_strain_field_points(img, result, strain_type)
 
         field_map = {

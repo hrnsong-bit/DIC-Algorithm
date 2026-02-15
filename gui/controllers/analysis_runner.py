@@ -12,7 +12,7 @@ from typing import Dict, Any
 from tkinter import messagebox
 
 from speckle.core.initial_guess import compute_fft_cc
-from speckle.core.optimization import compute_icgn
+from speckle.core.optimization import compute_icgn, prepare_ref_cache
 from speckle.io import load_image
 
 logger = logging.getLogger(__name__)
@@ -165,6 +165,17 @@ class AnalysisRunner:
                     raise ValueError("분석할 캐시된 이미지가 없습니다.")
 
                 total_files = len(cached_files)
+                interp_order = 5 if params['interpolation'] == 'biquintic' else 3
+
+                # 참조 이미지 전처리 캐시 (1회 계산, 모든 프레임에서 재사용)
+                ref_cache = prepare_ref_cache(
+                    self.state.ref_image,
+                    subset_size=params['subset_size'],
+                    interpolation_order=interp_order,
+                    shape_function=params['shape_function'],
+                    gaussian_blur=params.get('gaussian_blur'),
+                    use_numba=True,
+                )
 
                 for file_idx, def_path in enumerate(cached_files):
                     if self.state.should_stop:
@@ -188,7 +199,6 @@ class AnalysisRunner:
                         roi=self.state.roi,
                     )
 
-                    interp_order = 5 if params['interpolation'] == 'biquintic' else 3
                     icgn_result = compute_icgn(
                         self.state.ref_image, def_image,
                         initial_guess=fftcc_result,
@@ -199,6 +209,7 @@ class AnalysisRunner:
                         max_iterations=params['max_iter'],
                         gaussian_blur=params.get('gaussian_blur'),
                         use_numba=True,
+                        ref_cache=ref_cache,
                     )
 
                     self.state.batch_results[filename] = icgn_result
@@ -246,6 +257,17 @@ class AnalysisRunner:
             try:
                 files = self.state.sequence_files
                 total_files = len(files)
+                interp_order = 5 if params['interpolation'] == 'biquintic' else 3
+
+                # 참조 이미지 전처리 캐시 (1회 계산, 모든 프레임에서 재사용)
+                ref_cache = prepare_ref_cache(
+                    self.state.ref_image,
+                    subset_size=params['subset_size'],
+                    interpolation_order=interp_order,
+                    shape_function=params['shape_function'],
+                    gaussian_blur=params.get('gaussian_blur'),
+                    use_numba=True,
+                )
 
                 for file_idx, def_path in enumerate(files):
                     if self.state.should_stop:
@@ -270,7 +292,6 @@ class AnalysisRunner:
                         roi=self.state.roi
                     )
 
-                    interp_order = 5 if params['interpolation'] == 'biquintic' else 3
                     icgn_result = compute_icgn(
                         self.state.ref_image, def_image,
                         initial_guess=fftcc_result,
@@ -281,6 +302,7 @@ class AnalysisRunner:
                         max_iterations=params['max_iter'],
                         gaussian_blur=params.get('gaussian_blur'),
                         use_numba=True,
+                        ref_cache=ref_cache,
                     )
 
                     self.state.batch_results[filename] = icgn_result

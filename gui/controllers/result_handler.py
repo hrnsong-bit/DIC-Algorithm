@@ -97,6 +97,10 @@ class ResultHandler:
         """IC-GN 분석 완료 처리"""
         self.view.update_progress(100, "완료")
 
+        # PLS 변형률 캐시 무효화 (새 결과)
+        if hasattr(self.ctrl, 'renderer'):
+            self.ctrl.renderer.invalidate_strain_cache()
+
         self.state.fft_cc_result = result
         self.ctrl._refresh_display()
         self.update_result_ui(result)
@@ -113,6 +117,11 @@ class ResultHandler:
         """배치 분석 완료"""
         n_results = len(self.state.batch_results)
         self.view.update_progress(100, f"완료: {n_results} 파일 처리됨")
+
+        # PLS 변형률 캐시 무효화 (새 결과)
+        if hasattr(self.ctrl, 'renderer'):
+            self.ctrl.renderer.invalidate_strain_cache()
+
         self.ctrl._refresh_display()
 
         if self.state.batch_results:
