@@ -1,6 +1,6 @@
 # speckle/core/optimization/__init__.py
 
-from .icgn import compute_icgn
+from .icgn import compute_icgn, prepare_ref_cache
 from .results import ICGNResult
 from .interpolation import create_interpolator, ImageInterpolator
 from .shape_function import (
@@ -22,6 +22,7 @@ except ImportError:
 
 __all__ = [
     'compute_icgn',
+    'prepare_ref_cache',
     'ICGNResult',
     'create_interpolator',
     'ImageInterpolator',
