@@ -99,7 +99,8 @@ class AnalysisRunner:
                     convergence_threshold=params['conv_threshold'],
                     max_iterations=params['max_iter'],
                     gaussian_blur=params.get('gaussian_blur'),
-                    progress_callback=icgn_progress
+                    progress_callback=icgn_progress,
+                    use_numba=True,
                 )
 
                 self.state.fft_cc_result = fftcc_result
@@ -196,7 +197,8 @@ class AnalysisRunner:
                         interpolation_order=interp_order,
                         convergence_threshold=params['conv_threshold'],
                         max_iterations=params['max_iter'],
-                        gaussian_blur=params.get('gaussian_blur')
+                        gaussian_blur=params.get('gaussian_blur'),
+                        use_numba=True,
                     )
 
                     self.state.batch_results[filename] = icgn_result
@@ -277,7 +279,8 @@ class AnalysisRunner:
                         interpolation_order=interp_order,
                         convergence_threshold=params['conv_threshold'],
                         max_iterations=params['max_iter'],
-                        gaussian_blur=params.get('gaussian_blur')
+                        gaussian_blur=params.get('gaussian_blur'),
+                        use_numba=True,
                     )
 
                     self.state.batch_results[filename] = icgn_result
