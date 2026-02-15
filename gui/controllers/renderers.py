@@ -137,7 +137,7 @@ class FieldRenderer:
     # ===== 유틸리티: POI → 2D 그리드 =====
 
     def _to_grid(self, result, values):
-        """POI 값을 2D 그리드로 변환"""
+        """POI 값을 2D 그리드로 변환 (벡터화)"""
         valid = result.valid_mask
         px, py = result.points_x[valid], result.points_y[valid]
 
@@ -145,16 +145,16 @@ class FieldRenderer:
         unique_y = np.unique(py)
         nx, ny = len(unique_x), len(unique_y)
 
-        x_to_idx = {x: i for i, x in enumerate(unique_x)}
-        y_to_idx = {y: i for i, y in enumerate(unique_y)}
+        # 정렬된 좌표 → 인덱스 매핑 (searchsorted 활용)
+        xi = np.searchsorted(unique_x, px)
+        yi = np.searchsorted(unique_y, py)
 
         grid = np.full((ny, nx), np.nan)
         v_valid = values[valid]
-        for i, (x, y) in enumerate(zip(px, py)):
-            xi = x_to_idx.get(x)
-            yi = y_to_idx.get(y)
-            if xi is not None and yi is not None:
-                grid[yi, xi] = v_valid[i]
+
+        # 범위 내 인덱스만 기록
+        in_bounds = (xi < nx) & (yi < ny)
+        grid[yi[in_bounds], xi[in_bounds]] = v_valid[in_bounds]
 
         return grid, unique_x, unique_y
 

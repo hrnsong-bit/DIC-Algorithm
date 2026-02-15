@@ -4,10 +4,13 @@
 유니코드 경로 지원
 """
 
+import logging
 import numpy as np
 import cv2
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Union
+
+_logger = logging.getLogger(__name__)
 
 
 def load_image(path: Union[str, Path]) -> Optional[np.ndarray]:
@@ -34,6 +37,7 @@ def load_image(path: Union[str, Path]) -> Optional[np.ndarray]:
         return image
     
     except Exception as e:
+        _logger.warning(f"이미지 로드 실패 '{path}': {e}")
         return None
 
 
@@ -104,6 +108,7 @@ def save_image(image: np.ndarray, path: Union[str, Path]) -> bool:
         return False
     
     except Exception as e:
+        _logger.error(f"이미지 저장 실패 '{path}': {e}")
         return False
 
 

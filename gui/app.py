@@ -1,5 +1,6 @@
 """스페클 품질 분석 GUI - 메인 앱"""
 
+import logging
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -8,6 +9,8 @@ from .models.settings import SettingsManager
 from .controllers.main_controller import MainController
 from .controllers.dic_controller import DICController
 from .views.canvas_view import CanvasView
+
+_logger = logging.getLogger(__name__)
 from .views.param_panel import ParamPanel
 from .views.dic_tab import DICTab
 
@@ -63,8 +66,8 @@ class SpeckleQualityGUI:
                 spacing=self.settings.get('quality_spacing', 16)
             )
             self.param_panel.set_parameters(quality_params)
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.debug(f"설정 복원 실패 (초기 실행 시 정상): {e}")
         
     def _on_closing(self):
         """앱 종료 시 설정 저장"""
@@ -82,8 +85,8 @@ class SpeckleQualityGUI:
                 self.settings.set('last_folder', str(self.state.folder_path))
             
             self.settings.save()
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.warning(f"종료 시 설정 저장 실패: {e}")
         
         self.root.destroy()
 

@@ -1,8 +1,11 @@
 """설정 저장/불러오기 관리"""
 
 import json
+import logging
 from pathlib import Path
 from typing import Dict, Any
+
+_logger = logging.getLogger(__name__)
 
 
 class SettingsManager:
@@ -47,18 +50,18 @@ class SettingsManager:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     saved = json.load(f)
                     self.settings.update(saved)
-                print(f"[INFO] 설정 로드: {self.config_path}")
+                _logger.debug(f"설정 로드: {self.config_path}")
         except Exception as e:
-            print(f"[WARN] 설정 로드 실패: {e}")
+            _logger.warning(f"설정 로드 실패: {e}")
     
     def save(self):
         """설정 파일 저장"""
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 json.dump(self.settings, f, indent=2, ensure_ascii=False)
-            print(f"[INFO] 설정 저장: {self.config_path}")
+            _logger.debug(f"설정 저장: {self.config_path}")
         except Exception as e:
-            print(f"[WARN] 설정 저장 실패: {e}")
+            _logger.warning(f"설정 저장 실패: {e}")
     
     def get(self, key: str, default=None):
         """설정값 가져오기"""

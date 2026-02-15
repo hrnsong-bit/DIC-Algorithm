@@ -11,7 +11,7 @@ import numpy as np
 from typing import Dict, Any
 from tkinter import messagebox
 
-from speckle.core.initial_guess import compute_fft_cc
+from speckle.core.initial_guess import compute_fft_cc, compute_fft_cc_batch_cached
 from speckle.core.optimization import compute_icgn, prepare_ref_cache
 from speckle.io import load_image
 
@@ -167,7 +167,34 @@ class AnalysisRunner:
                 total_files = len(cached_files)
                 interp_order = 5 if params['interpolation'] == 'biquintic' else 3
 
-                # 참조 이미지 전처리 캐시 (1회 계산, 모든 프레임에서 재사용)
+                # === Phase 1: FFT-CC 배치 (ref 서브셋 캐시) ===
+                def get_image_func(def_path):
+                    return self.app_state.get_image(def_path.name)
+
+                def fft_progress(current, total, filename=""):
+                    if self.state.should_stop:
+                        raise InterruptedError("사용자 중단")
+                    progress = (current / total) * 50
+                    self.view.after(0, lambda p=progress, fn=filename, c=current, t=total:
+                                self.view.update_progress(p, f"FFT-CC {c}/{t}: {fn}"))
+
+                fftcc_results = compute_fft_cc_batch_cached(
+                    self.state.ref_image,
+                    cached_files,
+                    get_image_func,
+                    subset_size=params['subset_size'],
+                    spacing=params['spacing'],
+                    search_range=params.get('search_range'),
+                    zncc_threshold=params['zncc_threshold'],
+                    roi=self.state.roi,
+                    progress_callback=fft_progress,
+                    should_stop=lambda: self.state.should_stop,
+                )
+
+                if self.state.should_stop:
+                    raise InterruptedError("사용자 중단")
+
+                # === Phase 2: IC-GN (ref 전처리 캐시) ===
                 ref_cache = prepare_ref_cache(
                     self.state.ref_image,
                     subset_size=params['subset_size'],
@@ -177,28 +204,25 @@ class AnalysisRunner:
                     use_numba=True,
                 )
 
-                for file_idx, def_path in enumerate(cached_files):
+                processed = 0
+                for def_path in cached_files:
                     if self.state.should_stop:
                         break
 
                     filename = def_path.name
-                    progress = (file_idx / total_files) * 100
-                    self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
-                                self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
-                    self.view.after(0, lambda idx=file_idx+1: self.view.set_current_index(idx))
+                    if filename not in fftcc_results:
+                        continue
+
+                    progress = 50 + (processed / total_files) * 50
+                    self.view.after(0, lambda p=progress, fn=filename, fi=processed, tf=total_files:
+                                self.view.update_progress(p, f"IC-GN {fi+1}/{tf}: {fn}"))
+                    self.view.after(0, lambda idx=processed+1: self.view.set_current_index(idx))
 
                     def_image = self.app_state.get_image(filename)
                     if def_image is None:
                         continue
 
-                    fftcc_result = compute_fft_cc(
-                        self.state.ref_image, def_image,
-                        subset_size=params['subset_size'],
-                        spacing=params['spacing'],
-                        zncc_threshold=params['zncc_threshold'],
-                        roi=self.state.roi,
-                    )
-
+                    fftcc_result = fftcc_results[filename]
                     icgn_result = compute_icgn(
                         self.state.ref_image, def_image,
                         initial_guess=fftcc_result,
@@ -213,6 +237,7 @@ class AnalysisRunner:
                     )
 
                     self.state.batch_results[filename] = icgn_result
+                    processed += 1
 
                 if self.state.batch_results:
                     last_key = list(self.state.batch_results.keys())[-1]
@@ -259,7 +284,37 @@ class AnalysisRunner:
                 total_files = len(files)
                 interp_order = 5 if params['interpolation'] == 'biquintic' else 3
 
-                # 참조 이미지 전처리 캐시 (1회 계산, 모든 프레임에서 재사용)
+                # === Phase 1: FFT-CC 배치 (ref 서브셋 캐시) ===
+                def get_image_func(def_path):
+                    img = self.app_state.get_image(def_path.name)
+                    if img is None:
+                        img = load_image(def_path)
+                    return img
+
+                def fft_progress(current, total, filename=""):
+                    if self.state.should_stop:
+                        raise InterruptedError("사용자 중단")
+                    progress = (current / total) * 50
+                    self.view.after(0, lambda p=progress, fn=filename, c=current, t=total:
+                                self.view.update_progress(p, f"FFT-CC {c}/{t}: {fn}"))
+
+                fftcc_results = compute_fft_cc_batch_cached(
+                    self.state.ref_image,
+                    files,
+                    get_image_func,
+                    subset_size=params['subset_size'],
+                    spacing=params['spacing'],
+                    search_range=params.get('search_range'),
+                    zncc_threshold=params['zncc_threshold'],
+                    roi=self.state.roi,
+                    progress_callback=fft_progress,
+                    should_stop=lambda: self.state.should_stop,
+                )
+
+                if self.state.should_stop:
+                    raise InterruptedError("사용자 중단")
+
+                # === Phase 2: IC-GN (ref 전처리 캐시) ===
                 ref_cache = prepare_ref_cache(
                     self.state.ref_image,
                     subset_size=params['subset_size'],
@@ -269,29 +324,24 @@ class AnalysisRunner:
                     use_numba=True,
                 )
 
-                for file_idx, def_path in enumerate(files):
+                processed = 0
+                for def_path in files:
                     if self.state.should_stop:
                         break
 
                     filename = def_path.name
-                    progress = (file_idx / total_files) * 100
-                    self.view.after(0, lambda p=progress, fn=filename, fi=file_idx, tf=total_files:
-                                self.view.update_progress(p, f"분석 중 {fi+1}/{tf}: {fn}"))
+                    if filename not in fftcc_results:
+                        continue
 
-                    def_image = self.app_state.get_image(filename)
-                    if def_image is None:
-                        def_image = load_image(def_path)
+                    progress = 50 + (processed / total_files) * 50
+                    self.view.after(0, lambda p=progress, fn=filename, fi=processed, tf=total_files:
+                                self.view.update_progress(p, f"IC-GN {fi+1}/{tf}: {fn}"))
+
+                    def_image = get_image_func(def_path)
                     if def_image is None:
                         continue
 
-                    fftcc_result = compute_fft_cc(
-                        self.state.ref_image, def_image,
-                        subset_size=params['subset_size'],
-                        spacing=params['spacing'],
-                        zncc_threshold=params['zncc_threshold'],
-                        roi=self.state.roi
-                    )
-
+                    fftcc_result = fftcc_results[filename]
                     icgn_result = compute_icgn(
                         self.state.ref_image, def_image,
                         initial_guess=fftcc_result,
@@ -306,12 +356,15 @@ class AnalysisRunner:
                     )
 
                     self.state.batch_results[filename] = icgn_result
+                    processed += 1
 
                 if self.state.batch_results:
                     last_key = list(self.state.batch_results.keys())[-1]
                     self.state.icgn_result = self.state.batch_results[last_key]
                     self.state.fft_cc_result = self.state.batch_results[last_key]
 
+            except InterruptedError:
+                self.view.after(0, lambda: self.view.update_progress(0, "중단됨"))
             except Exception as ex:
                 error_msg = str(ex)
                 logger.error(f"배치 오류: {error_msg}", exc_info=True)

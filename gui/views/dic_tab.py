@@ -1,5 +1,6 @@
 """DIC 변위 분석 탭"""
 
+import logging
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -8,6 +9,8 @@ import numpy as np
 
 from .canvas_view import CanvasView
 from ..models.settings import SettingsManager
+
+_logger = logging.getLogger(__name__)
 
 class DICTab(ttk.Frame):
     """DIC 변위 분석을 위한 탭"""
@@ -551,7 +554,7 @@ class DICTab(ttk.Frame):
                 self.gaussian_blur_var.set(False)
                 self._toggle_gaussian_blur()
         except Exception as e:
-            print(f"[WARN] 파라미터 설정 중 오류: {e}")
+            _logger.warning(f"파라미터 설정 중 오류: {e}")
     
     def update_reference_label(self, text: str):
         self.ref_label.configure(text=text[:20], foreground="black")

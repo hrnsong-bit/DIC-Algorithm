@@ -171,6 +171,13 @@ def compute_icgn(
         _logger.warning("Numba modules not available, falling back to original")
         use_numba = False
 
+    n_points = len(initial_guess.points_x)
+    engine = "Numba" if use_numba else "ThreadPool"
+    cached = "cached" if ref_cache else "fresh"
+    _logger.info(f"IC-GN 시작: {n_points} POIs, subset={subset_size}, "
+                 f"order={interpolation_order}, shape={shape_function}, "
+                 f"engine={engine}, ref={cached}")
+
     if use_numba:
         return _compute_icgn_numba(
             ref_image, def_image, initial_guess,
@@ -223,10 +230,7 @@ def _compute_icgn_numba(
 
     # 변형 이미지 전처리 (매 프레임)
     def_gray = _to_gray(def_image).astype(np.float64)
-    if ref_cache is None and gaussian_blur is not None and gaussian_blur > 0:
-        def_gray = cv2.GaussianBlur(
-            def_gray, (gaussian_blur, gaussian_blur), 0)
-    elif ref_cache is not None and gaussian_blur is not None and gaussian_blur > 0:
+    if gaussian_blur is not None and gaussian_blur > 0:
         if gaussian_blur % 2 == 0:
             gaussian_blur += 1
         def_gray = cv2.GaussianBlur(
@@ -325,6 +329,14 @@ def _compute_icgn_numba(
 
     processing_time = time.time() - start_time
 
+    n_valid = int(np.sum(valid_mask))
+    n_conv = int(np.sum(result_conv))
+    mean_zncc = float(np.mean(result_zncc[valid_mask])) if n_valid > 0 else 0.0
+    _logger.info(f"IC-GN(Numba) 완료: {n_conv}/{n_points} 수렴 "
+                 f"({n_conv/n_points*100:.1f}%), "
+                 f"mean_zncc={mean_zncc:.4f}, {processing_time:.3f}s "
+                 f"({processing_time/n_points*1000:.2f}ms/POI)")
+
     return ICGNResult(
         points_y=points_y,
         points_x=points_x,
@@ -390,10 +402,7 @@ def _compute_icgn_original(
 
     # 변형 이미지 전처리 (매 프레임)
     def_gray = _to_gray(def_image).astype(np.float64)
-    if ref_cache is None and gaussian_blur is not None and gaussian_blur > 0:
-        def_gray = cv2.GaussianBlur(
-            def_gray, (gaussian_blur, gaussian_blur), 0)
-    elif ref_cache is not None and gaussian_blur is not None and gaussian_blur > 0:
+    if gaussian_blur is not None and gaussian_blur > 0:
         if gaussian_blur % 2 == 0:
             gaussian_blur += 1
         def_gray = cv2.GaussianBlur(
@@ -535,6 +544,14 @@ def _compute_icgn_original(
         progress_callback(n_points, n_points)
 
     processing_time = time.time() - start_time
+
+    n_valid_orig = int(np.sum(valid_mask))
+    n_conv_orig = int(np.sum(converged))
+    mean_zncc_orig = float(np.mean(zncc_values[valid_mask])) if n_valid_orig > 0 else 0.0
+    _logger.info(f"IC-GN(ThreadPool) 완료: {n_conv_orig}/{n_points} 수렴 "
+                 f"({n_conv_orig/n_points*100:.1f}%), "
+                 f"mean_zncc={mean_zncc_orig:.4f}, {processing_time:.3f}s "
+                 f"({processing_time/n_points*1000:.2f}ms/POI)")
 
     return ICGNResult(
         points_y=points_y,

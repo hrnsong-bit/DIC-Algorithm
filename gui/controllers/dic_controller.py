@@ -114,8 +114,8 @@ class DICController:
     def _warmup(self):
         try:
             warmup_fft_cc()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"FFT-CC 워밍업 실패 (무시): {e}")
 
     # ===== 이미지 선택 =====
 
@@ -280,26 +280,6 @@ class DICController:
         if img is None:
             return
         self._refresh_display()
-
-    def _refresh_display(self):
-        img = self.state.def_image if self.state.def_image is not None else self.state.ref_image
-        if img is None:
-            return
-
-        if self.state.fft_cc_result is not None:
-            display_img = self.renderer.create_overlay_image(img, self.state.fft_cc_result)
-        else:
-            display_img = img
-
-        self.view.canvas_view.display(
-            image=display_img,
-            zoom=self.state.zoom_level,
-            pan_offset=self.state.pan_offset,
-            roi=self.state.roi,
-            report=None,
-            show_all_poi=False,
-            show_bad_poi=False
-        )
 
     def update_display(self, mode: str = None):
         self._refresh_display(mode)
