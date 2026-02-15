@@ -118,7 +118,7 @@ class FFTCCResult:
         }
     
     def get_displacement_field_2d(self, shape: Tuple[int, int] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """2D 변위 필드 반환 (시각화용)"""
+        """2D 변위 필드 반환 (시각화용) — 벡터화 구현"""
         if shape is None:
             y_max = int(np.max(self.points_y)) + 1 if len(self.points_y) > 0 else 0
             x_max = int(np.max(self.points_x)) + 1 if len(self.points_x) > 0 else 0
@@ -127,11 +127,18 @@ class FFTCCResult:
         u_field = np.full(shape, np.nan, dtype=np.float64)
         v_field = np.full(shape, np.nan, dtype=np.float64)
         
-        for idx in range(self.n_points):
-            if self.valid_mask[idx]:
-                y, x = int(self.points_y[idx]), int(self.points_x[idx])
-                if 0 <= y < shape[0] and 0 <= x < shape[1]:
-                    u_field[y, x] = self.disp_u[idx]
-                    v_field[y, x] = self.disp_v[idx]
+        valid = self.valid_mask
+        if not np.any(valid):
+            return u_field, v_field
+        
+        ys = self.points_y[valid].astype(int)
+        xs = self.points_x[valid].astype(int)
+        
+        # 경계 내 인덱스만 필터링
+        in_bounds = (ys >= 0) & (ys < shape[0]) & (xs >= 0) & (xs < shape[1])
+        ys, xs = ys[in_bounds], xs[in_bounds]
+        
+        u_field[ys, xs] = self.disp_u[valid][in_bounds]
+        v_field[ys, xs] = self.disp_v[valid][in_bounds]
         
         return u_field, v_field

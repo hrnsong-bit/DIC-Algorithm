@@ -44,46 +44,50 @@ class ExportHandler:
             return
 
         try:
-            import csv
-            valid = result.valid_mask
             is_icgn = hasattr(result, 'converged')
+            n = result.n_points
 
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
+            if is_icgn:
+                # 벡터화된 CSV 생성: NumPy column_stack으로 한번에 조립
+                columns = [
+                    result.points_y,
+                    result.points_x,
+                    result.disp_u,
+                    result.disp_v,
+                    result.zncc_values,
+                    result.converged.astype(int),
+                    result.valid_mask.astype(int),
+                ]
+                # gradient columns (있으면 추가, 없으면 빈 열)
+                for arr in [result.disp_ux, result.disp_uy,
+                            result.disp_vx, result.disp_vy]:
+                    if arr is not None:
+                        columns.append(arr)
+                    else:
+                        columns.append(np.full(n, np.nan))
+                columns.append(result.iterations)
 
-                if is_icgn:
-                    header = ['y', 'x', 'u', 'v', 'zncc', 'converged', 'valid',
-                              'ux', 'uy', 'vx', 'vy', 'iterations']
-                    writer.writerow(header)
+                header = 'y,x,u,v,zncc,converged,valid,ux,uy,vx,vy,iterations'
+                data = np.column_stack(columns)
+                fmt = ['%d', '%d', '%.6f', '%.6f', '%.6f', '%d', '%d',
+                       '%.8f', '%.8f', '%.8f', '%.8f', '%d']
+            else:
+                data = np.column_stack([
+                    result.points_y,
+                    result.points_x,
+                    result.disp_u.astype(np.float64),
+                    result.disp_v.astype(np.float64),
+                    result.zncc_values,
+                    result.valid_mask.astype(int),
+                ])
+                header = 'y,x,u,v,zncc,valid'
+                fmt = ['%d', '%d', '%.6f', '%.6f', '%.6f', '%d']
 
-                    for i in range(result.n_points):
-                        row = [
-                            result.points_y[i], result.points_x[i],
-                            f"{result.disp_u[i]:.6f}", f"{result.disp_v[i]:.6f}",
-                            f"{result.zncc_values[i]:.6f}",
-                            result.converged[i], result.valid_mask[i],
-                            f"{result.disp_ux[i]:.8f}" if result.disp_ux is not None else "",
-                            f"{result.disp_uy[i]:.8f}" if result.disp_uy is not None else "",
-                            f"{result.disp_vx[i]:.8f}" if result.disp_vx is not None else "",
-                            f"{result.disp_vy[i]:.8f}" if result.disp_vy is not None else "",
-                            result.iterations[i]
-                        ]
-                        writer.writerow(row)
-                else:
-                    header = ['y', 'x', 'u', 'v', 'zncc', 'valid']
-                    writer.writerow(header)
-
-                    for i in range(result.n_points):
-                        row = [
-                            result.points_y[i], result.points_x[i],
-                            result.disp_u[i], result.disp_v[i],
-                            f"{result.zncc_values[i]:.6f}",
-                            result.valid_mask[i]
-                        ]
-                        writer.writerow(row)
+            np.savetxt(path, data, delimiter=',', header=header,
+                       comments='', fmt=fmt)
 
             messagebox.showinfo("완료", f"CSV 저장 완료: {path}")
-            logger.info(f"CSV 내보내기: {path}")
+            logger.info(f"CSV 내보내기: {path} ({n} POIs)")
 
         except Exception as e:
             messagebox.showerror("오류", f"CSV 저장 실패: {e}")

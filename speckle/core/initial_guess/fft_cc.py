@@ -20,6 +20,9 @@ from typing import Tuple, Optional, Callable, List, Dict
 from pathlib import Path
 import os
 import time
+import logging
+
+_logger = logging.getLogger(__name__)
 
 try:
     from scipy.fft import fft2 as scipy_fft2, ifft2 as scipy_ifft2
@@ -273,6 +276,9 @@ def compute_fft_cc(ref_image, def_image,
     if search_range is None:
         search_range = _SEARCH_RANGE
 
+    _logger.info(f"FFT-CC 시작: subset={subset_size}, spacing={spacing}, "
+                 f"search_range={search_range}, zncc_thr={zncc_threshold}")
+
     ref_gray = _to_gray(ref_image).astype(np.float32)
     def_gray = _to_gray(def_image).astype(np.float32)
     ref_h, ref_w = ref_gray.shape
@@ -396,6 +402,13 @@ def compute_fft_cc(ref_image, def_image,
 
     processing_time = time.time() - start_time
 
+    n_valid = int(np.sum(valid_mask))
+    n_total = len(points_y)
+    mean_zncc = float(np.mean(zncc_values[valid_mask])) if n_valid > 0 else 0.0
+    _logger.info(f"FFT-CC 완료: {n_valid}/{n_total} POI 유효 "
+                 f"({n_valid/n_total*100:.1f}%), "
+                 f"mean_zncc={mean_zncc:.4f}, {processing_time:.3f}s")
+
     return FFTCCResult(
         points_y=points_y,
         points_x=points_x,
@@ -479,8 +492,8 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
         )
         poi_search_range = np.minimum(poi_search_range, mask_sr)
         poi_search_range[poi_dist <= half] = 0
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.debug(f"마스크 기반 홀 제한 실패 (이미지 경계 기반만 사용): {e}")
 
     MIN_SR = 3
     valid = ref_valid & (poi_search_range >= MIN_SR)
