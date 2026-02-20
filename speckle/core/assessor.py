@@ -137,8 +137,8 @@ class SpeckleQualityAssessor:
     # ── 평가 ──
 
     def evaluate(self, image: np.ndarray,
-                 roi: Optional[Tuple[int, int, int, int]] = None
-                 ) -> QualityReport:
+                roi: Optional[Tuple[int, int, int, int]] = None
+                ) -> QualityReport:
         """단일 이미지 품질 평가"""
         start_time = time.time()
         warnings = []
@@ -150,9 +150,7 @@ class SpeckleQualityAssessor:
             gray = image.copy()
 
         # ====== 노이즈 분산 결정 (3-tier) ======
-        # 노이즈는 센서 특성이므로 ROI 적용 전 전체 이미지에서 추정
-        noise_variance, noise_method = self._resolve_noise_variance(
-            gray, roi)
+        noise_variance, noise_method = self._resolve_noise_variance(gray, roi)
         calculated_threshold = calculate_sssig_threshold(
             noise_variance, self.desired_accuracy)
 
@@ -203,8 +201,12 @@ class SpeckleQualityAssessor:
             )
 
         # ====== Stage 2: SSSIG ======
+        sssig_result = None
+        predicted_accuracy = None
+
         if self.auto_find_size:
-            optimal_size, size_found, _, info = find_optimal_subset_size(
+            # 최적 subset 크기 탐색 후 해당 크기로 SSSIG 계산
+            optimal_size, size_found, sssig_result, info = find_optimal_subset_size(
                 roi_gray,
                 spacing=self.poi_spacing,
                 desired_accuracy=self.desired_accuracy,
@@ -213,17 +215,18 @@ class SpeckleQualityAssessor:
                 max_size=61,
             )
             recommended_size = optimal_size
-        if sssig_result is None:
-            sssig_result = compute_sssig_map(
-                roi_gray,
-                subset_size=recommended_size,
-                spacing=self.poi_spacing,
-                noise_variance=noise_variance,
-                desired_accuracy=self.desired_accuracy,
-            )
-            predicted_accuracy = (sssig_result.predicted_accuracy
-                                  if sssig_result else None)
+
+            # find_optimal_subset_size가 sssig_result를 반환하지 않는 경우 대비
+            if sssig_result is None:
+                sssig_result = compute_sssig_map(
+                    roi_gray,
+                    subset_size=recommended_size,
+                    spacing=self.poi_spacing,
+                    noise_variance=noise_variance,
+                    desired_accuracy=self.desired_accuracy,
+                )
         else:
+            # 고정 subset 크기로 SSSIG 계산
             sssig_result = compute_sssig_map(
                 roi_gray,
                 subset_size=self.subset_size,
@@ -232,15 +235,16 @@ class SpeckleQualityAssessor:
                 desired_accuracy=self.desired_accuracy,
             )
             recommended_size = self.subset_size
-            size_found = len(sssig_result.bad_points) == 0
-            predicted_accuracy = (sssig_result.predicted_accuracy
-                                  if sssig_result else None)
+            size_found = len(sssig_result.bad_points) == 0 if sssig_result else False
+
+        predicted_accuracy = (sssig_result.predicted_accuracy
+                            if sssig_result else None)
 
         if sssig_result and len(sssig_result.points_y) == 0:
             warnings.append("유효한 POI가 없음 - ROI 확인 필요")
 
         sssig_pass = (sssig_result.n_bad_points == 0
-                      if sssig_result else False)
+                    if sssig_result else False)
 
         if not sssig_pass and sssig_result and sssig_result.n_bad_points > 0:
             warnings.append(

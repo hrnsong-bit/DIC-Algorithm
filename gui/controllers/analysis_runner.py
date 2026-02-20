@@ -98,10 +98,12 @@ class AnalysisRunner:
                     interpolation_order=interp_order,
                     convergence_threshold=params['conv_threshold'],
                     max_iterations=params['max_iter'],
+                    zncc_threshold=params.get('icgn_zncc_threshold', 0.85),  # IC-GN 전용 threshold
                     gaussian_blur=params.get('gaussian_blur'),
                     progress_callback=icgn_progress,
-                    use_numba=True,
+                    
                 )
+
 
                 self.state.fft_cc_result = fftcc_result
                 self.state.icgn_result = icgn_result
@@ -201,7 +203,7 @@ class AnalysisRunner:
                     interpolation_order=interp_order,
                     shape_function=params['shape_function'],
                     gaussian_blur=params.get('gaussian_blur'),
-                    use_numba=True,
+                    
                 )
 
                 processed = 0
@@ -231,8 +233,9 @@ class AnalysisRunner:
                         interpolation_order=interp_order,
                         convergence_threshold=params['conv_threshold'],
                         max_iterations=params['max_iter'],
+                        zncc_threshold=params.get('icgn_zncc_threshold', 0.85),  # IC-GN 전용 threshold
                         gaussian_blur=params.get('gaussian_blur'),
-                        use_numba=True,
+                        
                         ref_cache=ref_cache,
                     )
 
@@ -321,7 +324,7 @@ class AnalysisRunner:
                     interpolation_order=interp_order,
                     shape_function=params['shape_function'],
                     gaussian_blur=params.get('gaussian_blur'),
-                    use_numba=True,
+                    
                 )
 
                 processed = 0
@@ -350,8 +353,9 @@ class AnalysisRunner:
                         interpolation_order=interp_order,
                         convergence_threshold=params['conv_threshold'],
                         max_iterations=params['max_iter'],
+                        zncc_threshold=params.get('icgn_zncc_threshold', 0.85),  # IC-GN 전용 threshold
                         gaussian_blur=params.get('gaussian_blur'),
-                        use_numba=True,
+                        
                         ref_cache=ref_cache,
                     )
 

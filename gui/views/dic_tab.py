@@ -165,11 +165,11 @@ class DICTab(ttk.Frame):
         self.search_spin = ttk.Spinbox(grid, from_=10, to=200, textvariable=self.search_var, width=8)
         self.search_spin.grid(row=1, column=1, pady=2)
         
-        # ZNCC Threshold
-        ttk.Label(grid, text="ZNCC:").grid(row=1, column=2, sticky=tk.W, padx=(10,0), pady=2)
-        self.zncc_var = tk.DoubleVar(value=0.7)
+        # FFT-CC ZNCC Threshold (낮게, 텍스처 없음 검출용)
+        ttk.Label(grid, text="FFT ZNCC:").grid(row=1, column=2, sticky=tk.W, padx=(10,0), pady=2)
+        self.zncc_var = tk.DoubleVar(value=0.3)
         self.zncc_spin = ttk.Spinbox(grid, from_=0.1, to=0.99, increment=0.05,
-                                      textvariable=self.zncc_var, width=8)
+                                    textvariable=self.zncc_var, width=8)
         self.zncc_spin.grid(row=1, column=3, pady=2)
         
         # Shape Function
@@ -183,9 +183,19 @@ class DICTab(ttk.Frame):
         ttk.Label(grid, text="Interp:").grid(row=2, column=2, sticky=tk.W, padx=(10,0), pady=2)
         self.interp_var = tk.StringVar(value='bicubic')
         interp_combo = ttk.Combobox(grid, textvariable=self.interp_var,
-                                     values=['bicubic', 'biquintic'], width=10, state='readonly')
+                                    values=['bicubic', 'biquintic'], width=10, state='readonly')
         interp_combo.grid(row=2, column=3, pady=2)
-        
+
+        # IC-GN ZNCC Threshold (높게, 최종 품질 판단용) — 별도 행
+        icgn_zncc_frame = ttk.Frame(param_frame)
+        icgn_zncc_frame.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(icgn_zncc_frame, text="IC-GN ZNCC:").pack(side=tk.LEFT)
+        self.icgn_zncc_var = tk.DoubleVar(value=0.85)
+        ttk.Spinbox(icgn_zncc_frame, from_=0.1, to=0.99, increment=0.05,
+                    textvariable=self.icgn_zncc_var, width=8).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Label(icgn_zncc_frame, text="(최종 품질)", foreground="gray",
+                font=("", 8)).pack(side=tk.LEFT, padx=(5, 0))
+
         # Gaussian Blur
         blur_frame = ttk.Frame(param_frame)
         blur_frame.pack(fill=tk.X, pady=(5, 0))
@@ -198,7 +208,7 @@ class DICTab(ttk.Frame):
         
         self.blur_kernel_var = tk.IntVar(value=5)
         self.blur_kernel_combo = ttk.Combobox(blur_frame, textvariable=self.blur_kernel_var,
-                                               values=[3, 5, 7, 9], width=5, state='disabled')
+                                            values=[3, 5, 7, 9], width=5, state='disabled')
         self.blur_kernel_combo.pack(side=tk.LEFT, padx=(5, 0))
         
         # 고급 옵션
@@ -517,11 +527,12 @@ class DICTab(ttk.Frame):
             'subset_size': self.subset_var.get(),
             'spacing': self.spacing_var.get(),
             'search_range': self.search_var.get(),
-            'zncc_threshold': self.zncc_var.get(),
-            'shape_function': self.shape_func_var.get(),  # 수정
+            'zncc_threshold': self.zncc_var.get(),          # FFT-CC용 (0.3 기본)
+            'icgn_zncc_threshold': self.icgn_zncc_var.get(), # IC-GN용 (0.85 기본)
+            'shape_function': self.shape_func_var.get(),
             'interpolation': self.interp_var.get(),
-            'gaussian_blur': gaussian_blur,  # 수정
-            'gaussian_blur_enabled': self.gaussian_blur_var.get(),  # 추가
+            'gaussian_blur': gaussian_blur,
+            'gaussian_blur_enabled': self.gaussian_blur_var.get(),
             'conv_threshold': self.conv_threshold_var.get(),
             'max_iter': self.max_iter_var.get(),
         }
@@ -537,8 +548,10 @@ class DICTab(ttk.Frame):
                 self.search_var.set(params['search_range'])
             if params.get('zncc_threshold') is not None:
                 self.zncc_var.set(params['zncc_threshold'])
+            if params.get('icgn_zncc_threshold') is not None:
+                self.icgn_zncc_var.set(params['icgn_zncc_threshold'])
             if params.get('shape_function') is not None:
-                self.shape_func_var.set(params['shape_function'])  # 수정
+                self.shape_func_var.set(params['shape_function'])
             if params.get('interpolation') is not None:
                 self.interp_var.set(params['interpolation'])
             if params.get('conv_threshold') is not None:
@@ -546,10 +559,10 @@ class DICTab(ttk.Frame):
             if params.get('max_iter') is not None:
                 self.max_iter_var.set(params['max_iter'])
             if params.get('gaussian_blur_enabled'):
-                self.gaussian_blur_var.set(True)  # 수정
-                self._toggle_gaussian_blur()  # 콤보박스 활성화
+                self.gaussian_blur_var.set(True)
+                self._toggle_gaussian_blur()
                 if params.get('gaussian_blur'):
-                    self.blur_kernel_var.set(params['gaussian_blur'])  # 수정
+                    self.blur_kernel_var.set(params['gaussian_blur'])
             else:
                 self.gaussian_blur_var.set(False)
                 self._toggle_gaussian_blur()
