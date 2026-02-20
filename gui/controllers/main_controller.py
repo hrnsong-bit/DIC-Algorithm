@@ -308,6 +308,11 @@ class MainController:
             messagebox.showwarning("경고", "이미지를 먼저 로드하세요.")
             return
 
+        # 배치 실행 중 단일 평가 차단 (assessor 공유 충돌 방지)
+        if self.state.batch_running:
+            messagebox.showinfo("알림", "배치 평가 중에는 단일 평가를 실행할 수 없습니다.")
+            return
+
         # 이미 평가 중이면 중복 실행 방지
         if self._eval_thread and self._eval_thread.is_alive():
             messagebox.showinfo("알림", "평가 중입니다. 잠시 기다려주세요.")
@@ -315,16 +320,16 @@ class MainController:
 
         self._update_assessor()
 
+        # 스레드 시작 전 값 캡처 (race condition 방지)
+        image = self.state.current_image
+        roi = self.state.roi
+        filename = self.state.current_file
+
         def _run():
             try:
-                report = self.assessor.evaluate(
-                    self.state.current_image,
-                    self.state.roi
-                )
-                self.state.set_report(self.state.current_file, report)
-                logger.info(
-                    f"평가 완료: {self.state.current_file}, "
-                    f"{report.quality_grade}")
+                report = self.assessor.evaluate(image, roi)
+                self.state.set_report(filename, report)
+                logger.info(f"평가 완료: {filename}, {report.quality_grade}")
             except Exception as e:
                 logger.exception(f"평가 오류: {e}")
             finally:

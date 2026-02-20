@@ -70,7 +70,6 @@ class DICController:
 
         self._setup_callbacks()
         self._setup_canvas_callbacks()
-        self._warmup()
 
     def _setup_callbacks(self):
         """뷰 콜백 설정"""
