@@ -357,9 +357,20 @@ class FieldRenderer:
                                               "ZNCC", False, vmin=0.0, vmax=1.0)
 
     def _draw_invalid_points(self, img, result):
-        """불량 POI 시각화"""
+        """불량 POI 시각화
+        
+        - 초록점:  IC-GN 유효 (valid)
+        - 빨간점:  IC-GN 실패 (불연속 후보, splitting 대상)
+        - 표시 안 함: FFT-CC 실패 (텍스처 없음, 홀/배경)
+        """
         if result.n_points == 0:
             return img
+
+        # fft_valid_mask 존재 여부 확인
+        has_fft_mask = (
+            hasattr(result, 'fft_valid_mask') and
+            result.fft_valid_mask is not None
+        )
 
         for idx in range(result.n_points):
             x = int(result.points_x[idx])
@@ -368,10 +379,17 @@ class FieldRenderer:
                 continue
 
             if result.valid_mask[idx]:
+                # IC-GN 유효 → 초록점
                 cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
+
             else:
-                cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
-                cv2.drawMarker(img, (x, y), (0, 0, 255),
-                               cv2.MARKER_CROSS, 10, 2)
+                if has_fft_mask and not result.fft_valid_mask[idx]:
+                    # FFT-CC 실패 (텍스처 없음) → 표시 안 함
+                    pass
+                else:
+                    # IC-GN 실패 (불연속 후보) → 빨간점
+                    cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
+                    cv2.drawMarker(img, (x, y), (0, 0, 255),
+                                cv2.MARKER_CROSS, 10, 2)
 
         return img

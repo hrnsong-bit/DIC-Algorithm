@@ -347,6 +347,7 @@ def _compute_icgn_numba(
         iterations=result_iter,
         converged=result_conv,
         valid_mask=icgn_valid,
+        fft_valid_mask=fft_valid,    
         failure_reason=result_fail,
         subset_size=subset_size,
         max_iterations=max_iterations,

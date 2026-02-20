@@ -1,11 +1,9 @@
-# speckle/core/optimization/results.py
-
 """
 IC-GN 최적화 결과 데이터 클래스
 """
 
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict
 
 
@@ -63,9 +61,12 @@ class ICGNResult:
     converged: np.ndarray = None
     valid_mask: np.ndarray = None
 
+    # FFT-CC 통과 여부 (텍스처 없음 구분용)
+    # True  = FFT-CC 통과 → IC-GN 실행됨
+    # False = FFT-CC 실패 → 텍스처 없음 (홀/배경), IC-GN 스킵됨
+    fft_valid_mask: Optional[np.ndarray] = None
+
     # 실패 원인 (POI별)
-    # 0=success, 1=low_zncc, 2=diverged, 3=out_of_bounds,
-    # 4=singular_hessian, 5=flat_subset, 6=max_displacement, 7=flat_target
     failure_reason: np.ndarray = None
 
     # 메타데이터
@@ -86,6 +87,27 @@ class ICGNResult:
     @property
     def n_valid(self) -> int:
         return int(np.sum(self.valid_mask))
+
+    @property
+    def n_texture_less(self) -> int:
+        """FFT-CC 실패 POI 수 (텍스처 없음)"""
+        if self.fft_valid_mask is None:
+            return 0
+        return int(np.sum(~self.fft_valid_mask))
+
+    @property
+    def n_ic_fail(self) -> int:
+        """IC-GN 실패 POI 수 (불연속 후보)"""
+        if self.fft_valid_mask is None:
+            return int(np.sum(~self.valid_mask))
+        return int(np.sum(self.fft_valid_mask & ~self.valid_mask))
+
+    @property
+    def ic_fail_mask(self) -> np.ndarray:
+        """IC-GN 실패 POI 마스크 (불연속 후보)"""
+        if self.fft_valid_mask is None:
+            return ~self.valid_mask
+        return self.fft_valid_mask & ~self.valid_mask
 
     @property
     def convergence_rate(self) -> float:
