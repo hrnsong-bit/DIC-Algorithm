@@ -481,19 +481,19 @@ def compute_fft_cc_batch_cached(ref_image, def_file_paths, get_image_func,
     poi_search_range = np.clip(max_possible.astype(np.int32), 0, search_range)
     
     # 2) 마스크 기반 홀 제한 (성공 시만 추가 적용)
-    try:
-        specimen_mask = create_specimen_mask(ref_gray.astype(np.uint8))
-        dist_map = distance_transform_edt(specimen_mask > 0)
-        poi_dist = dist_map[points_y.astype(int), points_x.astype(int)]
-        mask_sr = np.clip(
-            (poi_dist - half).astype(np.int32),
-            0,
-            search_range
-        )
-        poi_search_range = np.minimum(poi_search_range, mask_sr)
-        poi_search_range[poi_dist <= half] = 0
-    except Exception as e:
-        _logger.debug(f"마스크 기반 홀 제한 실패 (이미지 경계 기반만 사용): {e}")
+    #try:
+    #   specimen_mask = create_specimen_mask(ref_gray.astype(np.uint8))
+    #    dist_map = distance_transform_edt(specimen_mask > 0)
+    #    poi_dist = dist_map[points_y.astype(int), points_x.astype(int)]
+    #    mask_sr = np.clip(
+    #        (poi_dist - half).astype(np.int32),
+    #        0,
+    #        search_range
+    #    )
+    #    poi_search_range = np.minimum(poi_search_range, mask_sr)
+    #    poi_search_range[poi_dist <= half] = 0
+    #except Exception as e:
+    #    _logger.debug(f"마스크 기반 홀 제한 실패 (이미지 경계 기반만 사용): {e}")
 
     MIN_SR = 3
     valid = ref_valid & (poi_search_range >= MIN_SR)

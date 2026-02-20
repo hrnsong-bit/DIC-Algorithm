@@ -341,17 +341,10 @@ def compute_sssig_map(image: np.ndarray,
     max_sssig = float(np.max(sssig_values))
 
     # 예상 정확도 (worst-case: 방향별 최소값 기준)
-    predicted_accuracy_x = predict_displacement_accuracy(
-        float(np.min(sssig_x)), noise_variance)
-    predicted_accuracy_y = predict_displacement_accuracy(
-        float(np.min(sssig_y)), noise_variance)
-    predicted_accuracy = max(predicted_accuracy_x, predicted_accuracy_y)
+    predicted_accuracy = predict_displacement_accuracy(float(np.min(sssig_values)), noise_variance)
 
-    # ── bad-point 판정 (수정) ──
-    # x/y 각각 threshold/2 미만이면 불량
-    # 한쪽 방향만 gradient가 극도로 약해도 해당 방향 정확도가 나빠지므로
-    half_threshold = threshold / 2.0
-    bad_mask = (sssig_x < half_threshold) | (sssig_y < half_threshold)
+    # ── bad-point 판정 ──
+    bad_mask = sssig_values < threshold
 
     bad_indices = np.where(bad_mask)[0]
 

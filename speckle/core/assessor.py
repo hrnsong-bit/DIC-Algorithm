@@ -1,5 +1,9 @@
 """
-스페클 품질 평가 메인 클래스 (v3.3.1 수정)
+스페클 품질 평가 메인 클래스 (v3.3.2 수정)
+
+수정 사항 (v3.3.2):
+- _NUMBA_WARMED_UP 모듈 레벨 플래그 추가 → 프로세스 전체에서 warmup_numba() 1회만 실행
+- SpeckleQualityAssessor 재생성 시 중복 워밍업 제거
 
 수정 사항 (v3.3.1):
 - 노이즈 추정을 ROI 적용 전 전체 이미지에서 수행
@@ -29,6 +33,9 @@ from .sssig import (
     estimate_noise_from_pair,
     calculate_sssig_threshold,
 )
+
+# 모듈 레벨 워밍업 플래그: 프로세스 전체에서 1회만 실행
+_NUMBA_WARMED_UP = False
 
 
 class SpeckleQualityAssessor:
@@ -71,7 +78,15 @@ class SpeckleQualityAssessor:
         self._noise_variance_override: Optional[float] = noise_variance
         self._noise_pair: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
-        warmup_numba()
+        # 최초 1회만 워밍업 (모듈 레벨 플래그로 중복 방지)
+        global _NUMBA_WARMED_UP
+        if not _NUMBA_WARMED_UP:
+            warmup_numba()
+            _NUMBA_WARMED_UP = True
+            logger.debug("Numba SSSIG 워밍업 완료 (최초 1회)")
+        else:
+            logger.debug("Numba SSSIG 워밍업 스킵 (이미 완료)")
+
         logger.debug(
             f"SpeckleQualityAssessor 초기화: MIG={mig_threshold}, "
             f"desired_accuracy={desired_accuracy}, "
@@ -279,13 +294,14 @@ class SpeckleQualityAssessor:
 
     # ── 배치 평가 ──
     def evaluate_batch(self,
-                    images: Dict[str, np.ndarray],
-                    roi: Optional[Tuple[int, int, int, int]] = None,
-                    progress_callback: Optional[
-                        Callable[[int, int, str], None]] = None
-                    ) -> BatchReport:
-        """배치 평가
-        
+                       images: Dict[str, np.ndarray],
+                       roi: Optional[Tuple[int, int, int, int]] = None,
+                       progress_callback: Optional[
+                           Callable[[int, int, str], None]] = None
+                       ) -> BatchReport:
+        """
+        배치 평가
+
         노이즈 분산은 첫 이미지에서 한 번만 추정하고 나머지에 재사용합니다.
         (같은 카메라/조명 세팅의 시퀀스에서 노이즈 특성은 동일)
         """

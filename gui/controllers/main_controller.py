@@ -25,9 +25,13 @@ class MainController:
 
     def __init__(self, state: AppState):
         self.state = state
+
+        # 최초 1회 생성 (이후 재생성 없이 속성만 갱신)
         self.assessor = SpeckleQualityAssessor()
+
         self._result_queue: Queue = Queue()
         self._loading_thread: Optional[threading.Thread] = None
+        self._eval_thread: Optional[threading.Thread] = None  # 단일 평가 스레드
 
         # 뷰 참조
         self.canvas_view: Optional[CanvasView] = None
@@ -53,7 +57,7 @@ class MainController:
         param_panel.on_noise_measured = self._handle_noise_measurement
 
     # ================================================================
-    #  노이즈 측정 로직 (신규)
+    #  노이즈 측정 로직
     # ================================================================
 
     def _handle_noise_measurement(self, variance: Optional[float],
@@ -65,11 +69,9 @@ class MainController:
         - variance가 None이면: 측정 요청 (method에 따라 분기)
         """
         if variance is not None:
-            # manual 또는 이미 측정 완료
             self._apply_noise_to_assessor(variance, method)
             return
 
-        # 측정 요청
         if method == 'auto':
             self._measure_noise_auto()
         elif method == 'pair':
@@ -183,7 +185,7 @@ class MainController:
         logger.info(f"Assessor 노이즈 설정: D(η)={variance:.2f} [{method}]")
 
     # ================================================================
-    #  기존 로직 (노이즈 연동 부분만 수정)
+    #  파일 열기 / 로딩
     # ================================================================
 
     def open_image(self):
@@ -279,7 +281,7 @@ class MainController:
             f"폴더 로드 완료: {loaded}개, "
             f"{self.state.memory_usage_mb:.1f}MB")
 
-        # ── 자동 pair 노이즈 측정 ──
+        # 자동 pair 노이즈 측정
         noise_config = (self.param_panel.get_noise_config()
                         if self.param_panel else None)
         if (noise_config and noise_config.method == 'auto'
@@ -296,20 +298,41 @@ class MainController:
     def get_loading_progress(self) -> float:
         return self.state.loading_state.progress
 
+    # ================================================================
+    #  평가
+    # ================================================================
+
     def evaluate_current(self):
+        """현재 이미지 평가 - 별도 스레드에서 실행하여 UI 블로킹 방지"""
         if self.state.current_image is None:
             messagebox.showwarning("경고", "이미지를 먼저 로드하세요.")
             return
 
-        self._update_assessor()
-        report = self.assessor.evaluate(self.state.current_image,
-                                         self.state.roi)
-        self.state.set_report(self.state.current_file, report)
+        # 이미 평가 중이면 중복 실행 방지
+        if self._eval_thread and self._eval_thread.is_alive():
+            messagebox.showinfo("알림", "평가 중입니다. 잠시 기다려주세요.")
+            return
 
-        logger.info(
-            f"평가 완료: {self.state.current_file}, "
-            f"{report.quality_grade}")
-        self._notify_state_changed()
+        self._update_assessor()
+
+        def _run():
+            try:
+                report = self.assessor.evaluate(
+                    self.state.current_image,
+                    self.state.roi
+                )
+                self.state.set_report(self.state.current_file, report)
+                logger.info(
+                    f"평가 완료: {self.state.current_file}, "
+                    f"{report.quality_grade}")
+            except Exception as e:
+                logger.exception(f"평가 오류: {e}")
+            finally:
+                self._notify_state_changed()
+
+        self._eval_thread = threading.Thread(
+            target=_run, daemon=True, name="eval-current")
+        self._eval_thread.start()
 
     def evaluate_all(self):
         if not self.state.has_images():
@@ -331,7 +354,8 @@ class MainController:
         self.state.batch_stop_requested = False
 
         logger.info(f"배치 평가 시작: {len(self.state.images)}개")
-        thread = threading.Thread(target=self._run_batch, daemon=True)
+        thread = threading.Thread(
+            target=self._run_batch, daemon=True, name="eval-batch")
         thread.start()
 
     def stop_batch(self):
@@ -363,6 +387,44 @@ class MainController:
         self.state.batch_running = False
         if self.on_batch_complete:
             self.on_batch_complete()
+
+    # ================================================================
+    #  Assessor 파라미터 갱신 (객체 재생성 없이 속성만 변경)
+    # ================================================================
+
+    def _update_assessor(self):
+        """
+        Assessor 파라미터 업데이트
+
+        핵심: SpeckleQualityAssessor를 새로 생성하지 않고
+        기존 객체의 속성만 갱신 → warmup_numba() 중복 실행 완전 차단
+        """
+        if not self.param_panel:
+            return
+
+        params = self.param_panel.get_parameters()
+        if not params:
+            messagebox.showerror("오류", "잘못된 파라미터 값입니다.")
+            return
+
+        noise_var = self.param_panel.get_noise_variance()
+
+        # 속성 직접 갱신 (재생성 X)
+        self.assessor.mig_threshold = params.mig_threshold
+        self.assessor.subset_size = params.subset_size
+        self.assessor.poi_spacing = params.spacing
+
+        if noise_var is not None:
+            self.assessor.set_noise_variance(noise_var)
+        else:
+            self.assessor.clear_noise_override()
+
+        logger.debug(
+            f"Assessor 파라미터 갱신: {params}, noise={noise_var}")
+
+    # ================================================================
+    #  네비게이션 / 캔버스
+    # ================================================================
 
     def navigate(self, direction: int):
         if self.state.navigate(direction):
@@ -399,68 +461,6 @@ class MainController:
         self.state.roi = roi
         self.state.clear_report(self.state.current_file)
         self._notify_state_changed()
-
-    def _update_assessor(self):
-        """Assessor 파라미터 업데이트 (노이즈 포함)"""
-        if not self.param_panel:
-            return
-
-        params = self.param_panel.get_parameters()
-        if not params:
-            messagebox.showerror("오류", "잘못된 파라미터 값입니다.")
-            return
-
-        noise_var = self.param_panel.get_noise_variance()
-
-        self.assessor = SpeckleQualityAssessor(
-            mig_threshold=params.mig_threshold,
-            subset_size=params.subset_size,
-            poi_spacing=params.spacing,
-            noise_variance=noise_var,
-        )
-
-        logger.debug(f"Assessor 업데이트: {params}, noise={noise_var}")
-
-    def _notify_state_changed(self):
-        if self.on_state_changed:
-            self.on_state_changed()
-
-    def get_current_parameters(self) -> Dict:
-        if self.param_panel:
-            params = self.param_panel.get_parameters()
-            if params:
-                return {
-                    'mig_threshold': params.mig_threshold,
-                    'subset_size': params.subset_size,
-                    'spacing': params.spacing,
-                }
-        return {'subset_size': 21, 'spacing': 16}
-
-    def get_roi(self):
-        return self.state.roi
-
-    def get_batch_summary(self) -> dict:
-        reports = self.state.get_all_reports()
-        passed = warning = failed = 0
-        max_subset = 21
-
-        for report in reports.values():
-            if not report.analyzable:
-                failed += 1
-            elif report.recommended_subset_size > report.current_subset_size:
-                warning += 1
-            else:
-                passed += 1
-            if report.recommended_subset_size > max_subset:
-                max_subset = report.recommended_subset_size
-
-        return {
-            'total': len(reports),
-            'passed': passed,
-            'warning': warning,
-            'failed': failed,
-            'max_subset': max_subset,
-        }
 
     # ================================================================
     #  내보내기
@@ -542,3 +542,48 @@ class MainController:
             logger.exception("이미지 저장 오류")
             messagebox.showerror("오류", f"저장 실패: {e}")
             return None
+
+    # ================================================================
+    #  유틸
+    # ================================================================
+
+    def get_current_parameters(self) -> Dict:
+        if self.param_panel:
+            params = self.param_panel.get_parameters()
+            if params:
+                return {
+                    'mig_threshold': params.mig_threshold,
+                    'subset_size': params.subset_size,
+                    'spacing': params.spacing,
+                }
+        return {'subset_size': 21, 'spacing': 16}
+
+    def get_roi(self):
+        return self.state.roi
+
+    def get_batch_summary(self) -> dict:
+        reports = self.state.get_all_reports()
+        passed = warning = failed = 0
+        max_subset = 21
+
+        for report in reports.values():
+            if not report.analyzable:
+                failed += 1
+            elif report.recommended_subset_size > report.current_subset_size:
+                warning += 1
+            else:
+                passed += 1
+            if report.recommended_subset_size > max_subset:
+                max_subset = report.recommended_subset_size
+
+        return {
+            'total': len(reports),
+            'passed': passed,
+            'warning': warning,
+            'failed': failed,
+            'max_subset': max_subset,
+        }
+
+    def _notify_state_changed(self):
+        if self.on_state_changed:
+            self.on_state_changed()
