@@ -34,10 +34,6 @@ from .sssig import (
     calculate_sssig_threshold,
 )
 
-# 모듈 레벨 워밍업 플래그: 프로세스 전체에서 1회만 실행
-_NUMBA_WARMED_UP = False
-
-
 class SpeckleQualityAssessor:
     """
     스페클 패턴 품질 평가기
@@ -50,13 +46,13 @@ class SpeckleQualityAssessor:
     """
 
     def __init__(self,
-                 mig_threshold: float = 30.0,
-                 sssig_threshold: float = 1e5,
-                 subset_size: int = 21,
-                 poi_spacing: int = 10,
-                 auto_find_size: bool = True,
-                 desired_accuracy: float = 0.02,
-                 noise_variance: Optional[float] = None):
+             mig_threshold: float = 30.0,
+             sssig_threshold: float = 1e5,
+             subset_size: int = 21,
+             poi_spacing: int = 10,
+             auto_find_size: bool = True,
+             desired_accuracy: float = 0.02,
+             noise_variance: Optional[float] = None):
         """
         Args:
             mig_threshold: MIG 임계값
@@ -74,19 +70,11 @@ class SpeckleQualityAssessor:
         self.auto_find_size = auto_find_size
         self.desired_accuracy = desired_accuracy
 
-        # 노이즈 관련
         self._noise_variance_override: Optional[float] = noise_variance
         self._noise_pair: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
-        # 최초 1회만 워밍업 (모듈 레벨 플래그로 중복 방지)
-        global _NUMBA_WARMED_UP
-        if not _NUMBA_WARMED_UP:
-            warmup_numba()
-            _NUMBA_WARMED_UP = True
-            logger.debug("Numba SSSIG 워밍업 완료 (최초 1회)")
-        else:
-            logger.debug("Numba SSSIG 워밍업 스킵 (이미 완료)")
-
+        # 워밍업은 app.py 백그라운드 스레드가 전담
+        # assessor 생성 시 메인 스레드 블로킹 없음
         logger.debug(
             f"SpeckleQualityAssessor 초기화: MIG={mig_threshold}, "
             f"desired_accuracy={desired_accuracy}, "

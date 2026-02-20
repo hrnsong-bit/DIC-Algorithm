@@ -61,21 +61,19 @@ class SpeckleQualityGUI:
 
     def _warmup_background(self):
         """앱 시작 후 백그라운드에서 Numba 전체 워밍업"""
+        self.btn_evaluate_all.config(state='disabled')
+        self.progress_var.set("⏳ Numba 초기화 중... (최초 1회)")
 
         def _run():
             try:
-                # SSSIG Numba 워밍업
                 from speckle.core.sssig import warmup_numba
                 warmup_numba()
                 _logger.debug("백그라운드 워밍업: SSSIG 완료")
 
-                # IC-GN Numba 워밍업 (가장 오래 걸리는 부분)
-                from speckle.core.optimization.icgn_core_numba import (
-                    warmup_icgn_core)
+                from speckle.core.optimization.icgn_core_numba import warmup_icgn_core
                 warmup_icgn_core()
                 _logger.debug("백그라운드 워밍업: IC-GN 완료")
 
-                # FFT-CC 워밍업
                 from speckle.core.initial_guess.fft_cc import warmup_fft_cc
                 warmup_fft_cc()
                 _logger.debug("백그라운드 워밍업: FFT-CC 완료")
@@ -85,10 +83,17 @@ class SpeckleQualityGUI:
             except Exception as e:
                 _logger.warning(f"백그라운드 워밍업 일부 실패 (무시): {e}")
 
-        thread = threading.Thread(
-            target=_run, daemon=True, name="numba-warmup")
-        thread.start()
+            finally:
+                self.root.after(0, self._on_warmup_complete)
 
+        threading.Thread(target=_run, daemon=True, name="numba-warmup").start()
+
+    def _on_warmup_complete(self):
+        """워밍업 완료 후 UI 복원 (메인 스레드에서 실행됨)"""
+        self.progress_var.set("✅ 준비 완료")
+        self.btn_evaluate_all.config(state='normal')
+        self.root.after(3000, lambda: self.progress_var.set(""))
+        
     def _apply_saved_settings(self):
         """저장된 설정 적용"""
         try:
