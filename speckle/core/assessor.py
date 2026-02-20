@@ -213,7 +213,7 @@ class SpeckleQualityAssessor:
                 max_size=61,
             )
             recommended_size = optimal_size
-
+        if sssig_result is None:
             sssig_result = compute_sssig_map(
                 roi_gray,
                 subset_size=recommended_size,

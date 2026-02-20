@@ -663,8 +663,9 @@ def _icgn_iterate(
         dp = H_inv @ b
 
         # 수렴 체크
+        half = subset_size // 2
         conv, dp_norm = check_convergence(
-            dp, subset_size, convergence_threshold, shape_function)
+            dp, half, convergence_threshold, shape_function)
 
         if conv:
             fail_code = ICGN_SUCCESS
