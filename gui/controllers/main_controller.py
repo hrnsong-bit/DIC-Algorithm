@@ -10,7 +10,7 @@ import numpy as np
 
 from speckle import (
     SpeckleQualityAssessor, load_image, ResultExporter,
-    estimate_noise_from_pair, estimate_noise_variance,
+    estimate_noise_from_pair, DEFAULT_NOISE_VARIANCE,
 )
 from speckle.io import get_image_files
 from speckle.utils.logger import logger
@@ -148,36 +148,28 @@ class MainController:
             messagebox.showerror("오류", f"노이즈 측정 실패: {e}")
 
     def _measure_noise_single(self):
-        """단일 이미지 측정: 현재 이미지 사용"""
-        if self.state.current_image is None:
-            messagebox.showwarning(
-                "노이즈 측정",
-                "이미지를 먼저 로드하세요.")
-            return
+        """
+        단일 이미지 노이즈 측정 (제거됨)
 
-        try:
-            import cv2
-            img = self.state.current_image
-            if len(img.shape) == 3:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = img
+        단일 이미지에서 텍스처와 노이즈를 분리하는 것은 원리적으로 불가능.
+        대신 디폴트 값을 안내하고, pair 측정 또는 수동 입력을 권장.
+        """
+        messagebox.showinfo(
+            "노이즈 측정",
+            f"단일 이미지 노이즈 추정은 신뢰도가 낮아 제거되었습니다.\n\n"
+            f"권장 방법:\n"
+            f"  1. 정지 이미지 2장으로 pair 측정\n"
+            f"  2. 카메라 스펙에서 직접 입력\n\n"
+            f"현재 디폴트 값({DEFAULT_NOISE_VARIANCE} GL²)이 적용됩니다.")
 
-            if self.state.roi is not None:
-                x, y, w, h = self.state.roi
-                gray = gray[y:y+h, x:x+w]
+        self._apply_noise_to_assessor(DEFAULT_NOISE_VARIANCE, 'default')
 
-            nv = estimate_noise_variance(gray)
-            self._apply_noise_to_assessor(nv, 'single_local_std')
+        if self.param_panel:
+            self.param_panel.set_noise_result(DEFAULT_NOISE_VARIANCE, 'default')
 
-            if self.param_panel:
-                self.param_panel.set_noise_result(nv, 'single_local_std')
-
-            logger.info(f"노이즈 single 측정: D(η)={nv:.2f}")
-
-        except Exception as e:
-            logger.exception("노이즈 single 측정 실패")
-            messagebox.showerror("오류", f"노이즈 측정 실패: {e}")
+        logger.info(
+            f"단일 이미지 측정 요청 → 디폴트 적용: "
+            f"D(η)={DEFAULT_NOISE_VARIANCE}")
 
     def _apply_noise_to_assessor(self, variance: float, method: str):
         """측정된 노이즈를 assessor에 적용"""

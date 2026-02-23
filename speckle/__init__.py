@@ -11,7 +11,7 @@ from .core import (
     get_mask_statistics,
     visualize_mask,
     visualize_mask_boundary,
-    estimate_noise_variance,
+    DEFAULT_NOISE_VARIANCE,
     estimate_noise_from_pair,
     calculate_sssig_threshold,
     predict_displacement_accuracy,
@@ -20,7 +20,7 @@ from .io import load_image, load_folder, save_image, get_image_files, ResultExpo
 from .visualization import draw_poi_overlay, create_result_visualization, draw_roi
 from .batch import BatchProcessor
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 
 __all__ = [
     # Models
@@ -36,7 +36,7 @@ __all__ = [
     'compute_gradient',
 
     # Noise
-    'estimate_noise_variance',
+    'DEFAULT_NOISE_VARIANCE',
     'estimate_noise_from_pair',
     'calculate_sssig_threshold',
     'predict_displacement_accuracy',

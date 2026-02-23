@@ -1,20 +1,19 @@
 """
-스페클 품질 평가 메인 클래스 (v3.3.2 수정)
+스페클 품질 평가 메인 클래스 (v3.4.0)
 
-수정 사항 (v3.3.2):
-- _NUMBA_WARMED_UP 모듈 레벨 플래그 추가 → 프로세스 전체에서 warmup_numba() 1회만 실행
-- SpeckleQualityAssessor 재생성 시 중복 워밍업 제거
+변경 사항 (v3.4.0):
+- estimate_noise_variance (단일 이미지 local_std) 의존 제거
+- 3-tier → 명확한 2-tier + default 구조:
+    Tier 1: 사용자 직접 지정 (set_noise_variance / __init__)
+    Tier 2: pair 이미지 차분 (set_noise_pair)
+    Fallback: DEFAULT_NOISE_VARIANCE (4.0 GL²) + 경고
+- noise_method 값: 'user', 'pair', 'default'
+- _resolve_noise_variance에서 full_gray 파라미터 제거 (더 이상 불필요)
 
-수정 사항 (v3.3.1):
-- 노이즈 추정을 ROI 적용 전 전체 이미지에서 수행
-- estimate_noise_variance에서 method 파라미터 제거 (Laplacian 삭제)
-- _resolve_noise_variance가 전체 이미지를 받도록 변경
-
-수정 사항 (v3.3.0):
-- 3-tier 노이즈 추정: user override > pair > single(local_std)
-- set_noise_variance / set_noise_pair 사후 설정 메서드
-- noise_method 기록 → QualityReport에 전달
-- __init__에 noise_variance 파라미터 추가
+이전 버전:
+- v3.3.2: _NUMBA_WARMED_UP 모듈 레벨 플래그
+- v3.3.1: 노이즈 추정을 ROI 적용 전 전체 이미지에서 수행
+- v3.3.0: 3-tier 노이즈 추정, set_noise_variance/pair API
 """
 
 import numpy as np
@@ -26,33 +25,34 @@ from ..models.reports import BadPoint, SSSIGResult, QualityReport, BatchReport
 from ..utils.logger import logger
 from .mig import compute_mig
 from .sssig import (
+    DEFAULT_NOISE_VARIANCE,
     compute_sssig_map,
     find_optimal_subset_size,
     warmup_numba,
-    estimate_noise_variance,
     estimate_noise_from_pair,
     calculate_sssig_threshold,
 )
+
 
 class SpeckleQualityAssessor:
     """
     스페클 패턴 품질 평가기
 
     평가 흐름:
-    1. 노이즈 분산 결정 (3-tier fallback, 전체 이미지 기반)
+    1. 노이즈 분산 결정 (user > pair > default 4.0 GL²)
     2. MIG로 ROI 내 전역 대비 확인
     3. SSSIG 맵으로 ROI 내 로컬 품질 확인
     4. 최적 subset size 추천
     """
 
     def __init__(self,
-             mig_threshold: float = 30.0,
-             sssig_threshold: float = 1e5,
-             subset_size: int = 21,
-             poi_spacing: int = 10,
-             auto_find_size: bool = True,
-             desired_accuracy: float = 0.02,
-             noise_variance: Optional[float] = None):
+                 mig_threshold: float = 30.0,
+                 sssig_threshold: float = 1e5,
+                 subset_size: int = 21,
+                 poi_spacing: int = 10,
+                 auto_find_size: bool = True,
+                 desired_accuracy: float = 0.02,
+                 noise_variance: Optional[float] = None):
         """
         Args:
             mig_threshold: MIG 임계값
@@ -61,7 +61,7 @@ class SpeckleQualityAssessor:
             poi_spacing: POI 간격
             auto_find_size: 자동 최적 크기 탐색 여부
             desired_accuracy: 원하는 변위 측정 정확도 (pixels)
-            noise_variance: 노이즈 분산 D(η) 사전 지정 (None이면 자동)
+            noise_variance: 노이즈 분산 D(η) 사전 지정 (None이면 pair 또는 디폴트)
         """
         self.mig_threshold = mig_threshold
         self.sssig_threshold = sssig_threshold
@@ -73,8 +73,6 @@ class SpeckleQualityAssessor:
         self._noise_variance_override: Optional[float] = noise_variance
         self._noise_pair: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
-        # 워밍업은 app.py 백그라운드 스레드가 전담
-        # assessor 생성 시 메인 스레드 블로킹 없음
         logger.debug(
             f"SpeckleQualityAssessor 초기화: MIG={mig_threshold}, "
             f"desired_accuracy={desired_accuracy}, "
@@ -93,52 +91,53 @@ class SpeckleQualityAssessor:
         logger.info("노이즈 pair 이미지 설정 완료")
 
     def clear_noise_override(self):
-        """노이즈 override 해제 → 자동 추정으로 복귀"""
+        """노이즈 override 해제 → 디폴트로 복귀"""
         self._noise_variance_override = None
         self._noise_pair = None
         logger.info("노이즈 override 해제")
 
-    def _resolve_noise_variance(self, full_gray: np.ndarray,
+    def _resolve_noise_variance(self,
                                  roi: Optional[Tuple[int, int, int, int]] = None
                                  ) -> Tuple[float, str]:
         """
-        3-tier 노이즈 분산 결정
+        노이즈 분산 결정
 
-        Tier 1: 사용자 직접 지정 (set_noise_variance)
-        Tier 2: pair 이미지 차분 (set_noise_pair)
-        Tier 3: 단일 이미지 local_std (fallback, 전체 이미지 사용)
+        우선순위:
+        1. 사용자 직접 지정 (set_noise_variance / __init__ noise_variance)
+        2. pair 이미지 차분 (set_noise_pair)
+        3. 디폴트 값 (4.0 GL²) + 경고
 
         Args:
-            full_gray: ROI 적용 전 전체 그레이스케일 이미지
-                       (센서 노이즈는 이미지 전체에서 추정하는 것이 정확)
-            roi: ROI 좌표 (pair 추정 시 전달용, Tier 3에서는 미사용)
+            roi: ROI 좌표 (pair 추정 시 전달용)
 
         Returns:
             (noise_variance, method_name)
         """
-        # Tier 1: 사용자 override
+        # 1. 사용자 override
         if self._noise_variance_override is not None:
             return self._noise_variance_override, 'user'
 
-        # Tier 2: pair 이미지
+        # 2. pair 이미지
         if self._noise_pair is not None:
             try:
                 nv = estimate_noise_from_pair(
                     self._noise_pair[0], self._noise_pair[1], roi)
                 return nv, 'pair'
             except Exception as e:
-                logger.warning(f"Pair 노이즈 추정 실패, fallback: {e}")
+                logger.warning(f"Pair 노이즈 추정 실패, 디폴트 사용: {e}")
 
-        # Tier 3: 단일 이미지 — 전체 이미지에서 추정
-        # 배경 등 평탄 영역을 활용하기 위해 ROI가 아닌 전체 이미지 사용
-        nv = estimate_noise_variance(full_gray)
-        return nv, 'single_local_std'
+        # 3. 디폴트
+        logger.warning(
+            f"노이즈 분산 미지정 → 디폴트 {DEFAULT_NOISE_VARIANCE} GL² 사용. "
+            f"정확한 SSSIG 임계값을 위해 pair 이미지 또는 "
+            f"카메라 스펙 기반 값을 지정하세요.")
+        return DEFAULT_NOISE_VARIANCE, 'default'
 
     # ── 평가 ──
 
     def evaluate(self, image: np.ndarray,
-                roi: Optional[Tuple[int, int, int, int]] = None
-                ) -> QualityReport:
+                 roi: Optional[Tuple[int, int, int, int]] = None
+                 ) -> QualityReport:
         """단일 이미지 품질 평가"""
         start_time = time.time()
         warnings = []
@@ -149,15 +148,15 @@ class SpeckleQualityAssessor:
         else:
             gray = image.copy()
 
-        # ====== 노이즈 분산 결정 (3-tier) ======
-        noise_variance, noise_method = self._resolve_noise_variance(gray, roi)
+        # ====== 노이즈 분산 결정 ======
+        noise_variance, noise_method = self._resolve_noise_variance(roi)
         calculated_threshold = calculate_sssig_threshold(
             noise_variance, self.desired_accuracy)
 
-        if noise_method == 'single_local_std':
-            logger.info(
-                "노이즈: 단일이미지 추정(local_std) 사용 중. "
-                "pair 추정 권장.")
+        if noise_method == 'default':
+            warnings.append(
+                f"노이즈 분산 미지정 → 디폴트 {DEFAULT_NOISE_VARIANCE} GL² 사용. "
+                f"pair 이미지 또는 카메라 스펙 기반 값을 권장합니다.")
 
         # ROI 적용
         if roi is not None:
@@ -205,7 +204,6 @@ class SpeckleQualityAssessor:
         predicted_accuracy = None
 
         if self.auto_find_size:
-            # 최적 subset 크기 탐색 후 해당 크기로 SSSIG 계산
             optimal_size, size_found, sssig_result, info = find_optimal_subset_size(
                 roi_gray,
                 spacing=self.poi_spacing,
@@ -216,7 +214,6 @@ class SpeckleQualityAssessor:
             )
             recommended_size = optimal_size
 
-            # find_optimal_subset_size가 sssig_result를 반환하지 않는 경우 대비
             if sssig_result is None:
                 sssig_result = compute_sssig_map(
                     roi_gray,
@@ -226,7 +223,6 @@ class SpeckleQualityAssessor:
                     desired_accuracy=self.desired_accuracy,
                 )
         else:
-            # 고정 subset 크기로 SSSIG 계산
             sssig_result = compute_sssig_map(
                 roi_gray,
                 subset_size=self.subset_size,
@@ -238,13 +234,13 @@ class SpeckleQualityAssessor:
             size_found = len(sssig_result.bad_points) == 0 if sssig_result else False
 
         predicted_accuracy = (sssig_result.predicted_accuracy
-                            if sssig_result else None)
+                              if sssig_result else None)
 
         if sssig_result and len(sssig_result.points_y) == 0:
             warnings.append("유효한 POI가 없음 - ROI 확인 필요")
 
         sssig_pass = (sssig_result.n_bad_points == 0
-                    if sssig_result else False)
+                      if sssig_result else False)
 
         if not sssig_pass and sssig_result and sssig_result.n_bad_points > 0:
             warnings.append(
@@ -285,6 +281,7 @@ class SpeckleQualityAssessor:
         )
 
     # ── 배치 평가 ──
+
     def evaluate_batch(self,
                        images: Dict[str, np.ndarray],
                        roi: Optional[Tuple[int, int, int, int]] = None,
@@ -294,7 +291,7 @@ class SpeckleQualityAssessor:
         """
         배치 평가
 
-        노이즈 분산은 첫 이미지에서 한 번만 추정하고 나머지에 재사용합니다.
+        노이즈 분산은 첫 이미지 평가 시 결정된 값을 나머지에 재사용합니다.
         (같은 카메라/조명 세팅의 시퀀스에서 노이즈 특성은 동일)
         """
         start_time = time.time()
@@ -324,13 +321,14 @@ class SpeckleQualityAssessor:
                 report = self.evaluate(image, roi)
                 individual_reports[filename] = report
 
-                # 첫 이미지에서 노이즈 추정 → 이후 재사용
+                # 첫 이미지에서 결정된 노이즈 → 이후 재사용
                 if idx == 0 and report.noise_variance is not None:
                     if original_override is None and self._noise_pair is None:
                         self._noise_variance_override = report.noise_variance
                         logger.info(
                             f"배치 노이즈 고정: D(η)={report.noise_variance:.2f} "
-                            f"(첫 이미지 '{filename}'에서 추정)")
+                            f"[{report.noise_method}] "
+                            f"(첫 이미지 '{filename}'에서 결정)")
 
                 mig_values.append(report.mig)
 

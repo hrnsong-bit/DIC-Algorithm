@@ -238,14 +238,23 @@ def _batch_fft_zncc(ref_subsets: np.ndarray,
 
 # ===== 단일 POI ZNCC (하위 호환) =====
 
-def _fft_zncc(template: np.ndarray, search_win: np.ndarray) -> Tuple[int, int, float]:
-    """단일 POI용 FFT-ZNCC"""
+def _fft_zncc(template: np.ndarray, search_win: np.ndarray,
+              min_std: float = 1.0) -> Tuple[int, int, float]:
+    """단일 POI용 FFT-ZNCC
+    
+    Args:
+        template: 참조 서브셋
+        search_win: 탐색 윈도우 (확장)
+        min_std: 텍스처 없음 판별 임계값 (기본 1.0)
+    
+    Returns:
+        (disp_v, disp_u, zncc)
+    """
     r = template[None, ...].astype(np.float64)
     t = search_win[None, ...].astype(np.float64)
 
-    du, dv, zncc = _batch_fft_zncc(r, t, n_workers=1, chunk_size=1)
+    du, dv, zncc = _batch_fft_zncc(r, t, min_std=min_std, n_workers=1, chunk_size=1)
     return int(dv[0]), int(du[0]), float(zncc[0])
-
 # ===== 메인 함수 =====
 
 def compute_fft_cc(ref_image, def_image,

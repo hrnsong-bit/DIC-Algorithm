@@ -26,6 +26,7 @@ from .results import (
     ICGN_FAIL_FLAT_SUBSET,
     ICGN_FAIL_MAX_DISPLACEMENT,
     ICGN_FAIL_FLAT_TARGET,
+    FAILURE_REASON_NAMES,
 )
 from .shape_function import (
     generate_local_coordinates,
@@ -303,6 +304,37 @@ def _compute_icgn_numba(
         f"mean_zncc={mean_zncc:.4f}, {processing_time:.3f}s "
         f"({processing_time/max(n_valid,1)*1000:.2f}ms/POI)"
     )
+    invalid_mask = ~icgn_valid & fft_valid  # FFT 통과했지만 IC-GN 실패한 POI
+    n_invalid = int(np.sum(invalid_mask))
+
+    if n_invalid > 0:
+        invalid_zncc = result_zncc[invalid_mask]
+        invalid_fail = result_fail[invalid_mask]
+
+        # ZNCC 분포
+        _logger.info(
+            f"IC-GN 불량 POI {n_invalid}개 상세: "
+            f"ZNCC min={invalid_zncc.min():.4f}, "
+            f"max={invalid_zncc.max():.4f}, "
+            f"mean={invalid_zncc.mean():.4f}"
+        )
+
+        # 실패 원인별 카운트
+        fail_counts = {}
+        for code, name in FAILURE_REASON_NAMES.items():
+            count = int(np.sum(invalid_fail == code))
+            if count > 0:
+                fail_counts[name] = count
+        _logger.info(f"IC-GN 불량 원인별: {fail_counts}")
+
+        # ZNCC 구간별 분포
+        bins = [0.0, 0.90, 0.93, 0.95, 0.97, 0.99, 1.0]
+        hist, _ = np.histogram(invalid_zncc, bins=bins)
+        bin_info = " | ".join(
+            f"{bins[i]:.2f}~{bins[i+1]:.2f}: {hist[i]}개"
+            for i in range(len(hist)) if hist[i] > 0
+        )
+        _logger.info(f"IC-GN 불량 ZNCC 구간: {bin_info}")
 
     # 결과 배열 분해
     if shape_function == 'affine':

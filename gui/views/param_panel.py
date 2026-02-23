@@ -1,4 +1,10 @@
-"""파라미터 패널 (노이즈 추정 섹션 포함)"""
+"""파라미터 패널 (노이즈 추정 섹션 포함, v3.4.0)
+
+변경 사항 (v3.4.0):
+- 'single' 노이즈 추정 방법 제거 (신뢰도 낮음)
+- 드롭다운: auto / pair / manual 3가지만 제공
+- 디폴트 결과 표시에 'default' method 지원
+"""
 
 import tkinter as tk
 from tkinter import ttk, filedialog
@@ -20,7 +26,7 @@ class Parameters:
 @dataclass
 class NoiseConfig:
     """노이즈 추정 설정"""
-    method: str = 'auto'          # 'auto', 'pair', 'manual', 'single'
+    method: str = 'auto'          # 'auto', 'pair', 'manual'
     variance: Optional[float] = None
     std: Optional[float] = None
     pair_paths: Optional[Tuple[str, str]] = None
@@ -95,13 +101,13 @@ class ParamPanel:
         self.noise_method_combo = ttk.Combobox(
             method_frame,
             textvariable=self.noise_method_var,
-            values=['auto', 'pair', 'manual', 'single'],
+            values=['auto', 'pair', 'manual'],
             state='readonly', width=12)
         self.noise_method_combo.pack(side=tk.LEFT, padx=(5, 0))
         self.noise_method_combo.bind(
             '<<ComboboxSelected>>', self._on_noise_method_changed)
 
-        # 툴팁 스타일 설명
+        # 설명
         self.noise_desc_var = tk.StringVar(
             value="폴더 로드 시 첫 2장으로 자동 측정")
         ttk.Label(nf, textvariable=self.noise_desc_var,
@@ -176,7 +182,6 @@ class ParamPanel:
             'auto': "폴더 로드 시 첫 2장으로 자동 측정",
             'pair': "정지 이미지 2장을 직접 선택하여 측정",
             'manual': "카메라 스펙 기반으로 D(η)를 직접 입력",
-            'single': "단일 이미지 로컬분산 추정 (정확도 낮음)",
         }
         self.noise_desc_var.set(descriptions.get(method, ""))
         self._update_noise_ui_visibility()
@@ -197,8 +202,8 @@ class ParamPanel:
         else:
             self.manual_frame.pack_forget()
 
-        # 측정 버튼 (manual은 "적용" 버튼이 별도)
-        if method in ('auto', 'pair', 'single'):
+        # 측정 버튼 (auto, pair만 — manual은 "적용" 버튼이 별도)
+        if method in ('auto', 'pair'):
             self.btn_measure.pack(fill=tk.X, padx=5, pady=2)
         else:
             self.btn_measure.pack_forget()
@@ -268,8 +273,8 @@ class ParamPanel:
         method_names = {
             'pair': 'pair 차분법 ✓',
             'manual': '사용자 입력',
-            'single_local_std': '단일이미지 (local_std)',
             'auto': '자동 (pair)',
+            'default': '디폴트 (4.0 GL²)',
         }
         display_method = method_names.get(method, method)
         self.noise_status_var.set(f"방법: {display_method}")
@@ -278,8 +283,10 @@ class ParamPanel:
             self.noise_status_label.config(foreground='green')
         elif method == 'manual':
             self.noise_status_label.config(foreground='blue')
-        else:
+        elif method == 'default':
             self.noise_status_label.config(foreground='orange')
+        else:
+            self.noise_status_label.config(foreground='green')
 
     def set_noise_result(self, variance: float, method: str):
         """외부(컨트롤러)에서 측정 결과를 표시할 때 호출"""

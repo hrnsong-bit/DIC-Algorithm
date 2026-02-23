@@ -2,12 +2,12 @@
 
 from .mig import compute_mig, compute_gradient as compute_mig_gradient, compute_local_mig
 from .sssig import (
+    DEFAULT_NOISE_VARIANCE,
     compute_sssig,
     compute_sssig_map,
     compute_gradient,
     find_optimal_subset_size,
     warmup_numba,
-    estimate_noise_variance,
     estimate_noise_from_pair,
     calculate_sssig_threshold,
     predict_displacement_accuracy,
@@ -22,6 +22,7 @@ from .masking import (
 from .assessor import SpeckleQualityAssessor
 
 __all__ = [
+    'DEFAULT_NOISE_VARIANCE',
     'compute_mig',
     'compute_mig_gradient',
     'compute_local_mig',
@@ -30,7 +31,6 @@ __all__ = [
     'compute_gradient',
     'find_optimal_subset_size',
     'warmup_numba',
-    'estimate_noise_variance',
     'estimate_noise_from_pair',
     'calculate_sssig_threshold',
     'predict_displacement_accuracy',

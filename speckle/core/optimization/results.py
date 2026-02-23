@@ -18,14 +18,14 @@ ICGN_FAIL_MAX_DISPLACEMENT = 6
 ICGN_FAIL_FLAT_TARGET = 7
 
 FAILURE_REASON_NAMES = {
-    ICGN_SUCCESS: 'success',
-    ICGN_FAIL_LOW_ZNCC: 'low_zncc',
-    ICGN_FAIL_DIVERGED: 'diverged',
-    ICGN_FAIL_OUT_OF_BOUNDS: 'out_of_bounds',
+    ICGN_SUCCESS:               'success',
+    ICGN_FAIL_LOW_ZNCC:         'low_zncc',
+    ICGN_FAIL_DIVERGED:         'diverged',
+    ICGN_FAIL_OUT_OF_BOUNDS:    'out_of_bounds',
     ICGN_FAIL_SINGULAR_HESSIAN: 'singular_hessian',
-    ICGN_FAIL_FLAT_SUBSET: 'flat_subset',
+    ICGN_FAIL_FLAT_SUBSET:      'flat_subset',
     ICGN_FAIL_MAX_DISPLACEMENT: 'max_displacement',
-    ICGN_FAIL_FLAT_TARGET: 'flat_target',
+    ICGN_FAIL_FLAT_TARGET:      'flat_target',
 }
 
 

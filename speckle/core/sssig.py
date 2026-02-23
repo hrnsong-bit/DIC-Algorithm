@@ -1,13 +1,20 @@
 """
-SSSIG 계산 모듈 (v3.3.0 수정)
+SSSIG 계산 모듈 (v3.4.0)
 
-수정 사항:
-- estimate_noise_from_pair: 분산(σ²) 반환으로 통일
+변경 사항 (v3.4.0):
+- estimate_noise_variance (단일 이미지 local_std 기반) 삭제
+  → 단일 이미지에서 텍스처와 노이즈를 분리하는 것은 원리적으로 불가능.
+    percentile 선택(0.5%)이 임의적이며 논문 리뷰에서 방어 불가.
+- max(noise_var, 1.0) 클램프 삭제 → 물리적 근거 없음
+- estimate_noise_from_pair: max 하한을 0.1 → 0.01로 완화 (고품질 카메라 대응)
+- 노이즈가 필요하지만 제공되지 않은 경우 default_noise_variance=4.0 사용 + 경고
+- analyze_image_quality_for_dic: noise_variance 필수 인자로 변경
+
+이전 버전 (v3.3.0):
 - compute_gradient: IC-GN과 동일한 Sobel ksize=5, /32.0
 - calculate_sssig_threshold: 하드코딩 클램프 제거, 경고 로깅으로 전환
-- compute_sssig_map: bad-point를 x/y 각각 threshold/2 기준으로 판정
-- find_optimal_subset_size: 마스크 안전 선형 탐색으로 변경
-- estimate_noise_variance: local_std 퍼센타일 5% → 0.5%
+- compute_sssig_map: bad-point를 x/y 각각 threshold 기준으로 판정
+- find_optimal_subset_size: 마스크 안전 선형 탐색
 
 References:
 - Pan et al. (2008) "Study on subset size selection in digital image
@@ -21,6 +28,11 @@ from numba import jit, prange
 
 from ..models.reports import BadPoint, SSSIGResult
 from ..utils.logger import logger
+
+
+# ===== 디폴트 노이즈 분산 =====
+# 일반적인 8-bit 산업용 카메라 센서 노이즈 수준 (σ ≈ 2 GL)
+DEFAULT_NOISE_VARIANCE = 4.0
 
 
 # ===== Numba 병렬 SSSIG =====
@@ -80,7 +92,7 @@ def compute_gradient(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
     SSSIG와 IC-GN이 동일한 gradient를 사용해야
     σ(Δu) ≈ √[D(η) / SSSIG] 관계가 성립함 (Pan et al., 2008, Eq. 18-19).
-    
+
     MIG용 gradient(mig.py, ksize=3, 정규화 없음)와는 의도적으로 다름.
     MIG는 상대적 품질 비교 지표이므로 gradient 스케일에 무관.
     """
@@ -94,72 +106,53 @@ def compute_gradient(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 # ===== 노이즈 추정 =====
 
-def estimate_noise_variance(image: np.ndarray) -> float:
-    """
-    단일 이미지에서 노이즈 분산 D(η)을 추정합니다.
-    
-    로컬 분산의 하위 0.5% 백분위(가장 평탄한 영역)를 사용하여
-    센서 노이즈를 추정합니다.
-    Reference:
-        Colom & Buades (2013), "Analysis and Extension of the Percentile Method"
-    
-    Args:
-        image: 그레이스케일 이미지
-        
-    Returns:
-        노이즈 분산 D(η) [GL² 단위] (최소 1.0, 실패 시 기본값 4.0)
-    """
-    try:
-        gray = _ensure_gray_float(image)
-        
-        # 로컬 분산 기반 추정 — 하위 0.5% (가장 평탄한 영역)
-        kernel_size = 5
-        local_mean = cv2.blur(gray, (kernel_size, kernel_size))
-        local_sq_mean = cv2.blur(gray ** 2, (kernel_size, kernel_size))
-        local_var = local_sq_mean - local_mean ** 2
-        valid_var = local_var[local_var > 0]
-        if len(valid_var) == 0:
-            return 4.0
-        noise_var = float(np.percentile(valid_var, 0.5))
-        return max(noise_var, 1.0)
-        
-    except Exception as e:
-        logger.error(f"노이즈 분산 추정 실패: {e}, 기본값 4.0 사용")
-        return 4.0
-
-
-
 def estimate_noise_from_pair(image1: np.ndarray, image2: np.ndarray,
                               roi: Optional[Tuple[int, int, int, int]] = None) -> float:
     """
     두 정지 이미지 차분으로 노이즈 분산 추정 (DIC Challenge 방식)
 
-    D(η) = Var(diff) / 2 = [std(diff) / √2]²
+    D(η) = Var(diff) / 2
+
+    동일한 시편을 동일 조건에서 연속 촬영한 두 이미지를 사용.
+    두 이미지의 노이즈가 i.i.d.라는 가정 하에 정확한 추정이 가능.
 
     Args:
         image1, image2: 동일 조건에서 촬영한 두 이미지
         roi: 분석 영역 (x, y, w, h)
 
     Returns:
-        노이즈 분산 D(η) [GL² 단위]  ← 수정: 이전 버전은 σ를 반환했음
+        노이즈 분산 D(η) [GL² 단위]
     """
     gray1 = _ensure_gray_float(image1)
     gray2 = _ensure_gray_float(image2)
 
-    # ROI 적용
     if roi is not None:
         x, y, w, h = roi
         gray1 = gray1[y:y+h, x:x+w]
         gray2 = gray2[y:y+h, x:x+w]
 
-    # 차이 이미지
     diff = gray1 - gray2
     diff = diff - np.mean(diff)  # DC 성분 제거
 
-    # D(η) = Var(diff) / 2
     noise_variance = float(np.var(diff) / 2.0)
 
-    return max(noise_variance, 0.1)  # 안전 하한
+    return max(noise_variance, 0.01)  # 수치 안전 하한 (고품질 카메라 대응)
+
+
+def _resolve_default_noise(noise_variance: Optional[float]) -> float:
+    """
+    노이즈 분산이 None이면 디폴트 값 반환 + 경고.
+
+    내부 유틸리티. compute_sssig_map, find_optimal_subset_size 등에서
+    noise_variance=None으로 호출될 때 일관된 처리를 위해 사용.
+    """
+    if noise_variance is not None:
+        return noise_variance
+
+    logger.warning(
+        f"노이즈 분산 미지정 → 디폴트 {DEFAULT_NOISE_VARIANCE} GL² 사용. "
+        f"정확한 분석을 위해 pair 이미지 또는 카메라 스펙 기반 값을 지정하세요.")
+    return DEFAULT_NOISE_VARIANCE
 
 
 # ===== Threshold 계산 =====
@@ -171,9 +164,6 @@ def calculate_sssig_threshold(noise_variance: float,
 
     σ(Δu) ≈ √[D(η) / SSSIG]
     → SSSIG ≥ D(η) / σ_target²
-
-    하드코딩 클램프(1e4–1e7) 제거.
-    대신 비정상적 값에 대해 경고 로그를 남김.
 
     Args:
         noise_variance: 이미지 노이즈 분산 D(η) [GL²]
@@ -187,7 +177,6 @@ def calculate_sssig_threshold(noise_variance: float,
 
     threshold = noise_variance / (desired_accuracy ** 2)
 
-    # 경고만 (클램프 X)
     if threshold < 1e3:
         logger.warning(
             f"SSSIG threshold가 매우 낮음: {threshold:.2e} "
@@ -260,24 +249,22 @@ def compute_sssig_map(image: np.ndarray,
     """
     전체 ROI에 대한 SSSIG 맵 계산
 
-    수정:
-    - gradient를 IC-GN과 동일 (ksize=5, /32.0) 사용
-    - bad-point 판정: sssig_x < threshold/2 OR sssig_y < threshold/2
-      (한쪽 방향만 극도로 낮아도 불량으로 검출)
+    bad-point 판정 (Pan et al., 2008, Eq. 18-19):
+        threshold = D(η) / σ_target² 는 각 방향 독립 기준.
+        sssig_x < threshold OR sssig_y < threshold 이면 불량.
     """
     gray = _ensure_gray(image).copy()
     h, w = gray.shape
     half = subset_size // 2
 
-    # 노이즈 분산 추정
-    if noise_variance is None:
-        noise_variance = estimate_noise_variance(gray)
+    # 노이즈 분산 결정
+    noise_variance = _resolve_default_noise(noise_variance)
 
     # Threshold 계산
     if threshold is None:
         threshold = calculate_sssig_threshold(noise_variance, desired_accuracy)
 
-    # Gradient 계산 (IC-GN 일치)
+    # Gradient 계산
     if gx is None or gy is None:
         gx, gy = compute_gradient(gray)
 
@@ -298,7 +285,6 @@ def compute_sssig_map(image: np.ndarray,
             predicted_accuracy=float('inf')
         )
 
-    # 모든 POI 좌표 생성
     yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
     all_points_y = yy.ravel()
     all_points_x = xx.ravel()
@@ -332,20 +318,21 @@ def compute_sssig_map(image: np.ndarray,
         points_y, points_x, half
     )
 
-    # 총 SSSIG (x + y)
     sssig_values = sssig_x + sssig_y
 
-    # 통계
     mean_sssig = float(np.mean(sssig_values))
     min_sssig = float(np.min(sssig_values))
     max_sssig = float(np.max(sssig_values))
 
-    # 예상 정확도 (worst-case: 방향별 최소값 기준)
-    predicted_accuracy = predict_displacement_accuracy(float(np.min(sssig_values)), noise_variance)
+    # 예상 정확도 (방향별 worst-case)
+    min_sssig_x = float(np.min(sssig_x)) if len(sssig_x) > 0 else 0.0
+    min_sssig_y = float(np.min(sssig_y)) if len(sssig_y) > 0 else 0.0
+    accuracy_x = predict_displacement_accuracy(min_sssig_x, noise_variance)
+    accuracy_y = predict_displacement_accuracy(min_sssig_y, noise_variance)
+    predicted_accuracy = max(accuracy_x, accuracy_y)
 
-    # ── bad-point 판정 ──
-    bad_mask = sssig_values < threshold
-
+    # bad-point 판정: 방향별 독립 기준
+    bad_mask = (sssig_x < threshold) | (sssig_y < threshold)
     bad_indices = np.where(bad_mask)[0]
 
     bad_points = [
@@ -397,23 +384,16 @@ def find_optimal_subset_size(image: np.ndarray,
                              mask: np.ndarray = None
                              ) -> Tuple[int, bool, Optional[SSSIGResult], dict]:
     """
-    최적 subset size 탐색
-
-    수정: binary search → 선형 탐색
-    마스크 적용 시 subset size에 따라 POI 세트가 달라져
-    SSSIG 단조성이 깨질 수 있으므로 선형이 안전함.
+    최적 subset size 탐색 (선형 탐색)
 
     Returns:
         (optimal_size, found, result, info)
     """
     gray = _ensure_gray(image).copy()
 
-    if noise_variance is None:
-        noise_variance = estimate_noise_variance(gray)
-
+    noise_variance = _resolve_default_noise(noise_variance)
     threshold = calculate_sssig_threshold(noise_variance, desired_accuracy)
 
-    # gradient 미리 계산 (재사용)
     gx, gy = compute_gradient(gray)
 
     info = {
@@ -450,9 +430,8 @@ def find_optimal_subset_size(image: np.ndarray,
             best_size = size
             best_result = result
             found = True
-            break  # 최소 통과 size를 찾으면 중단
+            break
 
-    # 못 찾으면 max_size 결과
     if best_result is None:
         best_result = compute_sssig_map(
             gray, subset_size=max_size, spacing=spacing,
@@ -467,11 +446,19 @@ def find_optimal_subset_size(image: np.ndarray,
 # ===== 종합 분석 =====
 
 def analyze_image_quality_for_dic(image: np.ndarray,
+                                   noise_variance: float,
                                    desired_accuracy: float = 0.01) -> dict:
-    """DIC 분석을 위한 이미지 품질 종합 분석"""
+    """
+    DIC 분석을 위한 이미지 품질 종합 분석
+
+    Args:
+        image: 분석 대상 이미지
+        noise_variance: 노이즈 분산 D(η) [GL²].
+                        pair 이미지 또는 카메라 스펙에서 결정하여 전달.
+        desired_accuracy: 원하는 변위 정확도 [pixels]
+    """
     gray = _ensure_gray(image).copy()
 
-    noise_variance = estimate_noise_variance(gray)
     threshold = calculate_sssig_threshold(noise_variance, desired_accuracy)
 
     optimal_size, found, result, search_info = find_optimal_subset_size(
