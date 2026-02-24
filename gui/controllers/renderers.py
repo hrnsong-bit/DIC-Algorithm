@@ -61,15 +61,20 @@ class FieldRenderer:
     # ===== matplotlib 기반 렌더링 =====
 
     def _render_field_matplotlib(self, img: np.ndarray, grid: np.ndarray,
-                                  unique_x: np.ndarray, unique_y: np.ndarray,
-                                  label: str, symmetric: bool,
-                                  vmin: float = None, vmax: float = None) -> np.ndarray:
-        """matplotlib Agg 백엔드로 필드를 렌더링하여 numpy 배열 반환"""
+                                unique_x: np.ndarray, unique_y: np.ndarray,
+                                label: str, symmetric: bool,
+                                vmin: float = None, vmax: float = None) -> np.ndarray:
+        """matplotlib Agg 백엔드로 필드를 렌더링하여 numpy 배열 반환
+        
+        NaN 영역은 투명 처리하되, 유효 데이터는 부드럽게 업샘플링.
+        방법: 가중치 기반 선형 보간 후 RGBA alpha 채널로 NaN 마스킹.
+        """
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         from matplotlib.colors import Normalize
         from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from scipy.interpolate import RegularGridInterpolator
 
         valid_vals = grid[~np.isnan(grid)]
         if len(valid_vals) == 0:
@@ -93,6 +98,69 @@ class FieldRenderer:
                 if abs(vmax - vmin) < 1e-15:
                     vmin, vmax = vmin - 1e-6, vmax + 1e-6
 
+        # === 가중치 기반 업샘플링 ===
+        # NaN을 0으로 채운 그리드와 유효 마스크(1/0)를 동시에 보간
+        # 보간 후 weight > threshold인 영역만 유효로 표시
+        nan_mask = np.isnan(grid)
+        grid_filled = np.where(nan_mask, 0.0, grid)
+        weight = (~nan_mask).astype(np.float64)
+
+        # POI 간격으로 업샘플 배율 결정
+        spacing = unique_x[1] - unique_x[0] if len(unique_x) > 1 else 1.0
+        upsample = max(1, int(round(spacing)))
+
+        if upsample > 1 and grid.shape[0] >= 3 and grid.shape[1] >= 3:
+            # RegularGridInterpolator로 선형 보간
+            yi_orig = np.arange(grid.shape[0]).astype(np.float64)
+            xi_orig = np.arange(grid.shape[1]).astype(np.float64)
+
+            interp_val = RegularGridInterpolator(
+                (yi_orig, xi_orig), grid_filled, method='linear',
+                bounds_error=False, fill_value=0.0
+            )
+            interp_w = RegularGridInterpolator(
+                (yi_orig, xi_orig), weight, method='linear',
+                bounds_error=False, fill_value=0.0
+            )
+
+            ny_up = (grid.shape[0] - 1) * upsample + 1
+            nx_up = (grid.shape[1] - 1) * upsample + 1
+            yi_new = np.linspace(0, grid.shape[0] - 1, ny_up)
+            xi_new = np.linspace(0, grid.shape[1] - 1, nx_up)
+            yy, xx = np.meshgrid(yi_new, xi_new, indexing='ij')
+            pts = np.column_stack([yy.ravel(), xx.ravel()])
+
+            val_up = interp_val(pts).reshape(ny_up, nx_up)
+            w_up = interp_w(pts).reshape(ny_up, nx_up)
+
+            # 가중치 정규화: weight > 0.3이면 유효
+            valid_up = w_up > 0.3
+            val_up[valid_up] /= w_up[valid_up]
+            val_up[~valid_up] = np.nan
+
+            # 업샘플된 그리드의 실제 좌표 범위
+            ux_up = np.linspace(float(unique_x[0]), float(unique_x[-1]), nx_up)
+            uy_up = np.linspace(float(unique_y[0]), float(unique_y[-1]), ny_up)
+        else:
+            val_up = grid.copy()
+            ux_up = unique_x
+            uy_up = unique_y
+
+        # === RGBA 생성 (NaN → 투명) ===
+        cmap = plt.get_cmap('turbo')
+        norm = Normalize(vmin=vmin, vmax=vmax)
+
+        # 정규화 후 colormap 적용
+        val_clipped = np.clip(val_up, vmin, vmax)
+        val_safe = np.where(np.isnan(val_up), 0.0, val_up)  # NaN → 0 (어차피 투명 처리)
+        val_normed = np.clip((val_safe - vmin) / (vmax - vmin + 1e-15), 0, 1)
+        rgba = cmap(val_normed)
+
+        # NaN 영역 투명
+        nan_up = np.isnan(val_up)
+        rgba[nan_up, 3] = 0.0
+        rgba[~nan_up, 3] = 0.9
+
         # === Figure 생성 ===
         img_h, img_w = img.shape[:2]
         fig = plt.figure(figsize=(img_w / 100, img_h / 100), dpi=100)
@@ -105,14 +173,10 @@ class FieldRenderer:
             gray_bg = img.copy()
         ax.imshow(gray_bg, cmap='gray', extent=[0, img_w, img_h, 0], alpha=0.3)
 
-        # === Norm (항상 Normalize) ===
-        norm = Normalize(vmin=vmin, vmax=vmax)
+        extent = [float(ux_up[0]), float(ux_up[-1]),
+                float(uy_up[-1]), float(uy_up[0])]
 
-        extent = [float(unique_x[0]), float(unique_x[-1]),
-                  float(unique_y[-1]), float(unique_y[0])]
-
-        im = ax.imshow(grid, cmap='turbo', norm=norm, extent=extent,
-                       interpolation='bicubic', alpha=0.9, aspect='auto')
+        ax.imshow(rgba, extent=extent, interpolation='bilinear', aspect='auto')
 
         ax.set_xlim(0, img_w)
         ax.set_ylim(img_h, 0)
@@ -127,7 +191,7 @@ class FieldRenderer:
         rendered_bgr = cv2.cvtColor(rendered, cv2.COLOR_RGBA2BGR)
         if rendered_bgr.shape[:2] != (img_h, img_w):
             rendered_bgr = cv2.resize(rendered_bgr, (img_w, img_h),
-                                       interpolation=cv2.INTER_LINEAR)
+                                    interpolation=cv2.INTER_LINEAR)
 
         # GUI colorbar 업데이트
         self.view.update_colorbar(vmin, vmax, label, 'turbo')

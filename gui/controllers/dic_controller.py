@@ -79,6 +79,7 @@ class DICController:
         self.view.set_callback('stop_analysis', self.runner.stop_analysis)
         self.view.set_callback('export_csv', self.exporter.export_csv)
         self.view.set_callback('export_image', self.exporter.export_image)
+        self.view.set_callback('export_dic_result', self.exporter.export_dic_result)
         self.view.set_callback('update_display', self.update_display)
         self.view.set_callback('fit_to_canvas', self.fit_to_canvas)
         self.view.set_callback('select_image_index', self.select_image_index)

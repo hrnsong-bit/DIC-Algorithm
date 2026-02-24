@@ -141,30 +141,40 @@ class SpeckleQualityGUI:
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="파일", menu=file_menu)
         file_menu.add_command(label="이미지 열기",
-                              command=lambda: self.controller.open_image(),
-                              accelerator="Ctrl+O")
+                            command=lambda: self.controller.open_image(),
+                            accelerator="Ctrl+O")
         file_menu.add_command(label="폴더 열기",
-                              command=lambda: self.controller.open_folder(),
-                              accelerator="Ctrl+Shift+O")
+                            command=lambda: self.controller.open_folder(),
+                            accelerator="Ctrl+Shift+O")
         file_menu.add_separator()
         file_menu.add_command(label="종료", command=self.root.quit)
 
         # 내보내기 메뉴
         export_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="내보내기", menu=export_menu)
+
+        # --- 품질평가 내보내기 ---
         export_menu.add_command(
-            label="CSV로 내보내기",
+            label="품질평가 → CSV",
             command=lambda: self._export('csv'))
         export_menu.add_command(
-            label="JSON으로 내보내기",
+            label="품질평가 → JSON",
             command=lambda: self._export('json'))
         export_menu.add_command(
-            label="요약 보고서 (TXT)",
+            label="품질평가 → 요약 보고서 (TXT)",
             command=lambda: self._export('txt'))
+
+        # --- 구분선 + DIC 결과 내보내기 ---
+        export_menu.add_separator()
+        export_menu.add_command(
+            label="DIC 결과 내보내기",
+            command=lambda: self.dic_controller.exporter.export_dic_result(),
+            accelerator="Ctrl+E")
 
         # 단축키 바인딩
         self.root.bind('<Control-o>', lambda e: self.controller.open_image())
         self.root.bind('<Control-O>', lambda e: self.controller.open_folder())
+        self.root.bind('<Control-e>', lambda e: self.dic_controller.exporter.export_dic_result())
 
     def _export(self, export_type: str, include_images: bool = False):
         """내보내기 실행"""
