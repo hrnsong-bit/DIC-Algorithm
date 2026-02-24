@@ -345,16 +345,50 @@ class FieldRenderer:
         return self._render_field_matplotlib(img, grid, ux, uy, "|D| (px)", False)
 
     def _draw_zncc_map(self, img, result):
-        """ZNCC 맵 시각화"""
+        """ZNCC 맵 시각화 — POI 점별 표시 (보간 없음)"""
         if result.n_points == 0:
             return img
 
-        grid, ux, uy = self._to_grid(result, result.zncc_values)
-        if grid.size == 0 or len(ux) < 3 or len(uy) < 3:
-            return img
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        cmap = plt.get_cmap('turbo')
 
-        return self._render_field_matplotlib(img, grid, ux, uy,
-                                              "ZNCC", False, vmin=0.0, vmax=1.0)
+        valid = result.valid_mask
+        zncc = result.zncc_values
+
+        # 컬러 범위
+        color_range = self.view.get_color_range()
+        if color_range is not None:
+            vmin, vmax = color_range
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        self.view.update_colorbar(vmin, vmax, "ZNCC", 'turbo')
+
+        # POI 반지름: spacing 기반 (겹치지 않을 정도)
+        spacing = getattr(result, 'spacing', 10)
+        radius = max(2, spacing // 4)
+
+        for idx in range(result.n_points):
+            x = int(result.points_x[idx])
+            y = int(result.points_y[idx])
+            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
+                continue
+
+            val = zncc[idx]
+            norm_val = np.clip((val - vmin) / (vmax - vmin + 1e-10), 0, 1)
+            r, g, b, _ = cmap(norm_val)
+            color = (int(b * 255), int(g * 255), int(r * 255))
+
+            if valid[idx]:
+                cv2.circle(img, (x, y), radius, color, -1)
+            else:
+                # 무효 POI: 회색 × 마커
+                cv2.circle(img, (x, y), radius, (128, 128, 128), -1)
+
+        return img
+
 
     def _draw_invalid_points(self, img, result):
         """불량 POI 시각화

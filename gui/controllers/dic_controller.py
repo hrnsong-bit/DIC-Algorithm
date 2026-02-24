@@ -13,9 +13,7 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox
 
-from speckle.core.initial_guess import (
-    warmup_fft_cc, FFTCCResult, ValidationResult
-)
+from speckle.core.initial_guess import warmup_fft_cc, FFTCCResult
 from speckle.io import load_image, get_image_files
 from ..models.app_state import AppState
 
@@ -46,7 +44,6 @@ class DICState:
 
     fft_cc_result: Optional[FFTCCResult] = None
     icgn_result: Optional[Any] = None
-    validation_result: Optional[ValidationResult] = None
     batch_results: Dict[str, Any] = field(default_factory=dict)
 
     is_running: bool = False
@@ -326,3 +323,61 @@ class DICController:
         self.state.pan_offset = (0, 0)
         self.view.zoom_label.configure(text="100%")
         self._refresh_display()
+        
+    def _setup_canvas_callbacks(self):
+        """캔버스 콜백 설정"""
+        self.view.canvas_view.on_zoom = self._handle_zoom
+        self.view.canvas_view.on_pan = self._handle_pan
+        self.view.canvas_view.on_roi_draw = self._handle_roi_draw
+        self.view.canvas_view.on_query_poi = self._query_poi    # ← 추가
+
+    def _query_poi(self, img_x: int, img_y: int) -> Optional[str]:
+        """
+        이미지 좌표에서 가장 가까운 POI 정보 반환
+
+        Returns:
+            POI 정보 문자열 (없으면 None)
+        """
+        result = self.state.icgn_result or self.state.fft_cc_result
+        if result is None or result.n_points == 0:
+            return None
+
+        # spacing 절반 이내의 POI만 반응
+        spacing = getattr(result, 'spacing', 10)
+        max_dist = spacing / 2
+
+        # 거리 계산 (벡터화)
+        dx = result.points_x - img_x
+        dy = result.points_y - img_y
+        dist = np.sqrt(dx * dx + dy * dy)
+
+        nearest_idx = np.argmin(dist)
+        if dist[nearest_idx] > max_dist:
+            return None
+
+        # 정보 조립
+        px = int(result.points_x[nearest_idx])
+        py = int(result.points_y[nearest_idx])
+        u = float(result.disp_u[nearest_idx])
+        v = float(result.disp_v[nearest_idx])
+        zncc = float(result.zncc_values[nearest_idx])
+        valid = bool(result.valid_mask[nearest_idx])
+
+        lines = [
+            f"POI ({px}, {py})",
+            f"U: {u:.4f}  V: {v:.4f}",
+            f"ZNCC: {zncc:.4f}",
+            f"{'Valid' if valid else 'Invalid'}",
+        ]
+
+        # IC-GN 결과면 gradient도 표시
+        is_icgn = hasattr(result, 'disp_ux') and result.disp_ux is not None
+        if is_icgn:
+            ux = float(result.disp_ux[nearest_idx])
+            uy = float(result.disp_uy[nearest_idx])
+            vx = float(result.disp_vx[nearest_idx])
+            vy = float(result.disp_vy[nearest_idx])
+            lines.append(f"ux: {ux:.6f}  uy: {uy:.6f}")
+            lines.append(f"vx: {vx:.6f}  vy: {vy:.6f}")
+
+        return "\n".join(lines)
