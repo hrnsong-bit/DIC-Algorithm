@@ -195,7 +195,16 @@ class DICTab(ttk.Frame):
                     textvariable=self.icgn_zncc_var, width=8).pack(side=tk.LEFT, padx=(5, 0))
         ttk.Label(icgn_zncc_frame, text="(최종 품질)", foreground="gray",
                 font=("", 8)).pack(side=tk.LEFT, padx=(5, 0))
-
+        
+        # Variable Subset (불연속 복원)
+        vs_frame = ttk.Frame(param_frame)
+        vs_frame.pack(fill=tk.X, pady=(4, 0))
+        self.variable_subset_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(vs_frame, text="Variable Subset (불연속 복원)",
+                        variable=self.variable_subset_var).pack(side=tk.LEFT)
+        ttk.Label(vs_frame, text="(크랙 근처 POI 자동 복원)", foreground="gray",
+                  font=("", 8)).pack(side=tk.LEFT, padx=(5, 0))
+        
         # Gaussian Blur
         blur_frame = ttk.Frame(param_frame)
         blur_frame.pack(fill=tk.X, pady=(5, 0))
@@ -535,6 +544,8 @@ class DICTab(ttk.Frame):
             'gaussian_blur_enabled': self.gaussian_blur_var.get(),
             'conv_threshold': self.conv_threshold_var.get(),
             'max_iter': self.max_iter_var.get(),
+            'enable_variable_subset': self.variable_subset_var.get(),
+
         }
 
     def set_parameters(self, params: Dict[str, Any]):
@@ -558,6 +569,8 @@ class DICTab(ttk.Frame):
                 self.conv_threshold_var.set(params['conv_threshold'])
             if params.get('max_iter') is not None:
                 self.max_iter_var.set(params['max_iter'])
+            if params.get('enable_variable_subset') is not None:
+                self.variable_subset_var.set(params['enable_variable_subset'])
             if params.get('gaussian_blur_enabled'):
                 self.gaussian_blur_var.set(True)
                 self._toggle_gaussian_blur()

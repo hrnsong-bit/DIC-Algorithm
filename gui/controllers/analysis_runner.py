@@ -101,7 +101,7 @@ class AnalysisRunner:
                     zncc_threshold=params.get('icgn_zncc_threshold', 0.85),  # IC-GN 전용 threshold
                     gaussian_blur=params.get('gaussian_blur'),
                     progress_callback=icgn_progress,
-                    
+                    enable_variable_subset=params.get('enable_variable_subset', True),
                 )
 
 
@@ -233,9 +233,9 @@ class AnalysisRunner:
                         interpolation_order=interp_order,
                         convergence_threshold=params['conv_threshold'],
                         max_iterations=params['max_iter'],
-                        zncc_threshold=params.get('icgn_zncc_threshold', 0.85),  # IC-GN 전용 threshold
+                        zncc_threshold=params.get('icgn_zncc_threshold', 0.85),
                         gaussian_blur=params.get('gaussian_blur'),
-                        
+                        enable_variable_subset=params.get('enable_variable_subset', True),
                         ref_cache=ref_cache,
                     )
 
@@ -355,7 +355,7 @@ class AnalysisRunner:
                         max_iterations=params['max_iter'],
                         zncc_threshold=params.get('icgn_zncc_threshold', 0.85),  # IC-GN 전용 threshold
                         gaussian_blur=params.get('gaussian_blur'),
-                        
+                        enable_variable_subset=params.get('enable_variable_subset', True),
                         ref_cache=ref_cache,
                     )
 
