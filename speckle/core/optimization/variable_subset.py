@@ -79,45 +79,29 @@ def _detect_grid_structure(points_x, points_y):
 def _build_neighbor_valid(
     bad_indices, points_x, points_y,
     valid_mask, zncc_values, zncc_threshold,
-    ny, nx
+    ny, nx, min_valid_neighbors=2  # 하위 호환용, 실제로는 사용 안 함
 ):
-    """
-    각 불량 POI의 8방위 이웃 valid 여부를 판정한다.
-
-    이웃 인덱스 매핑 (격자 기반):
-        [0]=NW (iy-1, ix-1) → S1(SE 확장)
-        [1]=N  (iy-1, ix  ) → S2(S 확장)
-        [2]=NE (iy-1, ix+1) → S3(SW 확장)
-        [3]=W  (iy,   ix-1) → S4(E 확장)
-        [4]=E  (iy,   ix+1) → S5(W 확장)
-        [5]=SW (iy+1, ix-1) → S6(NE 확장)
-        [6]=S  (iy+1, ix  ) → S7(N 확장)
-        [7]=SE (iy+1, ix+1) → S8(NW 확장)
-
-    Args:
-        bad_indices: 불량 POI 인덱스 배열 (n_bad,)
-        points_x, points_y: 전체 POI 좌표
-        valid_mask: 1단계 IC-GN valid 마스크 (n_poi,)
-        zncc_values: 1단계 ZNCC 값 (n_poi,)
-        zncc_threshold: C₀
-        ny, nx: 격자 크기
-
-    Returns:
-        all_neighbor_valid: (n_bad, 8) boolean
-    """
     n_bad = len(bad_indices)
     all_neighbor_valid = np.zeros((n_bad, 8), dtype=np.bool_)
 
     # 8방위 오프셋 (dy, dx)
     offsets = [
-        (-1, -1),  # 0: NW
-        (-1,  0),  # 1: N
-        (-1, +1),  # 2: NE
-        ( 0, -1),  # 3: W
-        ( 0, +1),  # 4: E
-        (+1, -1),  # 5: SW
-        (+1,  0),  # 6: S
-        (+1, +1),  # 7: SE
+        (-1, -1), (-1, 0), (-1, +1),
+        ( 0, -1),          ( 0, +1),
+        (+1, -1), (+1, 0), (+1, +1),
+    ]
+
+    # 연속 3이웃 그룹 → 대응 서브셋
+    # (이웃 인덱스 3개, 서브셋 인덱스)
+    triplet_to_subset = [
+        ([0, 1, 2], 6),  # NW,N,NE  → S7 (N 확장)
+        ([1, 2, 4], 5),  # N,NE,E   → S6 (NE 확장)
+        ([2, 4, 7], 3),  # NE,E,SE  → S4 (E 확장)
+        ([4, 7, 6], 0),  # E,SE,S   → S1 (SE 확장)
+        ([7, 6, 5], 1),  # SE,S,SW  → S2 (S 확장)
+        ([6, 5, 3], 2),  # S,SW,W   → S3 (SW 확장)
+        ([5, 3, 0], 4),  # SW,W,NW  → S5 (W 확장)
+        ([3, 0, 1], 7),  # W,NW,N   → S8 (NW 확장)
     ]
 
     for k in range(n_bad):
@@ -125,17 +109,33 @@ def _build_neighbor_valid(
         iy = flat_idx // nx
         ix = flat_idx % nx
 
-        for d, (dy, dx) in enumerate(offsets):
+        # 8방위 이웃 ZNCC 수집
+        neighbor_zncc = np.full(8, -1.0)
+        neighbor_ok = np.zeros(8, dtype=np.bool_)
+
+        for d in range(8):
+            dy, dx = offsets[d]
             ny_new = iy + dy
             nx_new = ix + dx
+            if 0 <= ny_new < ny and 0 <= nx_new < nx:
+                nf = ny_new * nx + nx_new
+                if valid_mask[nf] and zncc_values[nf] >= zncc_threshold:
+                    neighbor_ok[d] = True
+                    neighbor_zncc[d] = zncc_values[nf]
 
-            # 격자 경계 체크
-            if ny_new < 0 or ny_new >= ny or nx_new < 0 or nx_new >= nx:
-                continue
+        # 연속 3이웃이 모두 valid한 그룹 찾기
+        best_mean_zncc = -1.0
+        best_subset_idx = -1
 
-            neighbor_flat = ny_new * nx + nx_new
-            if valid_mask[neighbor_flat] and zncc_values[neighbor_flat] >= zncc_threshold:
-                all_neighbor_valid[k, d] = True
+        for triplet, s_idx in triplet_to_subset:
+            if all(neighbor_ok[d] for d in triplet):
+                mean_z = np.mean([neighbor_zncc[d] for d in triplet])
+                if mean_z > best_mean_zncc:
+                    best_mean_zncc = mean_z
+                    best_subset_idx = s_idx
+
+        if best_subset_idx >= 0:
+            all_neighbor_valid[k, best_subset_idx] = True
 
     return all_neighbor_valid
 
