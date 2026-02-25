@@ -152,6 +152,7 @@ def compute_variable_subset_recalc(
     convergence_threshold=0.001,
     shape_function='affine',
     zncc_threshold=0.9,
+    max_recovery_passes=1,
 ):
     """
     Variable Subset 2단계 재계산 — 메인 래퍼 함수.
@@ -254,50 +255,140 @@ def compute_variable_subset_recalc(
     result_conv = np.empty(n_bad, dtype=np.bool_)
     result_fail = np.empty(n_bad, dtype=np.int32)
     result_subset = np.empty(n_bad, dtype=np.int32)
+    
+    # === 5. 반복적 복원 ===
+    total_recovered = 0
+    all_recovered = []
+    all_failed = []
+    all_subset_types = np.full(n_bad, -1, dtype=np.int32)
 
-    # === 5. 배치 병렬 처리 ===
-    process_bad_pois_parallel(
-        ref_image, grad_x, grad_y,
-        coeffs, order,
-        points_x, points_y,
-        initial_u, initial_v,
-        subset_size, max_iterations, convergence_threshold,
-        shape_type,
-        bad_indices,
-        all_neighbor_valid,
-        zncc_threshold,
-        result_p, result_zncc, result_iter, result_conv, result_fail, result_subset,
-        batch_bufs['f'], batch_bufs['dfdx'], batch_bufs['dfdy'],
-        batch_bufs['J'], batch_bufs['H'], batch_bufs['H_inv'],
-        batch_bufs['p'], batch_bufs['xsi_w'], batch_bufs['eta_w'],
-        batch_bufs['x_def'], batch_bufs['y_def'],
-        batch_bufs['g'], batch_bufs['b'], batch_bufs['dp'], batch_bufs['p_new'],
-        batch_bufs['xsi_local'], batch_bufs['eta_local'],
-    )
+    current_bad = bad_indices.copy()
 
-    # === 6. 결과 병합 ===
-    recovered_list = []
-    failed_list = []
+    for pass_num in range(max_recovery_passes):
+        n_current = len(current_bad)
+        if n_current == 0:
+            break
 
-    for k in range(n_bad):
-        flat_idx = bad_indices[k]
+        # 이웃 valid 재판정 (매 패스마다 갱신)
+        pass_neighbor_valid = _build_neighbor_valid(
+            current_bad, points_x, points_y,
+            valid_mask, zncc_values, zncc_threshold,
+            ny, nx
+        )
 
-        if result_conv[k] and result_zncc[k] >= zncc_threshold:
-            # 복원 성공 → 기존 결과 덮어쓰기
-            valid_mask[flat_idx] = True
-            zncc_values[flat_idx] = result_zncc[k]
-            parameters[flat_idx, :n_params] = result_p[k, :]
-            convergence_flags[flat_idx] = True
-            iteration_counts[flat_idx] = result_iter[k]
-            failure_reasons[flat_idx] = ICGN_SUCCESS
-            recovered_list.append(flat_idx)
-        else:
-            failed_list.append(flat_idx)
+        # 시도 가능한 POI 필터
+        has_candidate = np.any(pass_neighbor_valid, axis=1)
+        n_candidates = int(np.sum(has_candidate))
 
-    recovered_indices = np.array(recovered_list, dtype=np.int64)
-    failed_indices = np.array(failed_list, dtype=np.int64)
-    n_recovered = len(recovered_list)
-    n_failed = len(failed_list)
+        if n_candidates == 0:
+            all_failed.extend(current_bad.tolist())
+            if max_recovery_passes > 1:
+                logger.info("  Pass %d: 시도 가능한 후보 없음 — 반복 종료",
+                            pass_num + 1)
+            break
+
+        candidate_indices = current_bad[has_candidate]
+        candidate_neighbor = pass_neighbor_valid[has_candidate]
+        n_cand = len(candidate_indices)
+
+        # 버퍼 할당
+        batch_bufs = allocate_variable_batch_buffers(n_cand, n_pixels, n_params)
+        result_p = np.empty((n_cand, n_params), dtype=np.float64)
+        result_zncc = np.empty(n_cand, dtype=np.float64)
+        result_iter = np.empty(n_cand, dtype=np.int32)
+        result_conv = np.empty(n_cand, dtype=np.bool_)
+        result_fail = np.empty(n_cand, dtype=np.int32)
+        result_subset = np.empty(n_cand, dtype=np.int32)
+
+        # 초기값 전파: initial_u/v가 0인 POI에 이웃 변위 평균 대입
+        for k in range(n_cand):
+            fidx = candidate_indices[k]
+            if abs(initial_u[fidx]) < 1e-10 and abs(initial_v[fidx]) < 1e-10:
+                iy = fidx // nx
+                ix = fidx % nx
+                sum_u, sum_v, cnt = 0.0, 0.0, 0
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        if dy == 0 and dx == 0:
+                            continue
+                        niy, nix = iy + dy, ix + dx
+                        if 0 <= niy < ny and 0 <= nix < nx:
+                            nf = niy * nx + nix
+                            if valid_mask[nf] and zncc_values[nf] >= zncc_threshold:
+                                sum_u += parameters[nf, 0]
+                                if n_params >= 6:
+                                    sum_v += parameters[nf, 3]
+                                cnt += 1
+                if cnt > 0:
+                    initial_u[fidx] = sum_u / cnt
+                    initial_v[fidx] = sum_v / cnt
+
+        # 배치 처리
+        process_bad_pois_parallel(
+            ref_image, grad_x, grad_y,
+            coeffs, order,
+            points_x, points_y,
+            initial_u, initial_v,
+            subset_size, max_iterations, convergence_threshold,
+            shape_type,
+            candidate_indices, candidate_neighbor, zncc_threshold,
+            result_p, result_zncc, result_iter, result_conv,
+            result_fail, result_subset,
+            batch_bufs['f'], batch_bufs['dfdx'], batch_bufs['dfdy'],
+            batch_bufs['J'], batch_bufs['H'], batch_bufs['H_inv'],
+            batch_bufs['p'], batch_bufs['xsi_w'], batch_bufs['eta_w'],
+            batch_bufs['x_def'], batch_bufs['y_def'],
+            batch_bufs['g'], batch_bufs['b'], batch_bufs['dp'],
+            batch_bufs['p_new'],
+            batch_bufs['xsi_local'], batch_bufs['eta_local'],
+        )
+
+        # 결과 병합
+        pass_recovered = 0
+        next_bad = []
+        no_candidate_indices = current_bad[~has_candidate]
+
+        for k in range(n_cand):
+            fidx = candidate_indices[k]
+            # bad_indices 내 원래 위치 찾기
+            orig_k = np.searchsorted(bad_indices, fidx)
+
+            if result_conv[k] and result_zncc[k] >= zncc_threshold:
+                valid_mask[fidx] = True
+                zncc_values[fidx] = result_zncc[k]
+                parameters[fidx, :n_params] = result_p[k, :]
+                convergence_flags[fidx] = True
+                iteration_counts[fidx] = result_iter[k]
+                failure_reasons[fidx] = 0  # ICGN_SUCCESS
+                all_recovered.append(fidx)
+                if orig_k < n_bad:
+                    all_subset_types[orig_k] = result_subset[k]
+                pass_recovered += 1
+            else:
+                next_bad.append(fidx)
+
+        total_recovered += pass_recovered
+
+        if max_recovery_passes > 1:
+            logger.info("  Pass %d: %d개 시도 → %d개 복원",
+                        pass_num + 1, n_cand, pass_recovered)
+
+        if pass_recovered == 0:
+            all_failed.extend(next_bad)
+            all_failed.extend(no_candidate_indices.tolist())
+            break
+
+        # 다음 패스용 불량 목록 갱신
+        next_bad.extend(no_candidate_indices.tolist())
+        current_bad = np.array(next_bad, dtype=np.int64)
+    else:
+        # max_recovery_passes 소진
+        all_failed.extend(current_bad.tolist())
+
+    recovered_indices = np.array(all_recovered, dtype=np.int64)
+    failed_indices = np.array(all_failed, dtype=np.int64)
+    n_recovered = len(all_recovered)
+    n_failed = len(all_failed)
 
     elapsed = time.time() - t_start
     logger.info(
@@ -311,6 +402,6 @@ def compute_variable_subset_recalc(
         'n_failed': n_failed,
         'recovered_indices': recovered_indices,
         'failed_indices': failed_indices,
-        'subset_types': result_subset.copy(),
+        'subset_types': all_subset_types,
         'elapsed_time': elapsed,
     }

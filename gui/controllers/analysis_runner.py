@@ -102,6 +102,8 @@ class AnalysisRunner:
                     gaussian_blur=params.get('gaussian_blur'),
                     progress_callback=icgn_progress,
                     enable_variable_subset=params.get('enable_variable_subset', True),
+                    max_recovery_passes=params.get('max_recovery_passes', 1),
+
                 )
 
 
@@ -237,6 +239,7 @@ class AnalysisRunner:
                         gaussian_blur=params.get('gaussian_blur'),
                         enable_variable_subset=params.get('enable_variable_subset', True),
                         ref_cache=ref_cache,
+                        max_recovery_passes=params.get('max_recovery_passes', 1),
                     )
 
                     self.state.batch_results[filename] = icgn_result
@@ -357,6 +360,7 @@ class AnalysisRunner:
                         gaussian_blur=params.get('gaussian_blur'),
                         enable_variable_subset=params.get('enable_variable_subset', True),
                         ref_cache=ref_cache,
+                        max_recovery_passes=params.get('max_recovery_passes', 1),
                     )
 
                     self.state.batch_results[filename] = icgn_result

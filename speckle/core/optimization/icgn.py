@@ -115,6 +115,7 @@ def compute_icgn(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     ref_cache: Optional[dict] = None,
     enable_variable_subset: bool = True,
+    max_recovery_passes: int = 1,
 ) -> ICGNResult:
     """
     IC-GN 서브픽셀 최적화 (Numba JIT + prange)
@@ -149,7 +150,7 @@ def compute_icgn(
         subset_size, max_iterations, convergence_threshold,
         zncc_threshold, interpolation_order, shape_function,
         gaussian_blur, progress_callback, ref_cache,
-        enable_variable_subset,
+        enable_variable_subset,max_recovery_passes,
     )
 
 
@@ -160,7 +161,7 @@ def _compute_icgn_numba(
     subset_size, max_iterations, convergence_threshold,
     zncc_threshold, interpolation_order, shape_function,
     gaussian_blur, progress_callback, ref_cache=None,
-    enable_variable_subset=True,
+    enable_variable_subset=True,max_recovery_passes=1
 ) -> ICGNResult:
     """Numba JIT + prange 병렬화 경로"""
     start_time = time.time()
@@ -367,6 +368,7 @@ def _compute_icgn_numba(
             convergence_threshold=convergence_threshold,
             shape_function=shape_function,
             zncc_threshold=zncc_threshold,
+            max_recovery_passes=max_recovery_passes,
         )
 
         # 2단계 결과 반영 후 통계 갱신

@@ -202,8 +202,11 @@ class DICTab(ttk.Frame):
         self.variable_subset_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(vs_frame, text="Variable Subset (불연속 복원)",
                         variable=self.variable_subset_var).pack(side=tk.LEFT)
-        ttk.Label(vs_frame, text="(크랙 근처 POI 자동 복원)", foreground="gray",
-                  font=("", 8)).pack(side=tk.LEFT, padx=(5, 0))
+        self.recovery_passes_var = tk.IntVar(value=1)
+        ttk.Spinbox(vs_frame, from_=1, to=5, width=2,
+                    textvariable=self.recovery_passes_var).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Label(vs_frame, text="회", foreground="gray",
+                  font=("", 8)).pack(side=tk.LEFT)
         
         # Gaussian Blur
         blur_frame = ttk.Frame(param_frame)
@@ -536,8 +539,8 @@ class DICTab(ttk.Frame):
             'subset_size': self.subset_var.get(),
             'spacing': self.spacing_var.get(),
             'search_range': self.search_var.get(),
-            'zncc_threshold': self.zncc_var.get(),          # FFT-CC용 (0.3 기본)
-            'icgn_zncc_threshold': self.icgn_zncc_var.get(), # IC-GN용 (0.85 기본)
+            'zncc_threshold': self.zncc_var.get(),
+            'icgn_zncc_threshold': self.icgn_zncc_var.get(),
             'shape_function': self.shape_func_var.get(),
             'interpolation': self.interp_var.get(),
             'gaussian_blur': gaussian_blur,
@@ -545,7 +548,7 @@ class DICTab(ttk.Frame):
             'conv_threshold': self.conv_threshold_var.get(),
             'max_iter': self.max_iter_var.get(),
             'enable_variable_subset': self.variable_subset_var.get(),
-
+            'max_recovery_passes': self.recovery_passes_var.get(),
         }
 
     def set_parameters(self, params: Dict[str, Any]):
@@ -571,6 +574,8 @@ class DICTab(ttk.Frame):
                 self.max_iter_var.set(params['max_iter'])
             if params.get('enable_variable_subset') is not None:
                 self.variable_subset_var.set(params['enable_variable_subset'])
+            if 'max_recovery_passes' in params:
+                self.recovery_passes_var.set(params['max_recovery_passes'])
             if params.get('gaussian_blur_enabled'):
                 self.gaussian_blur_var.set(True)
                 self._toggle_gaussian_blur()
