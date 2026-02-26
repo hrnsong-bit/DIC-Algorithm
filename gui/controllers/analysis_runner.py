@@ -103,6 +103,7 @@ class AnalysisRunner:
                     progress_callback=icgn_progress,
                     enable_variable_subset=params.get('enable_variable_subset', True),
                     max_recovery_passes=params.get('max_recovery_passes', 1),
+                    enable_adss_subset=params.get('enable_adss_subset', False),
 
                 )
 
@@ -240,6 +241,7 @@ class AnalysisRunner:
                         enable_variable_subset=params.get('enable_variable_subset', True),
                         ref_cache=ref_cache,
                         max_recovery_passes=params.get('max_recovery_passes', 1),
+                        enable_adss_subset=params.get('enable_adss_subset', False),
                     )
 
                     self.state.batch_results[filename] = icgn_result
@@ -361,6 +363,7 @@ class AnalysisRunner:
                         enable_variable_subset=params.get('enable_variable_subset', True),
                         ref_cache=ref_cache,
                         max_recovery_passes=params.get('max_recovery_passes', 1),
+                        enable_adss_subset=params.get('enable_adss_subset', False),
                     )
 
                     self.state.batch_results[filename] = icgn_result

@@ -199,14 +199,24 @@ class DICTab(ttk.Frame):
         # Variable Subset (불연속 복원)
         vs_frame = ttk.Frame(param_frame)
         vs_frame.pack(fill=tk.X, pady=(4, 0))
-        self.variable_subset_var = tk.BooleanVar(value=True)
+        self.variable_subset_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(vs_frame, text="Variable Subset (불연속 복원)",
-                        variable=self.variable_subset_var).pack(side=tk.LEFT)
+                        variable=self.variable_subset_var,
+                        command=self._on_variable_subset_toggle).pack(side=tk.LEFT)
         self.recovery_passes_var = tk.IntVar(value=1)
         ttk.Spinbox(vs_frame, from_=1, to=5, width=2,
                     textvariable=self.recovery_passes_var).pack(side=tk.LEFT, padx=(5, 0))
         ttk.Label(vs_frame, text="회", foreground="gray",
                   font=("", 8)).pack(side=tk.LEFT)
+
+        # ADSS-DIC (서브셋 분할 복원)
+        adss_frame = ttk.Frame(param_frame)
+        adss_frame.pack(fill=tk.X, pady=(4, 0))
+        self.adss_subset_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(adss_frame, text="ADSS-DIC (서브셋 분할 복원)",
+                        variable=self.adss_subset_var,
+                        command=self._on_adss_toggle).pack(side=tk.LEFT)
+
         
         # Gaussian Blur
         blur_frame = ttk.Frame(param_frame)
@@ -508,6 +518,16 @@ class DICTab(ttk.Frame):
     def _update_display(self):
         self._call('update_display', self.display_mode_var.get())
 
+    def _on_variable_subset_toggle(self):
+        """Variable Subset 활성화 시 ADSS 비활성화."""
+        if self.variable_subset_var.get():
+            self.adss_subset_var.set(False)
+
+    def _on_adss_toggle(self):
+        """ADSS 활성화 시 Variable Subset 비활성화."""
+        if self.adss_subset_var.get():
+            self.variable_subset_var.set(False)
+
     def _toggle_gaussian_blur(self):
         if self.gaussian_blur_var.get():
             self.blur_kernel_combo.configure(state='readonly')
@@ -548,6 +568,7 @@ class DICTab(ttk.Frame):
             'conv_threshold': self.conv_threshold_var.get(),
             'max_iter': self.max_iter_var.get(),
             'enable_variable_subset': self.variable_subset_var.get(),
+            'enable_adss_subset': self.adss_subset_var.get(),
             'max_recovery_passes': self.recovery_passes_var.get(),
         }
 
@@ -574,6 +595,8 @@ class DICTab(ttk.Frame):
                 self.max_iter_var.set(params['max_iter'])
             if params.get('enable_variable_subset') is not None:
                 self.variable_subset_var.set(params['enable_variable_subset'])
+            if params.get('enable_adss_subset') is not None:
+                self.adss_subset_var.set(params['enable_adss_subset'])
             if 'max_recovery_passes' in params:
                 self.recovery_passes_var.set(params['max_recovery_passes'])
             if params.get('gaussian_blur_enabled'):

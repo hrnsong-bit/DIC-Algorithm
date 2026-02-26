@@ -115,6 +115,7 @@ def compute_icgn(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     ref_cache: Optional[dict] = None,
     enable_variable_subset: bool = True,
+    enable_adss_subset: bool = False,
     max_recovery_passes: int = 1,
 ) -> ICGNResult:
     """
@@ -150,9 +151,8 @@ def compute_icgn(
         subset_size, max_iterations, convergence_threshold,
         zncc_threshold, interpolation_order, shape_function,
         gaussian_blur, progress_callback, ref_cache,
-        enable_variable_subset,max_recovery_passes,
+        enable_variable_subset, enable_adss_subset, max_recovery_passes,
     )
-
 
 # ===== Numba 경로 =====
 
@@ -161,8 +161,10 @@ def _compute_icgn_numba(
     subset_size, max_iterations, convergence_threshold,
     zncc_threshold, interpolation_order, shape_function,
     gaussian_blur, progress_callback, ref_cache=None,
-    enable_variable_subset=True,max_recovery_passes=1
+    enable_variable_subset=True, enable_adss_subset=False,
+    max_recovery_passes=1
 ) -> ICGNResult:
+    
     """Numba JIT + prange 병렬화 경로"""
     start_time = time.time()
 
@@ -340,11 +342,43 @@ def _compute_icgn_numba(
         )
         _logger.info(f"IC-GN 불량 ZNCC 구간: {bin_info}")
 
-    # ── Variable Subset 2단계 재계산 ──────────────────────────────
-    if enable_variable_subset:
+       # ── 2단계 재계산: ADSS-DIC 또는 Variable Subset ──────────────
+    if enable_adss_subset:
+        from .adss_subset import compute_adss_recalc
+
+        adss_report = compute_adss_recalc(
+            ref_gray, grad_x, grad_y,
+            coeffs, interpolation_order,
+            np.asarray(points_x, dtype=np.int64),
+            np.asarray(points_y, dtype=np.int64),
+            icgn_valid,
+            result_zncc,
+            result_p,
+            result_conv,
+            result_iter,
+            result_fail,
+            subset_size,
+            max_iterations=max_iterations,
+            convergence_threshold=convergence_threshold,
+            shape_function=shape_function,
+            zncc_threshold=zncc_threshold,
+        )
+
+        if adss_report['n_recovered'] > 0:
+            n_final_valid = int(np.sum(icgn_valid))
+            n_conv = int(np.sum(result_conv))
+            mean_zncc = (float(np.mean(result_zncc[icgn_valid]))
+                        if n_final_valid > 0 else 0.0)
+            processing_time = time.time() - start_time
+            _logger.info(
+                f"ADSS-DIC 반영 후: "
+                f"최종 valid: {n_final_valid}/{n_points}, "
+                f"mean_zncc={mean_zncc:.4f}, {processing_time:.3f}s"
+            )
+
+    elif enable_variable_subset:
         from .variable_subset import compute_variable_subset_recalc
 
-        # FFT-CC 초기 변위 (전체 POI 크기)
         full_initial_u = np.zeros(n_points, dtype=np.float64)
         full_initial_v = np.zeros(n_points, dtype=np.float64)
         if n_valid > 0:
@@ -357,12 +391,12 @@ def _compute_icgn_numba(
             np.asarray(points_x, dtype=np.int64),
             np.asarray(points_y, dtype=np.int64),
             full_initial_u, full_initial_v,
-            icgn_valid,          # valid_mask — in-place 업데이트됨
-            result_zncc,         # zncc_values — in-place 업데이트됨
-            result_p,            # parameters — in-place 업데이트됨
-            result_conv,         # convergence_flags — in-place 업데이트됨
-            result_iter,         # iteration_counts — in-place 업데이트됨
-            result_fail,         # failure_reasons — in-place 업데이트됨
+            icgn_valid,
+            result_zncc,
+            result_p,
+            result_conv,
+            result_iter,
+            result_fail,
             subset_size,
             max_iterations=max_iterations,
             convergence_threshold=convergence_threshold,
@@ -371,7 +405,6 @@ def _compute_icgn_numba(
             max_recovery_passes=max_recovery_passes,
         )
 
-        # 2단계 결과 반영 후 통계 갱신
         if vs_report['n_recovered'] > 0:
             n_final_valid = int(np.sum(icgn_valid))
             n_conv = int(np.sum(result_conv))
