@@ -388,3 +388,4 @@ def _compute_von_mises(
 ) -> np.ndarray:
     """von Mises 유효 변형률"""
     return np.sqrt(exx**2 + eyy**2 - exx * eyy + 3 * exy**2)
+

@@ -342,9 +342,14 @@ def _compute_icgn_numba(
         )
         _logger.info(f"IC-GN 불량 ZNCC 구간: {bin_info}")
 
-       # ── 2단계 재계산: ADSS-DIC 또는 Variable Subset ──────────────
+    # ── 2단계 재계산: ADSS-DIC 또는 Variable Subset ──────────────
+    adss_quarter_type_array = None
+
     if enable_adss_subset:
         from .adss_subset import compute_adss_recalc
+
+        # ADSS 전 bad mask 기억 (quarter_type 매핑용)
+        bad_mask_before = ~icgn_valid.copy()
 
         adss_report = compute_adss_recalc(
             ref_gray, grad_x, grad_y,
@@ -364,6 +369,14 @@ def _compute_icgn_numba(
             zncc_threshold=zncc_threshold,
         )
 
+        # quarter_type 배열 생성 (전체 POI 크기, 0=일반, 1~8=Q1~Q8)
+        adss_quarter_type_array = np.zeros(n_points, dtype=np.int32)
+        bad_indices_all = np.where(bad_mask_before)[0]
+        qt_all = adss_report['quarter_types']  # (n_bad,) 크기
+        for i, bi in enumerate(bad_indices_all):
+            if i < len(qt_all) and qt_all[i] > 0:
+                adss_quarter_type_array[bi] = qt_all[i]
+
         if adss_report['n_recovered'] > 0:
             n_final_valid = int(np.sum(icgn_valid))
             n_conv = int(np.sum(result_conv))
@@ -375,6 +388,7 @@ def _compute_icgn_numba(
                 f"최종 valid: {n_final_valid}/{n_points}, "
                 f"mean_zncc={mean_zncc:.4f}, {processing_time:.3f}s"
             )
+
 
     elif enable_variable_subset:
         from .variable_subset import compute_variable_subset_recalc
@@ -462,6 +476,7 @@ def _compute_icgn_numba(
         valid_mask=icgn_valid,
         fft_valid_mask=fft_valid,    
         failure_reason=result_fail,
+        adss_quarter_type=adss_quarter_type_array,
         subset_size=subset_size,
         max_iterations=max_iterations,
         convergence_threshold=convergence_threshold,
@@ -522,4 +537,5 @@ def _empty_result(
         convergence_threshold=convergence_threshold,
         processing_time=0.0,
         shape_function=shape_function,
+        adss_quarter_type=None,
     )

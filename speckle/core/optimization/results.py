@@ -69,6 +69,9 @@ class ICGNResult:
     # 실패 원인 (POI별)
     failure_reason: np.ndarray = None
 
+    # ADSS-DIC quarter-type (POI별, 0=일반, 1~8=Q1~Q8)
+    adss_quarter_type: Optional[np.ndarray] = None
+
     # 메타데이터
     subset_size: int = 21
     max_iterations: int = 50

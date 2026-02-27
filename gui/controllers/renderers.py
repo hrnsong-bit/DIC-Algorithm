@@ -17,7 +17,6 @@ class FieldRenderer:
 
     def __init__(self, ctrl):
         self.ctrl = ctrl
-        # PLS 변형률 캐시: (result_id, window_size, poly_order, grid_step) → PLSStrainResult
         self._strain_cache = {}
         self._strain_cache_key = None
 
@@ -58,14 +57,154 @@ class FieldRenderer:
 
         return display_img
 
-    # ===== matplotlib 기반 렌더링 =====
+    # ===== 새 렌더러: 서브셋 영역 직접 채색 =====
+
+    def _render_field_subset(self, img: np.ndarray, result,
+                              values: np.ndarray, label: str,
+                              symmetric: bool) -> np.ndarray:
+        """각 POI의 값을 서브셋 영역에 직접 칠하는 렌더러
+
+        보간 없음. ADSS 복구 POI는 quarter-type에 따라 절반만 채색.
+        invalid 영역은 투명(배경 투과).
+        """
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        valid = result.valid_mask
+        valid_values = values[valid]
+        if len(valid_values) == 0:
+            return img
+
+        # === 값 범위 결정 ===
+        color_range = self.view.get_color_range()
+        if color_range is not None:
+            vmin, vmax = color_range
+        else:
+            p2, p98 = np.percentile(valid_values, [2, 98])
+            if symmetric:
+                v_abs = max(abs(p2), abs(p98))
+                if v_abs < 1e-10:
+                    v_abs = max(abs(np.min(valid_values)), abs(np.max(valid_values)))
+                if v_abs < 1e-15:
+                    v_abs = 1e-6
+                vmin, vmax = -v_abs, v_abs
+            else:
+                vmin, vmax = p2, p98
+                if abs(vmax - vmin) < 1e-15:
+                    vmin, vmax = vmin - 1e-6, vmax + 1e-6
+
+        # === spacing 추정 ===
+        px_valid = result.points_x[valid]
+        unique_x = np.unique(px_valid)
+        spacing = int(round(np.median(np.diff(unique_x)))) if len(unique_x) > 1 else 20
+        half_sp = spacing // 2
+
+        # === ADSS quarter-type 배열 ===
+        has_qt = (hasattr(result, 'adss_quarter_type')
+                  and result.adss_quarter_type is not None)
+
+        # === 배경 이미지 ===
+        if len(img.shape) == 3:
+            gray_bg = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_bg = img.copy()
+        overlay = (gray_bg.astype(np.float32) * 0.3)
+        overlay = cv2.cvtColor(overlay.astype(np.uint8), cv2.COLOR_GRAY2BGR).astype(np.float32)
+
+        img_h, img_w = img.shape[:2]
+        cmap = plt.get_cmap('turbo')
+        alpha = 0.9
+
+        # === 각 POI 서브셋 영역 채색 ===
+        for idx in range(result.n_points):
+            if not valid[idx]:
+                continue
+
+            cx = int(result.points_x[idx])
+            cy = int(result.points_y[idx])
+            val = values[idx]
+
+            norm_val = np.clip((val - vmin) / (vmax - vmin + 1e-15), 0, 1)
+            r, g, b, _ = cmap(norm_val)
+            color_bgr = np.array([b * 255, g * 255, r * 255], dtype=np.float32)
+
+            # quarter-type에 따른 영역 결정
+            qt = 0
+            if has_qt:
+                qt = int(result.adss_quarter_type[idx])
+
+            if qt == 0:
+                # 일반 POI: 전체 spacing × spacing
+                x1 = max(0, cx - half_sp)
+                x2 = min(img_w, cx + half_sp + 1)
+                y1 = max(0, cy - half_sp)
+                y2 = min(img_h, cy + half_sp + 1)
+            elif qt == 1:  # Q1: Upper half (η: -M~0)
+                x1 = max(0, cx - half_sp)
+                x2 = min(img_w, cx + half_sp + 1)
+                y1 = max(0, cy - half_sp)
+                y2 = min(img_h, cy + 1)
+            elif qt == 2:  # Q2: Lower half (η: 0~+M)
+                x1 = max(0, cx - half_sp)
+                x2 = min(img_w, cx + half_sp + 1)
+                y1 = max(0, cy)
+                y2 = min(img_h, cy + half_sp + 1)
+            elif qt == 3:  # Q3: Left half (ξ: -M~0)
+                x1 = max(0, cx - half_sp)
+                x2 = min(img_w, cx + 1)
+                y1 = max(0, cy - half_sp)
+                y2 = min(img_h, cy + half_sp + 1)
+            elif qt == 4:  # Q4: Right half (ξ: 0~+M)
+                x1 = max(0, cx)
+                x2 = min(img_w, cx + half_sp + 1)
+                y1 = max(0, cy - half_sp)
+                y2 = min(img_h, cy + half_sp + 1)
+            elif qt == 5:  # Q5: Upper-left
+                x1 = max(0, cx - half_sp)
+                x2 = min(img_w, cx + 1)
+                y1 = max(0, cy - half_sp)
+                y2 = min(img_h, cy + 1)
+            elif qt == 6:  # Q6: Upper-right
+                x1 = max(0, cx)
+                x2 = min(img_w, cx + half_sp + 1)
+                y1 = max(0, cy - half_sp)
+                y2 = min(img_h, cy + 1)
+            elif qt == 7:  # Q7: Lower-left
+                x1 = max(0, cx - half_sp)
+                x2 = min(img_w, cx + 1)
+                y1 = max(0, cy)
+                y2 = min(img_h, cy + half_sp + 1)
+            elif qt == 8:  # Q8: Lower-right
+                x1 = max(0, cx)
+                x2 = min(img_w, cx + half_sp + 1)
+                y1 = max(0, cy)
+                y2 = min(img_h, cy + half_sp + 1)
+            else:
+                x1 = max(0, cx - half_sp)
+                x2 = min(img_w, cx + half_sp + 1)
+                y1 = max(0, cy - half_sp)
+                y2 = min(img_h, cy + half_sp + 1)
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            overlay[y1:y2, x1:x2] = (
+                overlay[y1:y2, x1:x2] * (1 - alpha) + color_bgr * alpha
+            )
+
+        result_img = np.clip(overlay, 0, 255).astype(np.uint8)
+        self.view.update_colorbar(vmin, vmax, label, 'turbo')
+        return result_img
+
+    # ===== 기존 matplotlib 렌더러 (보간 포함 — 참고용 보존) =====
 
     def _render_field_matplotlib(self, img: np.ndarray, grid: np.ndarray,
                                 unique_x: np.ndarray, unique_y: np.ndarray,
                                 label: str, symmetric: bool,
                                 vmin: float = None, vmax: float = None) -> np.ndarray:
         """matplotlib Agg 백엔드로 필드를 렌더링하여 numpy 배열 반환
-        
+
         NaN 영역은 투명 처리하되, 유효 데이터는 부드럽게 업샘플링.
         방법: 가중치 기반 선형 보간 후 RGBA alpha 채널로 NaN 마스킹.
         """
@@ -80,7 +219,6 @@ class FieldRenderer:
         if len(valid_vals) == 0:
             return img
 
-        # === 값 범위 결정 ===
         color_range = self.view.get_color_range()
         if color_range is not None:
             vmin, vmax = color_range
@@ -98,19 +236,14 @@ class FieldRenderer:
                 if abs(vmax - vmin) < 1e-15:
                     vmin, vmax = vmin - 1e-6, vmax + 1e-6
 
-        # === 가중치 기반 업샘플링 ===
-        # NaN을 0으로 채운 그리드와 유효 마스크(1/0)를 동시에 보간
-        # 보간 후 weight > threshold인 영역만 유효로 표시
         nan_mask = np.isnan(grid)
         grid_filled = np.where(nan_mask, 0.0, grid)
         weight = (~nan_mask).astype(np.float64)
 
-        # POI 간격으로 업샘플 배율 결정
         spacing = unique_x[1] - unique_x[0] if len(unique_x) > 1 else 1.0
         upsample = max(1, int(round(spacing)))
 
         if upsample > 1 and grid.shape[0] >= 3 and grid.shape[1] >= 3:
-            # RegularGridInterpolator로 선형 보간
             yi_orig = np.arange(grid.shape[0]).astype(np.float64)
             xi_orig = np.arange(grid.shape[1]).astype(np.float64)
 
@@ -133,12 +266,10 @@ class FieldRenderer:
             val_up = interp_val(pts).reshape(ny_up, nx_up)
             w_up = interp_w(pts).reshape(ny_up, nx_up)
 
-            # 가중치 정규화: weight > 0.3이면 유효
             valid_up = w_up > 0.3
             val_up[valid_up] /= w_up[valid_up]
             val_up[~valid_up] = np.nan
 
-            # 업샘플된 그리드의 실제 좌표 범위
             ux_up = np.linspace(float(unique_x[0]), float(unique_x[-1]), nx_up)
             uy_up = np.linspace(float(unique_y[0]), float(unique_y[-1]), ny_up)
         else:
@@ -146,27 +277,22 @@ class FieldRenderer:
             ux_up = unique_x
             uy_up = unique_y
 
-        # === RGBA 생성 (NaN → 투명) ===
         cmap = plt.get_cmap('turbo')
         norm = Normalize(vmin=vmin, vmax=vmax)
 
-        # 정규화 후 colormap 적용
         val_clipped = np.clip(val_up, vmin, vmax)
-        val_safe = np.where(np.isnan(val_up), 0.0, val_up)  # NaN → 0 (어차피 투명 처리)
+        val_safe = np.where(np.isnan(val_up), 0.0, val_up)
         val_normed = np.clip((val_safe - vmin) / (vmax - vmin + 1e-15), 0, 1)
         rgba = cmap(val_normed)
 
-        # NaN 영역 투명
         nan_up = np.isnan(val_up)
         rgba[nan_up, 3] = 0.0
         rgba[~nan_up, 3] = 0.9
 
-        # === Figure 생성 ===
         img_h, img_w = img.shape[:2]
         fig = plt.figure(figsize=(img_w / 100, img_h / 100), dpi=100)
         ax = fig.add_axes([0, 0, 1, 1])
 
-        # 배경: 시편 이미지 (어둡게)
         if len(img.shape) == 3:
             gray_bg = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         else:
@@ -182,7 +308,6 @@ class FieldRenderer:
         ax.set_ylim(img_h, 0)
         ax.axis('off')
 
-        # === Figure → numpy ===
         canvas_agg = FigureCanvasAgg(fig)
         canvas_agg.draw()
         rendered = np.asarray(canvas_agg.buffer_rgba())
@@ -193,7 +318,6 @@ class FieldRenderer:
             rendered_bgr = cv2.resize(rendered_bgr, (img_w, img_h),
                                     interpolation=cv2.INTER_LINEAR)
 
-        # GUI colorbar 업데이트
         self.view.update_colorbar(vmin, vmax, label, 'turbo')
 
         return rendered_bgr
@@ -209,23 +333,21 @@ class FieldRenderer:
         unique_y = np.unique(py)
         nx, ny = len(unique_x), len(unique_y)
 
-        # 정렬된 좌표 → 인덱스 매핑 (searchsorted 활용)
         xi = np.searchsorted(unique_x, px)
         yi = np.searchsorted(unique_y, py)
 
         grid = np.full((ny, nx), np.nan)
         v_valid = values[valid]
 
-        # 범위 내 인덱스만 기록
         in_bounds = (xi < nx) & (yi < ny)
         grid[yi[in_bounds], xi[in_bounds]] = v_valid[in_bounds]
 
         return grid, unique_x, unique_y
 
-    # ===== 개별 렌더러 =====
+    # ===== 개별 렌더러 (변위 — 서브셋 직접 채색) =====
 
     def _draw_scalar_field(self, img, result, field_type):
-        """변위 필드 시각화"""
+        """변위 필드 시각화 — 서브셋 영역 직접 채색"""
         if result.n_points == 0:
             return img
 
@@ -237,12 +359,8 @@ class FieldRenderer:
             values = np.sqrt(result.disp_u**2 + result.disp_v**2)
             label = "|D| (px)"
 
-        grid, ux, uy = self._to_grid(result, values)
-        if grid.size == 0 or len(ux) < 3 or len(uy) < 3:
-            return img
-
         symmetric = field_type in ('u', 'v')
-        return self._render_field_matplotlib(img, grid, ux, uy, label, symmetric)
+        return self._render_field_subset(img, result, values, label, symmetric)
 
     def _get_strain_cache_key(self, result):
         """결과 객체의 고유 캐시 키 생성"""
@@ -255,7 +373,6 @@ class FieldRenderer:
         if cache_key == self._strain_cache_key and self._strain_cache:
             return self._strain_cache.get('strain')
 
-        # 캐시 미스: 새로 계산
         u_grid, _, _ = self._to_grid(result, result.disp_u)
         v_grid, _, _ = self._to_grid(result, result.disp_v)
 
@@ -265,7 +382,6 @@ class FieldRenderer:
                 u_grid, v_grid,
                 window_size=11, poly_order=2, grid_step=grid_step
             )
-            # 캐시 저장 (이전 캐시 제거)
             self._strain_cache = {'strain': strain}
             self._strain_cache_key = cache_key
             return strain
@@ -274,12 +390,12 @@ class FieldRenderer:
             return None
 
     def invalidate_strain_cache(self):
-        """변형률 캐시 무효화 (새 분석 결과 시 호출)"""
+        """변형률 캐시 무효화"""
         self._strain_cache = {}
         self._strain_cache_key = None
 
     def _draw_strain_field(self, img, result, strain_type):
-        """변형률 필드 시각화 (PLS, 캐시 적용)"""
+        """변형률 필드 시각화 — IC-GN gradient 직접 추출 + 서브셋 채색"""
         if result.n_points == 0:
             return img
 
@@ -289,36 +405,36 @@ class FieldRenderer:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return img
 
-        valid = result.valid_mask
-        px_valid = result.points_x[valid]
-        unique_x = np.unique(px_valid)
-        unique_y = np.unique(result.points_y[valid])
+        # IC-GN shape function gradient에서 직접 strain 계산
+        ux = result.disp_ux
+        uy = result.disp_uy
+        vx = result.disp_vx
+        vy = result.disp_vy
 
-        if len(unique_x) < 5 or len(unique_y) < 5:
-            return self._draw_strain_field_points(img, result, strain_type)
+        exx = ux
+        eyy = vy
+        exy = 0.5 * (uy + vx)
 
-        grid_step = float(np.median(np.diff(unique_x))) if len(unique_x) > 1 else 1.0
-
-        strain = self._get_cached_strain(result, grid_step)
-        if strain is None:
-            return self._draw_strain_field_points(img, result, strain_type)
+        e_mean = 0.5 * (exx + eyy)
+        R = np.sqrt(((exx - eyy) / 2.0)**2 + exy**2)
+        e1 = e_mean + R
+        von_mises = np.sqrt(exx**2 + eyy**2 - exx * eyy + 3.0 * exy**2)
 
         field_map = {
-            'exx': (strain.exx, "εxx"),
-            'eyy': (strain.eyy, "εyy"),
-            'exy': (strain.exy, "εxy"),
-            'e1':  (strain.e1, "ε₁"),
-            'von_mises': (strain.von_mises, "εᵥₘ")
+            'exx': (exx, "εxx"),
+            'eyy': (eyy, "εyy"),
+            'exy': (exy, "εxy"),
+            'e1':  (e1, "ε₁"),
+            'von_mises': (von_mises, "εᵥₘ"),
         }
 
         if strain_type not in field_map:
             return img
 
-        strain_2d, label = field_map[strain_type]
+        values, label = field_map[strain_type]
         symmetric = strain_type in ('exx', 'eyy', 'exy', 'e1')
 
-        return self._render_field_matplotlib(img, strain_2d, unique_x, unique_y,
-                                              label, symmetric)
+        return self._render_field_subset(img, result, values, label, symmetric)
 
     def _draw_strain_field_points(self, img, result, strain_type):
         """변형률 필드 점 시각화 (PLS 실패 시 fallback, turbo colormap)"""
@@ -349,7 +465,6 @@ class FieldRenderer:
 
         self.view.update_colorbar(vmin, vmax, label, 'turbo')
 
-        # turbo colormap 사용
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
@@ -363,7 +478,7 @@ class FieldRenderer:
             if strain.valid_mask[idx]:
                 norm_val = np.clip((values[idx] - vmin) / (vmax - vmin + 1e-10), 0, 1)
                 r, g, b, _ = cmap(norm_val)
-                color = (int(b * 255), int(g * 255), int(r * 255))  # BGR
+                color = (int(b * 255), int(g * 255), int(r * 255))
                 cv2.circle(img, (x, y), 4, color, -1)
             else:
                 cv2.circle(img, (x, y), 4, (128, 128, 128), -1)
@@ -397,16 +512,12 @@ class FieldRenderer:
         return img
 
     def _draw_magnitude(self, img, result):
-        """변위 크기 시각화"""
+        """변위 크기 시각화 — 서브셋 영역 직접 채색"""
         if result.n_points == 0:
             return img
 
         mag = np.sqrt(result.disp_u**2 + result.disp_v**2)
-        grid, ux, uy = self._to_grid(result, mag)
-        if grid.size == 0 or len(ux) < 3 or len(uy) < 3:
-            return img
-
-        return self._render_field_matplotlib(img, grid, ux, uy, "|D| (px)", False)
+        return self._render_field_subset(img, result, mag, "|D| (px)", False)
 
     def _draw_zncc_map(self, img, result):
         """ZNCC 맵 시각화 — POI 점별 표시 (보간 없음)"""
@@ -421,7 +532,6 @@ class FieldRenderer:
         valid = result.valid_mask
         zncc = result.zncc_values
 
-        # 컬러 범위
         color_range = self.view.get_color_range()
         if color_range is not None:
             vmin, vmax = color_range
@@ -430,7 +540,6 @@ class FieldRenderer:
 
         self.view.update_colorbar(vmin, vmax, "ZNCC", 'turbo')
 
-        # POI 반지름: spacing 기반 (겹치지 않을 정도)
         spacing = getattr(result, 'spacing', 10)
         radius = max(2, spacing // 4)
 
@@ -448,23 +557,15 @@ class FieldRenderer:
             if valid[idx]:
                 cv2.circle(img, (x, y), radius, color, -1)
             else:
-                # 무효 POI: 회색 × 마커
                 cv2.circle(img, (x, y), radius, (128, 128, 128), -1)
 
         return img
 
-
     def _draw_invalid_points(self, img, result):
-        """불량 POI 시각화
-        
-        - 초록점:  IC-GN 유효 (valid)
-        - 빨간점:  IC-GN 실패 (불연속 후보, splitting 대상)
-        - 표시 안 함: FFT-CC 실패 (텍스처 없음, 홀/배경)
-        """
+        """불량 POI 시각화"""
         if result.n_points == 0:
             return img
 
-        # fft_valid_mask 존재 여부 확인
         has_fft_mask = (
             hasattr(result, 'fft_valid_mask') and
             result.fft_valid_mask is not None
@@ -477,15 +578,11 @@ class FieldRenderer:
                 continue
 
             if result.valid_mask[idx]:
-                # IC-GN 유효 → 초록점
                 cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
-
             else:
                 if has_fft_mask and not result.fft_valid_mask[idx]:
-                    # FFT-CC 실패 (텍스처 없음) → 표시 안 함
                     pass
                 else:
-                    # IC-GN 실패 (불연속 후보) → 빨간점
                     cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
                     cv2.drawMarker(img, (x, y), (0, 0, 255),
                                 cv2.MARKER_CROSS, 10, 2)
