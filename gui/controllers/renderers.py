@@ -325,29 +325,123 @@ class FieldRenderer:
     # ===== 유틸리티: POI → 2D 그리드 =====
 
     def _to_grid(self, result, values):
-        """POI 값을 2D 그리드로 변환 (벡터화)"""
+        """POI 값을 2D 그리드로 변환.
+        
+        해상도를 2배로 올려서 각 POI 셀을 2×2 서브셀로 분할.
+        - 정상 POI: 4개 서브셀 모두 같은 값
+        - ADSS POI: 복원된 사분면에 해당하는 서브셀만 값 배치
+        """
+        all_unique_x = np.unique(result.points_x)
+        all_unique_y = np.unique(result.points_y)
+        nx_orig = len(all_unique_x)
+        ny_orig = len(all_unique_y)
+
+        if nx_orig < 2 or ny_orig < 2:
+            return np.full((1, 1), np.nan), all_unique_x, all_unique_y
+
+        spacing = float(all_unique_x[1] - all_unique_x[0]) if nx_orig > 1 else 1.0
+
+        # 2배 해상도 격자
+        nx2 = nx_orig * 2
+        ny2 = ny_orig * 2
+        grid = np.full((ny2, nx2), np.nan)
+
+        # 2배 해상도 좌표 (서브셀 중심)
+        half = spacing / 4.0
+        unique_x_2x = np.empty(nx2, dtype=np.float64)
+        unique_y_2x = np.empty(ny2, dtype=np.float64)
+        for i in range(nx_orig):
+            unique_x_2x[2 * i]     = all_unique_x[i] - half
+            unique_x_2x[2 * i + 1] = all_unique_x[i] + half
+        for i in range(ny_orig):
+            unique_y_2x[2 * i]     = all_unique_y[i] - half
+            unique_y_2x[2 * i + 1] = all_unique_y[i] + half
+
+        # 원래 좌표 → 인덱스 매핑
+        x_to_idx = {}
+        for i, x in enumerate(all_unique_x):
+            x_to_idx[int(x)] = i
+        y_to_idx = {}
+        for i, y in enumerate(all_unique_y):
+            y_to_idx[int(y)] = i
+
+        # ADSS로 복원된 부모 POI 인덱스 집합
+        adss = getattr(result, 'adss_result', None)
+        adss_parent_set = set()
+        if adss is not None and adss.n_sub > 0:
+            adss_parent_set = set(adss.unique_parents.tolist())
+
+        # === 정상 POI: 4개 서브셀 모두 같은 값 ===
         valid = result.valid_mask
-        px, py = result.points_x[valid], result.points_y[valid]
+        for idx in range(result.n_points):
+            if not valid[idx]:
+                # ADSS 부모가 아닌 불량 POI → NaN 유지
+                continue
 
-        unique_x = np.unique(px)
-        unique_y = np.unique(py)
-        nx, ny = len(unique_x), len(unique_y)
+            px_val = int(result.points_x[idx])
+            py_val = int(result.points_y[idx])
+            ix = x_to_idx.get(px_val)
+            iy = y_to_idx.get(py_val)
+            if ix is None or iy is None:
+                continue
 
-        xi = np.searchsorted(unique_x, px)
-        yi = np.searchsorted(unique_y, py)
+            val = values[idx]
+            # 2×2 서브셀 모두 채움
+            grid[2 * iy,     2 * ix]     = val  # 좌상
+            grid[2 * iy,     2 * ix + 1] = val  # 우상
+            grid[2 * iy + 1, 2 * ix]     = val  # 좌하
+            grid[2 * iy + 1, 2 * ix + 1] = val  # 우하
 
-        grid = np.full((ny, nx), np.nan)
-        v_valid = values[valid]
+        # === ADSS sub-POI: 해당 사분면 서브셀만 ===
+        if adss is not None and adss.n_sub > 0:
+            sub_values = self._get_adss_sub_values(result, values, adss)
+            if sub_values is not None:
+                # quarter_type → 2×2 내 (dy, dx) 매핑
+                # Q5(좌상)→(0,0), Q6(우상)→(0,1), Q7(좌하)→(1,0), Q8(우하)→(1,1)
+                qt_to_offset = {5: (0, 0), 6: (0, 1), 7: (1, 0), 8: (1, 1)}
 
-        in_bounds = (xi < nx) & (yi < ny)
-        grid[yi[in_bounds], xi[in_bounds]] = v_valid[in_bounds]
+                for s in range(adss.n_sub):
+                    px_val = int(adss.points_x[s])
+                    py_val = int(adss.points_y[s])
+                    ix = x_to_idx.get(px_val)
+                    iy = y_to_idx.get(py_val)
+                    if ix is None or iy is None:
+                        continue
 
-        return grid, unique_x, unique_y
+                    qt = int(adss.quarter_types[s])
+                    offset = qt_to_offset.get(qt)
+                    if offset is None:
+                        continue
+
+                    dy, dx = offset
+                    grid[2 * iy + dy, 2 * ix + dx] = sub_values[s]
+
+        return grid, unique_x_2x, unique_y_2x
+    
+    def _get_adss_sub_values(self, result, values, adss):
+        """현재 표시 중인 필드에 대응하는 ADSS sub-POI 값 추출"""
+        n_params = adss.parameters.shape[1]
+        is_affine = (n_params <= 6)
+
+        if values is result.disp_u:
+            return adss.parameters[:, 0]
+        elif values is result.disp_v:
+            return adss.parameters[:, 3] if is_affine else adss.parameters[:, 6]
+        elif hasattr(result, 'disp_ux') and values is result.disp_ux:
+            return adss.parameters[:, 1]
+        elif hasattr(result, 'disp_uy') and values is result.disp_uy:
+            return adss.parameters[:, 2]
+        elif hasattr(result, 'disp_vx') and values is result.disp_vx:
+            return adss.parameters[:, 4] if is_affine else adss.parameters[:, 7]
+        elif hasattr(result, 'disp_vy') and values is result.disp_vy:
+            return adss.parameters[:, 5] if is_affine else adss.parameters[:, 8]
+        else:
+            # magnitude 등 파생 값
+            return None
 
     # ===== 개별 렌더러 (변위 — 서브셋 직접 채색) =====
-
     def _draw_scalar_field(self, img, result, field_type):
-        """변위 필드 시각화 — 서브셋 영역 직접 채색"""
+        """변위 필드 시각화"""
         if result.n_points == 0:
             return img
 
@@ -359,16 +453,22 @@ class FieldRenderer:
             values = np.sqrt(result.disp_u**2 + result.disp_v**2)
             label = "|D| (px)"
 
+        grid, ux, uy = self._to_grid(result, values)
+        if grid.size == 0 or len(ux) < 3 or len(uy) < 3:
+            return img
+
         symmetric = field_type in ('u', 'v')
-        return self._render_field_subset(img, result, values, label, symmetric)
+        return self._render_field_matplotlib(img, grid, ux, uy, label, symmetric)
 
     def _get_strain_cache_key(self, result):
         """결과 객체의 고유 캐시 키 생성"""
         return (id(result), result.n_points, result.processing_time)
 
     def _get_cached_strain(self, result, grid_step):
-        """캐시된 PLS 변형률 결과 반환 (없으면 계산 후 캐시)"""
-        cache_key = (self._get_strain_cache_key(result), 11, 2, grid_step)
+        """캐시된 PLS 변형률 결과 반환"""
+        # 2배 해상도이므로 grid_step은 원래의 절반
+        grid_step_2x = grid_step / 2.0
+        cache_key = (self._get_strain_cache_key(result), 11, 2, grid_step_2x)
 
         if cache_key == self._strain_cache_key and self._strain_cache:
             return self._strain_cache.get('strain')
@@ -380,7 +480,7 @@ class FieldRenderer:
             from speckle.core.postprocess.strain_pls import compute_strain_pls
             strain = compute_strain_pls(
                 u_grid, v_grid,
-                window_size=11, poly_order=2, grid_step=grid_step
+                window_size=11, poly_order=2, grid_step=grid_step_2x
             )
             self._strain_cache = {'strain': strain}
             self._strain_cache_key = cache_key
@@ -395,7 +495,7 @@ class FieldRenderer:
         self._strain_cache_key = None
 
     def _draw_strain_field(self, img, result, strain_type):
-        """변형률 필드 시각화 — IC-GN gradient 직접 추출 + 서브셋 채색"""
+        """변형률 필드 시각화 (PLS, 캐시 적용)"""
         if result.n_points == 0:
             return img
 
@@ -405,36 +505,55 @@ class FieldRenderer:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return img
 
-        # IC-GN shape function gradient에서 직접 strain 계산
-        ux = result.disp_ux
-        uy = result.disp_uy
-        vx = result.disp_vx
-        vy = result.disp_vy
+        valid = result.valid_mask
+        px_valid = result.points_x[valid]
+        unique_x = np.unique(px_valid)
+        unique_y = np.unique(result.points_y[valid])
 
-        exx = ux
-        eyy = vy
-        exy = 0.5 * (uy + vx)
+        if len(unique_x) < 5 or len(unique_y) < 5:
+            return self._draw_strain_field_points(img, result, strain_type)
 
-        e_mean = 0.5 * (exx + eyy)
-        R = np.sqrt(((exx - eyy) / 2.0)**2 + exy**2)
-        e1 = e_mean + R
-        von_mises = np.sqrt(exx**2 + eyy**2 - exx * eyy + 3.0 * exy**2)
+        grid_step = float(np.median(np.diff(unique_x))) if len(unique_x) > 1 else 1.0
+
+        strain = self._get_cached_strain(result, grid_step)
+        if strain is None:
+            return self._draw_strain_field_points(img, result, strain_type)
 
         field_map = {
-            'exx': (exx, "εxx"),
-            'eyy': (eyy, "εyy"),
-            'exy': (exy, "εxy"),
-            'e1':  (e1, "ε₁"),
-            'von_mises': (von_mises, "εᵥₘ"),
+            'exx': (strain.exx, "εxx"),
+            'eyy': (strain.eyy, "εyy"),
+            'exy': (strain.exy, "εxy"),
+            'e1':  (strain.e1, "ε₁"),
+            'von_mises': (strain.von_mises, "εᵥₘ")
         }
 
         if strain_type not in field_map:
             return img
 
-        values, label = field_map[strain_type]
+        strain_2d, label = field_map[strain_type]
         symmetric = strain_type in ('exx', 'eyy', 'exy', 'e1')
 
-        return self._render_field_subset(img, result, values, label, symmetric)
+        # strain 격자 좌표는 _to_grid의 2배 해상도 좌표
+        # _get_cached_strain이 _to_grid를 호출하므로 2배 해상도 격자에서 PLS 계산됨
+        all_unique_x = np.unique(result.points_x)
+        all_unique_y = np.unique(result.points_y)
+        spacing = float(all_unique_x[1] - all_unique_x[0]) if len(all_unique_x) > 1 else 1.0
+        half = spacing / 4.0
+
+        nx_orig = len(all_unique_x)
+        ny_orig = len(all_unique_y)
+        unique_x_2x = np.empty(nx_orig * 2, dtype=np.float64)
+        unique_y_2x = np.empty(ny_orig * 2, dtype=np.float64)
+        for i in range(nx_orig):
+            unique_x_2x[2 * i]     = all_unique_x[i] - half
+            unique_x_2x[2 * i + 1] = all_unique_x[i] + half
+        for i in range(ny_orig):
+            unique_y_2x[2 * i]     = all_unique_y[i] - half
+            unique_y_2x[2 * i + 1] = all_unique_y[i] + half
+
+        return self._render_field_matplotlib(img, strain_2d, unique_x_2x, unique_y_2x,
+                                              label, symmetric)
+
 
     def _draw_strain_field_points(self, img, result, strain_type):
         """변형률 필드 점 시각화 (PLS 실패 시 fallback, turbo colormap)"""
@@ -512,12 +631,45 @@ class FieldRenderer:
         return img
 
     def _draw_magnitude(self, img, result):
-        """변위 크기 시각화 — 서브셋 영역 직접 채색"""
+        """변위 크기 시각화"""
         if result.n_points == 0:
             return img
 
         mag = np.sqrt(result.disp_u**2 + result.disp_v**2)
-        return self._render_field_subset(img, result, mag, "|D| (px)", False)
+        grid, ux, uy = self._to_grid(result, mag)
+
+        # ADSS magnitude는 _to_grid에서 자동 처리 안 됨 (파생값)
+        # 별도로 ADSS sub-POI magnitude를 추가
+        adss = getattr(result, 'adss_result', None)
+        if adss is not None and adss.n_sub > 0:
+            sub_u = adss.parameters[:, 0]
+            n_params = adss.parameters.shape[1]
+            sub_v = adss.parameters[:, 3] if n_params <= 6 else adss.parameters[:, 6]
+            sub_mag = np.sqrt(sub_u**2 + sub_v**2)
+
+            all_unique_x = np.unique(result.points_x)
+            all_unique_y = np.unique(result.points_y)
+            x_to_idx = {int(x): i for i, x in enumerate(all_unique_x)}
+            y_to_idx = {int(y): i for i, y in enumerate(all_unique_y)}
+            qt_to_offset = {5: (0, 0), 6: (0, 1), 7: (1, 0), 8: (1, 1)}
+
+            for s in range(adss.n_sub):
+                ix = x_to_idx.get(int(adss.points_x[s]))
+                iy = y_to_idx.get(int(adss.points_y[s]))
+                if ix is None or iy is None:
+                    continue
+                qt = int(adss.quarter_types[s])
+                offset = qt_to_offset.get(qt)
+                if offset is None:
+                    continue
+                dy, dx = offset
+                grid[2 * iy + dy, 2 * ix + dx] = sub_mag[s]
+
+        if grid.size == 0 or len(ux) < 3 or len(uy) < 3:
+            return img
+
+        return self._render_field_matplotlib(img, grid, ux, uy, "|D| (px)", False)
+
 
     def _draw_zncc_map(self, img, result):
         """ZNCC 맵 시각화 — POI 점별 표시 (보간 없음)"""
@@ -562,7 +714,13 @@ class FieldRenderer:
         return img
 
     def _draw_invalid_points(self, img, result):
-        """불량 POI 시각화"""
+        """불량 POI 시각화
+        
+        - 초록점:    IC-GN 유효 (valid)
+        - 파란 사분면: ADSS 복원 성공 (quarter별 영역 표시)
+        - 빨간 ×:    복원 불가 (IC-GN 실패 + ADSS 실패 또는 미시도)
+        - 표시 안 함:  FFT-CC 실패 (텍스처 없음)
+        """
         if result.n_points == 0:
             return img
 
@@ -571,18 +729,71 @@ class FieldRenderer:
             result.fft_valid_mask is not None
         )
 
+        # ADSS 정보 수집
+        adss = getattr(result, 'adss_result', None)
+        adss_parent_set = set()
+        adss_parent_quarters = {}  # parent_idx → [quarter_type, ...]
+        if adss is not None and adss.n_sub > 0:
+            adss_parent_set = set(adss.unique_parents.tolist())
+            for s in range(adss.n_sub):
+                pi = int(adss.parent_indices[s])
+                qt = int(adss.quarter_types[s])
+                if pi not in adss_parent_quarters:
+                    adss_parent_quarters[pi] = []
+                adss_parent_quarters[pi].append(qt)
+
+        # spacing 추정
+        valid = result.valid_mask
+        px_valid = result.points_x[valid]
+        unique_x = np.unique(px_valid) if np.any(valid) else np.unique(result.points_x)
+        spacing = int(round(np.median(np.diff(unique_x)))) if len(unique_x) > 1 else 11
+        half_sp = spacing // 2
+
+        # quarter → 영역 오프셋 (cx, cy 기준 상대 사각형)
+        # (x1_off, x2_off, y1_off, y2_off)
+        qt_offsets = {
+            5: (-half_sp, 0,        -half_sp, 0),         # Q5: 좌상
+            6: (1,         half_sp+1, -half_sp, 0),        # Q6: 우상
+            7: (-half_sp, 0,         1,         half_sp+1), # Q7: 좌하
+            8: (1,         half_sp+1, 1,         half_sp+1), # Q8: 우하
+        }
+
+        img_h, img_w = img.shape[:2]
+
         for idx in range(result.n_points):
             x = int(result.points_x[idx])
             y = int(result.points_y[idx])
-            if x < 0 or x >= img.shape[1] or y < 0 or y >= img.shape[0]:
+            if x < 0 or x >= img_w or y < 0 or y >= img_h:
                 continue
 
             if result.valid_mask[idx]:
+                # 정상 POI → 초록점
                 cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
+
+            elif idx in adss_parent_set:
+                # ADSS 복원된 POI → 파란색 사분면 영역
+                quarters = adss_parent_quarters.get(idx, [])
+                for qt in quarters:
+                    offsets = qt_offsets.get(qt)
+                    if offsets is None:
+                        continue
+                    x1_off, x2_off, y1_off, y2_off = offsets
+                    x1 = max(0, x + x1_off)
+                    x2 = min(img_w, x + x2_off)
+                    y1 = max(0, y + y1_off)
+                    y2 = min(img_h, y + y2_off)
+                    if x2 > x1 and y2 > y1:
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 180, 0), -1)
+
+                # 중심에 작은 파란점
+                cv2.circle(img, (x, y), 3, (255, 100, 0), -1)
+
             else:
                 if has_fft_mask and not result.fft_valid_mask[idx]:
+                    # FFT-CC 실패 → 표시 안 함
                     pass
                 else:
+                    # 복원 불가 → 빨간 ×
                     cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
                     cv2.drawMarker(img, (x, y), (0, 0, 255),
                                 cv2.MARKER_CROSS, 10, 2)
