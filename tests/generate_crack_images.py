@@ -1,12 +1,12 @@
 """
-Mode I 크랙 합성 스페클 이미지 생성기
+Mode I 크랙 합성 스페클 이미지 생성기 (대각선 크랙 지원)
 
 ADSS-DIC (Zhao & Pan, 2025, Experimental Mechanics) 논문의
 수치 실험과 동일한 조건으로 합성 이미지를 생성합니다.
 
 순방향 매핑(forward splatting)을 사용하여 크랙 틈이 실제 검정으로 나타남.
 
-생성물:
+생성물 (각 각도별 서브폴더):
     - reference.tiff      : 스페클 참조 이미지 (500×500)
     - deformed.tiff        : Mode I 크랙 변형 이미지 (크랙 틈 = 검정)
     - ground_truth_u.npy   : x방향 변위 ground truth
@@ -21,9 +21,8 @@ Parameters (ADSS-DIC 논문 조건):
     - E = 70 GPa
     - ν = 0.3 (평면 변형률)
     - 크랙 팁: 이미지 중심 (250, 250)
-    - 크랙 방향: 수평 (왼쪽 가장자리 → 중심)
+    - 크랙 방향: 수평 (0°) 또는 임의 각도
     - 노이즈: σ = 5 Gray Levels (참조 + 변형 모두)
-    - 최대 크랙 개구량: ~11.12 px
 
 Usage:
     python generate_crack_images.py
@@ -67,7 +66,7 @@ def generate_speckle_image(height=500, width=500,
     area_per_speckle = np.pi * (speckle_radius * 2.0) ** 2
     n_speckles = int(height * width * density / area_per_speckle)
 
-    img = np.ones((height, width), dtype=np.float64) * 180.0
+    img = np.ones((height, width), dtype=np.float64) * 120.0
 
     yy, xx = np.mgrid[0:height, 0:width]
 
@@ -91,32 +90,43 @@ def generate_speckle_image(height=500, width=500,
                    (local_x - centers_x[i])**2)
         gauss = amplitudes[i] * np.exp(-dist_sq / (2 * radii[i]**2))
 
-        img[y_lo:y_hi, x_lo:x_hi] -= gauss
+        img[y_lo:y_hi, x_lo:x_hi] += gauss
 
     return np.clip(img, 0, 255)
 
 
 # =============================================================================
-#  2. Mode I 크랙 변위장
+#  2. Mode I 크랙 변위장 (임의 각도 지원)
 # =============================================================================
 
 def mode1_crack_displacement(height, width, KI=17.0, E=70.0, nu=0.3,
-                              crack_tip_x=None, crack_tip_y=None):
+                              crack_tip_x=None, crack_tip_y=None,
+                              crack_angle_deg=0.0):
     """
-    Mode I 크랙 변위장 계산 (ADSS-DIC Eq.7)
+    Mode I 크랙 변위장 계산 (임의 각도 지원)
 
-    크랙 경로: y == crack_tip_y, x <= crack_tip_x (수평, 왼쪽→팁)
+    좌표 변환 절차:
+        1) 글로벌 좌표 → 크랙 팁 중심 상대 좌표
+        2) 크랙 각도만큼 역회전 → 로컬 크랙 좌표계
+           (로컬에서 크랙은 항상 수평: 음의 x축 방향)
+        3) 로컬 좌표계에서 Mode I 변위 계산
+        4) 변위를 글로벌 좌표계로 정회전
 
     Args:
         height, width: 이미지 크기
         KI: 응력확대계수 (GPa·px^0.5)
         E: 영률 (GPa)
         nu: 포아송비
-        crack_tip_x, crack_tip_y: 크랙 팁 좌표
+        crack_tip_x, crack_tip_y: 크랙 팁 좌표 (기본값: 이미지 중심)
+        crack_angle_deg: 크랙 각도 (도, degree)
+            0°  = 수평 (왼쪽→팁, 원래 동작)
+            45° = 좌하→팁 방향 대각선
+            90° = 수직 (아래→팁)
+            임의 각도 가능
 
     Returns:
-        u: x방향 변위장 (height, width)
-        v: y방향 변위장 (height, width)
+        u: x방향 변위장 (height, width)  [글로벌 좌표계]
+        v: y방향 변위장 (height, width)  [글로벌 좌표계]
     """
     if crack_tip_x is None:
         crack_tip_x = width / 2
@@ -125,14 +135,27 @@ def mode1_crack_displacement(height, width, KI=17.0, E=70.0, nu=0.3,
 
     kappa = 3 - 4 * nu  # 평면 변형률
 
-    y, x = np.mgrid[0:height, 0:width]
-    dx = x.astype(np.float64) - crack_tip_x
-    dy = y.astype(np.float64) - crack_tip_y
+    # --- 글로벌 좌표 생성 ---
+    y_idx, x_idx = np.mgrid[0:height, 0:width]
+    dx_global = x_idx.astype(np.float64) - crack_tip_x
+    dy_global = y_idx.astype(np.float64) - crack_tip_y
 
-    r = np.sqrt(dx**2 + dy**2)
+    # --- 좌표 회전: 글로벌 → 로컬 크랙 좌표계 ---
+    # 크랙 각도만큼 역회전 (로컬에서 크랙은 수평)
+    alpha = np.radians(crack_angle_deg)
+    cos_a = np.cos(alpha)
+    sin_a = np.sin(alpha)
+
+    # 역회전 (rotation by -alpha)
+    dx_local = cos_a * dx_global + sin_a * dy_global
+    dy_local = -sin_a * dx_global + cos_a * dy_global
+
+    # --- 로컬 좌표계에서 극좌표 ---
+    r = np.sqrt(dx_local**2 + dy_local**2)
     r = np.maximum(r, 1e-6)
-    theta = np.arctan2(dy, dx)
+    theta = np.arctan2(dy_local, dx_local)
 
+    # --- Mode I 변위 (로컬 좌표계) ---
     sqrt_r_2pi = np.sqrt(r / (2 * np.pi))
     coeff = KI / (2 * E)
 
@@ -141,14 +164,19 @@ def mode1_crack_displacement(height, width, KI=17.0, E=70.0, nu=0.3,
     cos_3half = np.cos(3 * theta / 2)
     sin_3half = np.sin(3 * theta / 2)
 
-    u = coeff * sqrt_r_2pi * (1 + nu) * (
+    u_local = coeff * sqrt_r_2pi * (1 + nu) * (
         (2 * kappa - 1) * cos_half - cos_3half
     )
-    v = coeff * sqrt_r_2pi * (1 + nu) * (
+    v_local = coeff * sqrt_r_2pi * (1 + nu) * (
         (2 * kappa + 1) * sin_half - sin_3half
     )
 
-    return u, v
+    # --- 변위 회전: 로컬 → 글로벌 좌표계 ---
+    # 정회전 (rotation by +alpha)
+    u_global = cos_a * u_local - sin_a * v_local
+    v_global = sin_a * u_local + cos_a * v_local
+
+    return u_global, v_global
 
 
 # =============================================================================
@@ -268,7 +296,8 @@ def warp_image_forward(ref_image, u, v, noise_std=0.0, seed=None):
 #  4. 시각화
 # =============================================================================
 
-def visualize_results(ref, deformed, u, v, crack_mask, save_path=None):
+def visualize_results(ref, deformed, u, v, crack_mask,
+                      crack_angle_deg=0.0, save_path=None):
     """결과 시각화 (6 패널)"""
     import matplotlib
     matplotlib.use('Agg')
@@ -281,14 +310,16 @@ def visualize_results(ref, deformed, u, v, crack_mask, save_path=None):
     axes[0, 0].axis('off')
 
     axes[0, 1].imshow(deformed, cmap='gray', vmin=0, vmax=255)
-    axes[0, 1].set_title('(b) Deformed Image (Mode I Crack)', fontsize=13)
+    axes[0, 1].set_title(f'(b) Deformed (crack angle={crack_angle_deg}°)',
+                          fontsize=13)
     axes[0, 1].axis('off')
 
     # 크랙 마스크 오버레이
     overlay = np.stack([deformed/255]*3, axis=-1)
     overlay[crack_mask] = [1, 0, 0]  # 크랙 틈 = 빨강
     axes[0, 2].imshow(overlay)
-    axes[0, 2].set_title(f'(c) Crack mask ({np.sum(crack_mask)} px)', fontsize=13)
+    axes[0, 2].set_title(f'(c) Crack mask ({np.sum(crack_mask)} px)',
+                          fontsize=13)
     axes[0, 2].axis('off')
 
     im_u = axes[1, 0].imshow(u, cmap='RdBu_r')
@@ -305,18 +336,67 @@ def visualize_results(ref, deformed, u, v, crack_mask, save_path=None):
 
     mag = np.sqrt(u**2 + v**2)
     im_m = axes[1, 2].imshow(mag, cmap='jet')
-    axes[1, 2].set_title(f'Magnitude (max = {np.max(mag):.2f} px)', fontsize=13)
+    axes[1, 2].set_title(f'Magnitude (max = {np.max(mag):.2f} px)',
+                          fontsize=13)
     plt.colorbar(im_m, ax=axes[1, 2], shrink=0.8)
     axes[1, 2].axis('off')
 
-    plt.suptitle('Mode I Crack Synthetic Images for DIC\n'
-                 r'$K_I$=17, E=70, $\nu$=0.3, noise $\sigma$=5 GL',
+    plt.suptitle(f'Mode I Crack Synthetic Images for DIC\n'
+                 rf'$K_I$=17, E=70, $\nu$=0.3, noise $\sigma$=5 GL, '
+                 rf'crack angle={crack_angle_deg}°',
                  fontsize=15, fontweight='bold')
     plt.tight_layout()
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"  시각화 저장: {save_path}")
+    plt.close()
+
+
+def visualize_multi_angle(results_dict, save_path=None):
+    """
+    여러 각도의 변형 이미지를 한 번에 비교하는 시각화
+
+    Args:
+        results_dict: {angle_deg: result_dict, ...}
+        save_path: 저장 경로
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    angles = sorted(results_dict.keys())
+    n = len(angles)
+    fig, axes = plt.subplots(2, n, figsize=(5 * n, 10))
+
+    if n == 1:
+        axes = axes.reshape(2, 1)
+
+    for i, angle in enumerate(angles):
+        res = results_dict[angle]
+        deformed = res['deformed']
+        crack_mask = res['crack_mask']
+        mag = np.sqrt(res['u']**2 + res['v']**2)
+
+        axes[0, i].imshow(deformed, cmap='gray', vmin=0, vmax=255)
+        axes[0, i].set_title(f'Deformed ({angle}°)', fontsize=12)
+        axes[0, i].axis('off')
+
+        # 크랙 마스크 오버레이
+        overlay = np.stack([deformed/255]*3, axis=-1)
+        overlay[crack_mask] = [1, 0, 0]
+        axes[1, i].imshow(overlay)
+        axes[1, i].set_title(f'Crack mask ({angle}°)\n'
+                              f'{np.sum(crack_mask)} px', fontsize=12)
+        axes[1, i].axis('off')
+
+    plt.suptitle('Multi-Angle Mode I Crack Comparison',
+                 fontsize=16, fontweight='bold')
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  멀티 각도 시각화 저장: {save_path}")
     plt.close()
 
 
@@ -331,9 +411,10 @@ def generate_crack_dataset(output_dir='synthetic_crack_data',
                            speckle_radius=1.0,
                            speckle_density=0.9,
                            speckle_seed=42,
-                           noise_seed=123):
+                           noise_seed=123,
+                           crack_angle_deg=0.0):
     """
-    Mode I 크랙 합성 데이터셋 생성
+    Mode I 크랙 합성 데이터셋 생성 (임의 각도 지원)
 
     Args:
         output_dir: 출력 디렉토리
@@ -344,6 +425,11 @@ def generate_crack_dataset(output_dir='synthetic_crack_data',
         speckle_density: 스페클 밀도
         speckle_seed: 스페클 시드
         noise_seed: 노이즈 시드
+        crack_angle_deg: 크랙 각도 (도)
+            0°  = 수평 왼쪽→팁 (원래 동작)
+            45° = 좌하→팁 대각선
+            90° = 수직 아래→팁
+            -30° = 좌상→팁 방향
 
     Returns:
         dict with ref, deformed, u, v, crack_mask
@@ -356,6 +442,7 @@ def generate_crack_dataset(output_dir='synthetic_crack_data',
     print("=" * 60)
     print(f"  이미지 크기 : {image_size} x {image_size}")
     print(f"  KI={KI}, E={E}, nu={nu}")
+    print(f"  크랙 각도   : {crack_angle_deg}°")
     print(f"  노이즈 σ   : {noise_std} GL")
     print(f"  Numba 가속 : {'사용' if HAS_NUMBA else '미사용 (느림)'}")
     print(f"  출력 경로   : {out.resolve()}")
@@ -376,13 +463,23 @@ def generate_crack_dataset(output_dir='synthetic_crack_data',
 
     # --- 2. 변위장 ---
     t0 = time.time()
-    print("[2/5] Mode I 변위장 계산...")
+    print(f"[2/5] Mode I 변위장 계산 (각도={crack_angle_deg}°)...")
     u, v = mode1_crack_displacement(image_size, image_size,
-                                     KI=KI, E=E, nu=nu)
+                                     KI=KI, E=E, nu=nu,
+                                     crack_angle_deg=crack_angle_deg)
     v_max = np.max(np.abs(v))
     u_max = np.max(np.abs(u))
+    disp_max = np.max(np.sqrt(u**2 + v**2))
     print(f"       max|u|={u_max:.2f} px, max|v|={v_max:.2f} px")
-    print(f"       크랙 최대 개구량 ≈ {2*v_max:.2f} px")
+    print(f"       max displacement magnitude = {disp_max:.2f} px")
+
+    # 크랙 개구량: 크랙면에 수직인 방향의 변위 불연속
+    alpha = np.radians(crack_angle_deg)
+    # 크랙면 법선 방향 = (-sin(alpha), cos(alpha))
+    # 법선 방향 변위 = -sin(alpha)*u + cos(alpha)*v
+    u_normal = -np.sin(alpha) * u + np.cos(alpha) * v
+    crack_opening = 2 * np.max(np.abs(u_normal))
+    print(f"       크랙 최대 개구량 ≈ {crack_opening:.2f} px")
     print(f"       완료 ({time.time()-t0:.2f}s)")
 
     # --- 3. 순방향 워프 ---
@@ -415,13 +512,15 @@ def generate_crack_dataset(output_dir='synthetic_crack_data',
         'image_size': image_size,
         'KI': KI, 'E': E, 'nu': nu,
         'noise_std': noise_std,
+        'crack_angle_deg': crack_angle_deg,
         'speckle_radius': speckle_radius,
         'speckle_density': speckle_density,
         'speckle_seed': speckle_seed,
         'noise_seed': noise_seed,
         'u_max_px': float(u_max),
         'v_max_px': float(v_max),
-        'crack_opening_max_px': float(2 * v_max),
+        'disp_magnitude_max_px': float(disp_max),
+        'crack_opening_max_px': float(crack_opening),
         'crack_tip': [image_size // 2, image_size // 2],
         'n_crack_pixels': int(n_crack_px),
     }
@@ -432,13 +531,14 @@ def generate_crack_dataset(output_dir='synthetic_crack_data',
     t0 = time.time()
     print("[5/5] 시각화 생성...")
     visualize_results(ref_noisy, deformed, u, v, crack_mask,
+                      crack_angle_deg=crack_angle_deg,
                       save_path=str(out / 'visualization.png'))
     print(f"       완료 ({time.time()-t0:.2f}s)")
 
     print("-" * 60)
     print("생성 완료!")
     print(f"  reference.tiff       : 참조 이미지")
-    print(f"  deformed.tiff        : 크랙 변형 이미지")
+    print(f"  deformed.tiff        : 크랙 변형 이미지 ({crack_angle_deg}°)")
     print(f"  ground_truth_u/v.npy : 변위장 정답")
     print(f"  crack_mask.npy       : 크랙 틈 마스크")
     print(f"  params.npz           : 생성 파라미터")
@@ -454,15 +554,82 @@ def generate_crack_dataset(output_dir='synthetic_crack_data',
     }
 
 
+def generate_multi_angle_dataset(base_dir='synthetic_crack_data',
+                                  angles=None,
+                                  **kwargs):
+    """
+    여러 각도의 크랙 데이터셋을 한 번에 생성
+
+    Args:
+        base_dir: 기본 출력 디렉토리
+        angles: 크랙 각도 리스트 (기본값: [0, 30, 45, 60, 90])
+        **kwargs: generate_crack_dataset에 전달할 나머지 파라미터
+
+    Returns:
+        {angle: result_dict, ...}
+    """
+    if angles is None:
+        angles = [0, 30, 45, 60, 90]
+
+    print("\n" + "#" * 60)
+    print(f"  멀티 각도 크랙 데이터 생성: {angles}")
+    print("#" * 60 + "\n")
+
+    all_results = {}
+
+    for angle in angles:
+        angle_dir = Path(base_dir) / f"angle_{angle:+04d}deg"
+        result = generate_crack_dataset(
+            output_dir=str(angle_dir),
+            crack_angle_deg=angle,
+            **kwargs
+        )
+        all_results[angle] = result
+        print()
+
+    # 멀티 각도 비교 시각화
+    visualize_multi_angle(
+        all_results,
+        save_path=str(Path(base_dir) / 'multi_angle_comparison.png')
+    )
+
+    print("#" * 60)
+    print("  모든 각도 생성 완료!")
+    print(f"  출력 디렉토리: {Path(base_dir).resolve()}")
+    print("#" * 60)
+
+    return all_results
+
+
 # =============================================================================
 #  실행
 # =============================================================================
 
 if __name__ == '__main__':
-    result = generate_crack_dataset(
-        output_dir='synthetic_crack_data',
+
+    # --- 옵션 1: 단일 각도 (원래 0° 수평 크랙) ---
+    # result = generate_crack_dataset(
+    #     output_dir='synthetic_crack_data/angle_0deg',
+    #     image_size=500,
+    #     KI=17.0, E=70.0, nu=0.3,
+    #     noise_std=5.0,
+    #     crack_angle_deg=0.0,
+    # )
+
+    # --- 옵션 2: 단일 대각선 크랙 (45°) ---
+    # result = generate_crack_dataset(
+    #     output_dir='synthetic_crack_data/angle_45deg',
+    #     image_size=500,
+    #     KI=17.0, E=70.0, nu=0.3,
+    #     noise_std=5.0,
+    #     crack_angle_deg=45.0,
+    # )
+
+    # --- 옵션 3: 여러 각도 한 번에 생성 (기본 사용) ---
+    results = generate_multi_angle_dataset(
+        base_dir='synthetic_crack_data',
+        angles=[0, 30, 45, 60, 90],
         image_size=500,
         KI=17.0, E=70.0, nu=0.3,
         noise_std=5.0,
     )
-
