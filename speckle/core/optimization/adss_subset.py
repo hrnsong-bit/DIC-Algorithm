@@ -36,28 +36,44 @@ def _build_neighbor_info_adss_v2(
     zncc_threshold, ny, nx, n_params
 ):
     """
-    ADSS-DIC v2용 이웃 정보 구성 — 대각선 4방위만 (Q5~Q8).
+    ADSS-DIC v2용 이웃 정보 구성 — 사분면당 3이웃 후보.
+
+    각 사분면에 대해 인접한 3방향 이웃을 후보로 저장한다.
+      Q5(좌상): 좌상, 상, 좌
+      Q6(우상): 우상, 상, 우
+      Q7(좌하): 좌하, 하, 좌
+      Q8(우하): 우하, 하, 우
 
     Returns
     -------
-    all_neighbor_valid : (n_bad, 4) bool
-    all_neighbor_params : (n_bad, 4, n_params) float64
-    all_neighbor_x : (n_bad, 4) float64
-    all_neighbor_y : (n_bad, 4) float64
+    all_neighbor_valid  : (n_bad, 4, 3) bool
+    all_neighbor_params : (n_bad, 4, 3, n_params) float64
+    all_neighbor_x      : (n_bad, 4, 3) float64
+    all_neighbor_y      : (n_bad, 4, 3) float64
     """
     n_bad = len(bad_indices)
 
-    all_neighbor_valid = np.zeros((n_bad, 4), dtype=np.bool_)
-    all_neighbor_params = np.zeros((n_bad, 4, n_params), dtype=np.float64)
-    all_neighbor_x = np.zeros((n_bad, 4), dtype=np.float64)
-    all_neighbor_y = np.zeros((n_bad, 4), dtype=np.float64)
+    all_neighbor_valid  = np.zeros((n_bad, 4, 3), dtype=np.bool_)
+    all_neighbor_params = np.zeros((n_bad, 4, 3, n_params), dtype=np.float64)
+    all_neighbor_x      = np.zeros((n_bad, 4, 3), dtype=np.float64)
+    all_neighbor_y      = np.zeros((n_bad, 4, 3), dtype=np.float64)
 
-    # Q5~Q8 대응 대각선 이웃 방향 (dy, dx)
-    neighbor_dirs = [
-        (-1, -1),  # Q5: 좌상 이웃
-        (-1,  1),  # Q6: 우상 이웃
-        ( 1, -1),  # Q7: 좌하 이웃
-        ( 1,  1),  # Q8: 우하 이웃
+    # 8방위 이웃 방향 (dy, dx)
+    #   0:좌상  1:상  2:우상
+    #   3:좌         4:우
+    #   5:좌하  6:하  7:우하
+    all_dirs = [
+        (-1, -1), (-1,  0), (-1, +1),
+        ( 0, -1),           ( 0, +1),
+        (+1, -1), (+1,  0), (+1, +1),
+    ]
+
+    # 각 사분면에 대한 3이웃 후보 인덱스 (all_dirs 기준)
+    quarter_neighbor_indices = [
+        [0, 1, 3],  # Q5(좌상) ← 좌상, 상, 좌
+        [2, 1, 4],  # Q6(우상) ← 우상, 상, 우
+        [5, 6, 3],  # Q7(좌하) ← 좌하, 하, 좌
+        [7, 6, 4],  # Q8(우하) ← 우하, 하, 우
     ]
 
     for k in range(n_bad):
@@ -65,17 +81,19 @@ def _build_neighbor_info_adss_v2(
         iy = flat_idx // nx
         ix = flat_idx % nx
 
-        for d, (dy, dx) in enumerate(neighbor_dirs):
-            niy = iy + dy
-            nix = ix + dx
+        for q in range(4):  # 사분면 Q5~Q8
+            for c, dir_idx in enumerate(quarter_neighbor_indices[q]):
+                dy, dx = all_dirs[dir_idx]
+                niy = iy + dy
+                nix = ix + dx
 
-            if 0 <= niy < ny and 0 <= nix < nx:
-                nf = niy * nx + nix
-                if valid_mask[nf] and zncc_values[nf] >= zncc_threshold:
-                    all_neighbor_valid[k, d] = True
-                    all_neighbor_params[k, d, :n_params] = parameters[nf, :n_params]
-                    all_neighbor_x[k, d] = float(points_x[nf])
-                    all_neighbor_y[k, d] = float(points_y[nf])
+                if 0 <= niy < ny and 0 <= nix < nx:
+                    nf = niy * nx + nix
+                    if valid_mask[nf] and zncc_values[nf] >= zncc_threshold:
+                        all_neighbor_valid[k, q, c]  = True
+                        all_neighbor_params[k, q, c, :n_params] = parameters[nf, :n_params]
+                        all_neighbor_x[k, q, c] = float(points_x[nf])
+                        all_neighbor_y[k, q, c] = float(points_y[nf])
 
     return all_neighbor_valid, all_neighbor_params, all_neighbor_x, all_neighbor_y
 
@@ -155,7 +173,7 @@ def compute_adss_recalc(
         zncc_threshold, ny, nx, n_params
     )
 
-    has_candidate = np.any(all_nv, axis=1)
+    has_candidate = np.any(all_nv.reshape(n_bad, -1), axis=1)
     n_candidates = int(np.sum(has_candidate))
 
     if n_candidates == 0:

@@ -114,8 +114,8 @@ def compute_icgn(
     gaussian_blur: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     ref_cache: Optional[dict] = None,
-    enable_variable_subset: bool = True,
-    enable_adss_subset: bool = False,
+    enable_variable_subset: bool = False,
+    enable_adss_subset: bool = True,
     max_recovery_passes: int = 1,
 ) -> ICGNResult:
     """
@@ -528,6 +528,5 @@ def _empty_result(
         convergence_threshold=convergence_threshold,
         processing_time=0.0,
         shape_function=shape_function,
-        adss_quarter_type=None,
         adss_result=None,   
     )

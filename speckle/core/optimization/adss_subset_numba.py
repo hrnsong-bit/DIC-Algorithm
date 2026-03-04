@@ -187,10 +187,10 @@ def process_poi_adss_multi(
     max_iterations,
     convergence_threshold,
     shape_type,
-    neighbor_valid,
-    neighbor_params,
-    neighbor_x,
-    neighbor_y,
+    neighbor_valid,       # (4, 3) bool      ← shape 변경
+    neighbor_params,      # (4, 3, n_params)  ← shape 변경
+    neighbor_x,           # (4, 3)            ← shape 변경
+    neighbor_y,           # (4, 3)            ← shape 변경
     zncc_threshold,
     zncc_pre_threshold,
     out_p,
@@ -207,12 +207,6 @@ def process_poi_adss_multi(
     xsi_local, eta_local,
     init_params_buf
 ):
-    """
-    단일 불량 POI: 사분면 4개 평가, pre_threshold 이상 모두 IC-GN.
-    fail_info[i] = [final_zncc, n_iter, fail_code] 기록.
-
-    Returns: n_recovered (0~4)
-    """
     M = subset_size // 2
     n_params = get_num_params(shape_type)
 
@@ -227,22 +221,16 @@ def process_poi_adss_multi(
         out_zncc[i] = 0.0
         out_iter[i] = 0
         out_qt[i] = -1
-        out_fail_info[i, 0] = -1.0    # final_zncc
-        out_fail_info[i, 1] = 0.0     # n_iter
-        out_fail_info[i, 2] = -1.0    # fail_code (-1 = 미시도)
+        out_fail_info[i, 0] = -1.0
+        out_fail_info[i, 1] = 0.0
+        out_fail_info[i, 2] = -1.0
 
-    # === Step 1: 4개 사분면 1-warp ZNCC 평가 ===
+    # === 임시 버퍼: 각 사분면의 최적 이웃 초기값 저장 ===
+    best_init_params = np.zeros((4, n_params), dtype=np.float64)
+
+    # === Step 1: 각 사분면에 대해 3이웃 후보 평가, 최고 ZNCC 이웃 선택 ===
     for i in range(4):
-        if not neighbor_valid[i]:
-            continue
-
-        predict_initial_params(
-            neighbor_x[i], neighbor_y[i],
-            neighbor_params[i],
-            float64(cx), float64(cy),
-            shape_type, init_params_buf
-        )
-
+        # 사분면 픽셀 좌표 생성
         idx = 0
         for row in range(eta_mins[i], eta_maxs[i] + 1):
             for col in range(xsi_mins[i], xsi_maxs[i] + 1):
@@ -251,16 +239,35 @@ def process_poi_adss_multi(
                 idx += 1
         n_pix = idx
 
-        zncc_1warp = evaluate_quarter_zncc(
-            ref_image, grad_x, grad_y,
-            coeffs, order, cx, cy,
-            init_params_buf,
-            xsi_mins[i], xsi_maxs[i], eta_mins[i], eta_maxs[i],
-            xsi_local, eta_local,
-            shape_type, n_pix,
-            f, dfdx, dfdy, xsi_w, eta_w, x_def, y_def, g
-        )
-        out_candidate_zncc[i] = zncc_1warp
+        best_zncc_for_quarter = -1.0
+
+        for c in range(3):  # 3개 이웃 후보 순회
+            if not neighbor_valid[i, c]:
+                continue
+
+            predict_initial_params(
+                neighbor_x[i, c], neighbor_y[i, c],
+                neighbor_params[i, c],
+                float64(cx), float64(cy),
+                shape_type, init_params_buf
+            )
+
+            zncc_1warp = evaluate_quarter_zncc(
+                ref_image, grad_x, grad_y,
+                coeffs, order, cx, cy,
+                init_params_buf,
+                xsi_mins[i], xsi_maxs[i], eta_mins[i], eta_maxs[i],
+                xsi_local, eta_local,
+                shape_type, n_pix,
+                f, dfdx, dfdy, xsi_w, eta_w, x_def, y_def, g
+            )
+
+            if zncc_1warp > best_zncc_for_quarter:
+                best_zncc_for_quarter = zncc_1warp
+                for k in range(n_params):
+                    best_init_params[i, k] = init_params_buf[k]
+
+        out_candidate_zncc[i] = best_zncc_for_quarter
 
     # === Step 2: pre_threshold 이상인 사분면 모두 IC-GN ===
     n_recovered = 0
@@ -278,12 +285,9 @@ def process_poi_adss_multi(
                 idx += 1
         n_pixels = idx
 
-        predict_initial_params(
-            neighbor_x[i], neighbor_y[i],
-            neighbor_params[i],
-            float64(cx), float64(cy),
-            shape_type, init_params_buf
-        )
+        # Step 1에서 선택된 최적 이웃의 초기값 사용
+        for k in range(n_params):
+            init_params_buf[k] = best_init_params[i, k]
 
         f_mean, f_tilde, valid = extract_reference_subset_variable(
             ref_image, grad_x, grad_y, cx, cy,
@@ -337,7 +341,6 @@ def process_poi_adss_multi(
         out_fail_info[i, 2] = float64(fail_code)
 
         if conv and zncc >= zncc_threshold:
-            # IC-GN 정상 수렴
             for k in range(n_params):
                 out_p[n_recovered, k] = p[k]
             out_zncc[n_recovered] = zncc
@@ -346,18 +349,15 @@ def process_poi_adss_multi(
             n_recovered += 1
         elif (fail_code == 2
               and n_iter <= 1
-              and out_candidate_zncc[i] >= zncc_threshold
-              ):
-            # Fallback: 1회차 발산이지만 1-warp ZNCC 충분 → 초기 파라미터 채택
+              and out_candidate_zncc[i] >= zncc_threshold):
             for k in range(n_params):
-                out_p[n_recovered, k] = init_params_buf[k]
+                out_p[n_recovered, k] = best_init_params[i, k]
             out_zncc[n_recovered] = out_candidate_zncc[i]
             out_iter[n_recovered] = 0
             out_qt[n_recovered] = qt_codes[i]
             n_recovered += 1
 
     return n_recovered
-
 
 
 @jit(nopython=True, parallel=True, cache=True)
