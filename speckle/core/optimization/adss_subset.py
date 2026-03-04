@@ -94,13 +94,7 @@ def compute_adss_recalc(
     zncc_pre_threshold=0.5,
 ):
     """
-    ADSS-DIC v2 재계산 — 사분면 복수 채택.
-
-    Returns
-    -------
-    ADSSResult
-        모든 sub-POI가 포함된 결과 객체.
-        대표값은 ICGNResult 배열에 in-place 반영됨.
+    ADSS-DIC v2 재계산 — 사분면 복수 채택 + fail_info 디버깅 로그.
     """
     t_start = time.time()
     n_poi = len(points_x)
@@ -154,7 +148,7 @@ def compute_adss_recalc(
     ny, nx, spacing = grid_info
     logger.info("  격자 구조: %d×%d, 간격=%dpx", ny, nx, spacing)
 
-    # === 3. 이웃 정보 구성 (대각선 4방위만) ===
+    # === 3. 이웃 정보 구성 ===
     all_nv, all_np, all_nx, all_ny = _build_neighbor_info_adss_v2(
         bad_indices, points_x, points_y,
         valid_mask, zncc_values, parameters,
@@ -179,7 +173,7 @@ def compute_adss_recalc(
     logger.info("  시도 가능 후보: %d / %d", n_cand, n_bad)
 
     # === 4. 버퍼 할당 ===
-    n_pixels_max = (M + 1) * (M + 1)  # 사분면 크기
+    n_pixels_max = (M + 1) * (M + 1)
     bufs = allocate_adss_multi_batch_buffers(n_cand, n_pixels_max, n_params)
 
     max_sub = 4 * n_cand
@@ -190,6 +184,7 @@ def compute_adss_recalc(
     result_parent = np.full(max_sub, -1, dtype=np.int64)
     result_count = np.zeros(n_cand, dtype=np.int32)
     result_candidate_zncc = np.full((n_cand, 4), -1.0, dtype=np.float64)
+    result_fail_info = np.full((n_cand, 4, 3), -1.0, dtype=np.float64)    # ← 추가
 
     # === 5. 배치 병렬 처리 ===
     process_bad_pois_adss_multi_parallel(
@@ -203,6 +198,7 @@ def compute_adss_recalc(
         zncc_threshold, zncc_pre_threshold,
         result_p, result_zncc, result_iter, result_qt,
         result_parent, result_count, result_candidate_zncc,
+        result_fail_info,                                                   # ← 추가
         bufs['f'], bufs['dfdx'], bufs['dfdy'],
         bufs['J'], bufs['H'], bufs['H_inv'],
         bufs['p'], bufs['xsi_w'], bufs['eta_w'],
@@ -212,6 +208,7 @@ def compute_adss_recalc(
         bufs['init_params'],
         bufs['out_p'], bufs['out_zncc'], bufs['out_iter'],
         bufs['out_qt'], bufs['out_cand_zncc'],
+        bufs['out_fail_info'],                                              # ← 추가
     )
 
     # === 6. 유효 결과 추출 ===
@@ -228,17 +225,16 @@ def compute_adss_recalc(
     sub_zncc = result_zncc[valid_sub_mask]
     sub_iter = result_iter[valid_sub_mask]
 
-    # 사분면 영역 정보 생성
     sub_xsi_min = np.zeros(n_sub_total, dtype=np.int32)
     sub_xsi_max = np.zeros(n_sub_total, dtype=np.int32)
     sub_eta_min = np.zeros(n_sub_total, dtype=np.int32)
     sub_eta_max = np.zeros(n_sub_total, dtype=np.int32)
 
     qt_to_range = {
-        5: (-M, 0, -M, 0),   # Q5: Upper-left
-        6: (0, M, -M, 0),    # Q6: Upper-right
-        7: (-M, 0, 0, M),    # Q7: Lower-left
-        8: (0, M, 0, M),     # Q8: Lower-right
+        5: (-M, 0, -M, 0),
+        6: (0, M, -M, 0),
+        7: (-M, 0, 0, M),
+        8: (0, M, 0, M),
     }
 
     for i in range(n_sub_total):
@@ -249,7 +245,7 @@ def compute_adss_recalc(
     sub_px = np.array([int(points_x[pi]) for pi in sub_parent], dtype=np.int64)
     sub_py = np.array([int(points_y[pi]) for pi in sub_parent], dtype=np.int64)
 
-    # === 7. 대표값 ICGNResult 반영 (기존 파이프라인 호환) ===
+    # === 7. 통계 ===
     unique_parents = np.unique(sub_parent)
     n_parent_recovered = len(unique_parents)
     n_unrecoverable = n_bad - n_parent_recovered
@@ -263,33 +259,49 @@ def compute_adss_recalc(
 
     elapsed = time.time() - t_start
 
-    # === 9. 로그 출력 ===
+    # === 9. 로그 출력 (fail_info 포함) ===
     quarter_names = {5: 'Q5:UL', 6: 'Q6:UR', 7: 'Q7:LL', 8: 'Q8:LR'}
+    fail_code_names = {
+        -1: 'NOT_TRIED', 0: 'SUCCESS', 1: 'LOW_ZNCC', 2: 'DIVERGED',
+        3: 'OUT_OF_BOUNDS', 4: 'SINGULAR_H', 5: 'FLAT_SUBSET',
+        6: 'MAX_DISP', 7: 'FLAT_TARGET', 99: 'REF_EXTRACT_FAIL'
+    }
+    qn = ['Q5:UL', 'Q6:UR', 'Q7:LL', 'Q8:LR']
 
     for k in range(n_cand):
         fidx = cand_indices[k]
         n_rec = result_count[k]
         cz = result_candidate_zncc[k]
+        fi = result_fail_info[k]
 
-        # 이 POI에서 복원된 사분면 목록
         offset = k * 4
         rec_qts = []
         for j in range(n_rec):
             rec_qts.append(quarter_names.get(result_qt[offset + j], '?'))
 
-        zncc_strs = []
-        qn = ['Q5:UL', 'Q6:UR', 'Q7:LL', 'Q8:LR']
+        detail_strs = []
         for i in range(4):
             if cz[i] < 0:
-                zncc_strs.append(f"{qn[i]}:N/A")
+                detail_strs.append(f"{qn[i]}:N/A")
             else:
-                zncc_strs.append(f"{qn[i]}:{cz[i]:.4f}")
+                fc = int(fi[i, 2])
+                fc_name = fail_code_names.get(fc, f'CODE_{fc}')
+                final_z = fi[i, 0]
+                n_it = int(fi[i, 1])
+                if fc == 0:
+                    detail_strs.append(
+                        f"{qn[i]}:1w={cz[i]:.4f}→OK(z={final_z:.4f},{n_it}it)"
+                    )
+                else:
+                    detail_strs.append(
+                        f"{qn[i]}:1w={cz[i]:.4f}→FAIL({fc_name},z={final_z:.4f},{n_it}it)"
+                    )
 
         logger.info(
-            "  POI[%d] (%d,%d) → %d개 복원 %s | 1-warp: %s",
+            "  POI[%d] (%d,%d) → %d개 복원 %s | %s",
             fidx, points_x[fidx], points_y[fidx],
             n_rec, rec_qts,
-            " | ".join(zncc_strs)
+            " | ".join(detail_strs)
         )
 
     logger.info(

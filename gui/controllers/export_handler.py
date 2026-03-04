@@ -202,6 +202,15 @@ class ExportHandler:
             errors.append(f"overlay.png: {e}")
             logger.error(f"오버레이 이미지 저장 실패: {e}")
 
+        # 6) 논문용 고품질 시각화 (DICPlotter)
+        try:
+            path = self._save_paper_figures(result, out_dir)
+            if path:
+                saved_files.extend(path)
+        except Exception as e:
+            errors.append(f"paper figures: {e}")
+            logger.error(f"논문용 시각화 저장 실패: {e}")
+
         # 결과 보고
         msg = f"저장 완료: {len(saved_files)}개 파일\n폴더: {out_dir}\n\n"
         msg += "\n".join(f"  ✓ {f}" for f in saved_files)
@@ -689,3 +698,27 @@ class ExportHandler:
         except Exception as e:
             logger.warning(f"오버레이 이미지 저장 실패: {e}")
             return None
+    def _save_paper_figures(self, result, out_dir: Path) -> list:
+        """논문용 고품질 변위/변형률/ZNCC 이미지 저장"""
+        is_icgn = hasattr(result, 'converged')
+        if not is_icgn:
+            logger.info("FFT-CC 결과 — 논문용 시각화 생략")
+            return []
+
+        from speckle.visualization.dic_plot import DICPlotter
+
+        ref_img = self.state.ref_image
+        plotter = DICPlotter(result, ref_image=ref_img, dpi=300)
+
+        fig_dir = out_dir / "figures"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+        plotter.save_all(str(fig_dir), fmt='png')
+
+        saved = [
+            fig_dir / "displacement.png",
+            fig_dir / "strain_pls.png",
+            fig_dir / "zncc.png",
+        ]
+        logger.info(f"논문용 시각화 저장: {fig_dir}")
+        return [p.name for p in saved if p.exists()]

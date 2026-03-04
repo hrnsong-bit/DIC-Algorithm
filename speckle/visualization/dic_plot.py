@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm, Normalize
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy.interpolate import RegularGridInterpolator
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 import logging
@@ -31,7 +32,6 @@ _logger = logging.getLogger(__name__)
 class DICPlotter:
     """DIC 결과 시각화 클래스"""
 
-    # 기본 스타일 설정
     DEFAULT_STYLE = {
         'figure.facecolor': 'white',
         'axes.facecolor': 'white',
@@ -42,35 +42,37 @@ class DICPlotter:
         'ytick.labelsize': 9,
     }
 
-    # colormap 프리셋
     CMAPS = {
-        'displacement': 'RdBu_r',      # 변위: 양/음 구분
-        'strain': 'RdBu_r',            # 변형률: 양/음 구분
-        'magnitude': 'hot',             # 크기: 단조증가
-        'zncc': 'viridis',             # 상관계수: 0~1
-        'von_mises': 'inferno',        # von Mises: 양수만
+        'displacement': 'RdBu_r',
+        'strain': 'RdBu_r',
+        'magnitude': 'hot',
+        'zncc': 'viridis',
+        'von_mises': 'inferno',
     }
 
     def __init__(self, icgn_result, ref_image: Optional[np.ndarray] = None,
-                 dpi: int = 150, style: Optional[Dict] = None):
+                 dpi: int = 150, style: Optional[Dict] = None,
+                 upsample: int = 4, weight_threshold: float = 0.5):
         """
         Args:
             icgn_result: ICGNResult 객체
             ref_image: 참조 이미지 (배경용, optional)
             dpi: 출력 해상도
             style: matplotlib rcParams 오버라이드
+            upsample: 보간 업샘플 배율 (1이면 보간 없음)
+            weight_threshold: NaN 경계 판정 가중치 임계값 (0~1)
         """
         self.result = icgn_result
         self.ref_image = self._to_gray(ref_image) if ref_image is not None else None
         self.dpi = dpi
+        self.upsample = max(1, upsample)
+        self.weight_threshold = weight_threshold
 
-        # 스타일 적용
         self._style = {**self.DEFAULT_STYLE}
         if style:
             self._style.update(style)
 
-        # 그리드 정보 사전 계산
-        self._grid_info = self._build_grid()
+        self._grid_base = self._build_grid_base()
 
     def _to_gray(self, img: np.ndarray) -> np.ndarray:
         if img is None:
@@ -80,39 +82,176 @@ class DICPlotter:
             return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return img
 
-    def _build_grid(self) -> Dict:
-        """POI 데이터를 2D 그리드로 변환"""
+    # ===== 2배 해상도 그리드 구성 =====
+
+    def _build_grid_base(self) -> Dict:
+        """전체 POI 좌표 기반으로 그리드 매핑 정보를 구성"""
         r = self.result
-        valid = r.valid_mask
-        px, py = r.points_x[valid], r.points_y[valid]
 
-        unique_x = np.unique(px)
-        unique_y = np.unique(py)
-        nx, ny = len(unique_x), len(unique_y)
+        all_unique_x = np.unique(r.points_x)
+        all_unique_y = np.unique(r.points_y)
+        nx_orig = len(all_unique_x)
+        ny_orig = len(all_unique_y)
 
-        spacing = float(np.median(np.diff(unique_x))) if nx > 1 else 1.0
+        spacing = float(all_unique_x[1] - all_unique_x[0]) if nx_orig > 1 else 1.0
 
-        x_to_idx = {x: i for i, x in enumerate(unique_x)}
-        y_to_idx = {y: i for i, y in enumerate(unique_y)}
+        x_to_idx = {int(x): i for i, x in enumerate(all_unique_x)}
+        y_to_idx = {int(y): i for i, y in enumerate(all_unique_y)}
 
-        def to_grid(values):
-            grid = np.full((ny, nx), np.nan)
-            v_valid = values[valid]
-            for i, (x, y) in enumerate(zip(px, py)):
-                xi, yi = x_to_idx.get(x), y_to_idx.get(y)
-                if xi is not None and yi is not None:
-                    grid[yi, xi] = v_valid[i]
-            return grid
+        half = spacing / 4.0
+        nx2 = nx_orig * 2
+        ny2 = ny_orig * 2
+
+        unique_x_2x = np.empty(nx2, dtype=np.float64)
+        unique_y_2x = np.empty(ny2, dtype=np.float64)
+        for i in range(nx_orig):
+            unique_x_2x[2 * i]     = all_unique_x[i] - half
+            unique_x_2x[2 * i + 1] = all_unique_x[i] + half
+        for i in range(ny_orig):
+            unique_y_2x[2 * i]     = all_unique_y[i] - half
+            unique_y_2x[2 * i + 1] = all_unique_y[i] + half
 
         return {
-            'unique_x': unique_x, 'unique_y': unique_y,
-            'nx': nx, 'ny': ny, 'spacing': spacing,
-            'to_grid': to_grid,
-            'extent': [unique_x[0], unique_x[-1], unique_y[-1], unique_y[0]]
+            'all_unique_x': all_unique_x,
+            'all_unique_y': all_unique_y,
+            'nx_orig': nx_orig,
+            'ny_orig': ny_orig,
+            'spacing': spacing,
+            'x_to_idx': x_to_idx,
+            'y_to_idx': y_to_idx,
+            'nx2': nx2,
+            'ny2': ny2,
+            'unique_x_2x': unique_x_2x,
+            'unique_y_2x': unique_y_2x,
         }
 
+    def _to_grid_2x(self, values: np.ndarray) -> np.ndarray:
+        """POI 값을 2배 해상도 그리드로 변환"""
+        b = self._grid_base
+        r = self.result
+        grid = np.full((b['ny2'], b['nx2']), np.nan)
+
+        for idx in range(r.n_points):
+            if not r.valid_mask[idx]:
+                continue
+            ix = b['x_to_idx'].get(int(r.points_x[idx]))
+            iy = b['y_to_idx'].get(int(r.points_y[idx]))
+            if ix is None or iy is None:
+                continue
+            val = values[idx]
+            grid[2 * iy,     2 * ix]     = val
+            grid[2 * iy,     2 * ix + 1] = val
+            grid[2 * iy + 1, 2 * ix]     = val
+            grid[2 * iy + 1, 2 * ix + 1] = val
+
+        adss = getattr(r, 'adss_result', None)
+        if adss is not None and adss.n_sub > 0:
+            sub_values = self._get_adss_sub_values(values, adss)
+            if sub_values is not None:
+                qt_to_offset = {5: (0, 0), 6: (0, 1), 7: (1, 0), 8: (1, 1)}
+                for s in range(adss.n_sub):
+                    ix = b['x_to_idx'].get(int(adss.points_x[s]))
+                    iy = b['y_to_idx'].get(int(adss.points_y[s]))
+                    if ix is None or iy is None:
+                        continue
+                    qt = int(adss.quarter_types[s])
+                    offset = qt_to_offset.get(qt)
+                    if offset is None:
+                        continue
+                    dy, dx = offset
+                    grid[2 * iy + dy, 2 * ix + dx] = sub_values[s]
+
+        return grid
+
+    def _get_adss_sub_values(self, values: np.ndarray, adss) -> Optional[np.ndarray]:
+        """현재 필드에 대응하는 ADSS sub-POI 값 추출"""
+        r = self.result
+        n_params = adss.parameters.shape[1]
+        is_affine = (n_params <= 6)
+
+        if values is r.disp_u:
+            return adss.parameters[:, 0]
+        elif values is r.disp_v:
+            return adss.parameters[:, 3] if is_affine else adss.parameters[:, 6]
+        elif hasattr(r, 'disp_ux') and values is r.disp_ux:
+            return adss.parameters[:, 1]
+        elif hasattr(r, 'disp_uy') and values is r.disp_uy:
+            return adss.parameters[:, 2]
+        elif hasattr(r, 'disp_vx') and values is r.disp_vx:
+            return adss.parameters[:, 4] if is_affine else adss.parameters[:, 7]
+        elif hasattr(r, 'disp_vy') and values is r.disp_vy:
+            return adss.parameters[:, 5] if is_affine else adss.parameters[:, 8]
+        else:
+            return None
+
+    # ===== 가중치 기반 bilinear 업샘플링 =====
+
+    def _upsample_field(self, grid: np.ndarray, unique_x: np.ndarray,
+                        unique_y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        가중치 기반 bilinear 업샘플링.
+        
+        NaN을 0으로 채운 값과 유효 마스크(1/0)를 동시에 보간.
+        보간 후 weight > threshold인 영역만 유효, 나머지는 NaN.
+        불연속 경계에서 번짐 없이 유효 영역만 부드럽게 처리.
+        
+        Returns:
+            (val_up, ux_up, uy_up): 업샘플된 값, x좌표, y좌표
+        """
+        if self.upsample <= 1 or grid.shape[0] < 3 or grid.shape[1] < 3:
+            return grid.copy(), unique_x.copy(), unique_y.copy()
+
+        nan_mask = np.isnan(grid)
+        grid_filled = np.where(nan_mask, 0.0, grid)
+        weight = (~nan_mask).astype(np.float64)
+
+        yi_orig = np.arange(grid.shape[0], dtype=np.float64)
+        xi_orig = np.arange(grid.shape[1], dtype=np.float64)
+
+        interp_val = RegularGridInterpolator(
+            (yi_orig, xi_orig), grid_filled, method='linear',
+            bounds_error=False, fill_value=0.0
+        )
+        interp_w = RegularGridInterpolator(
+            (yi_orig, xi_orig), weight, method='linear',
+            bounds_error=False, fill_value=0.0
+        )
+
+        ny_up = (grid.shape[0] - 1) * self.upsample + 1
+        nx_up = (grid.shape[1] - 1) * self.upsample + 1
+        yi_new = np.linspace(0, grid.shape[0] - 1, ny_up)
+        xi_new = np.linspace(0, grid.shape[1] - 1, nx_up)
+        yy, xx = np.meshgrid(yi_new, xi_new, indexing='ij')
+        pts = np.column_stack([yy.ravel(), xx.ravel()])
+
+        val_up = interp_val(pts).reshape(ny_up, nx_up)
+        w_up = interp_w(pts).reshape(ny_up, nx_up)
+
+        valid_up = w_up > self.weight_threshold
+        val_up[valid_up] /= w_up[valid_up]
+        val_up[~valid_up] = np.nan
+
+        ux_up = np.linspace(float(unique_x[0]), float(unique_x[-1]), nx_up)
+        uy_up = np.linspace(float(unique_y[0]), float(unique_y[-1]), ny_up)
+
+        return val_up, ux_up, uy_up
+
+    def _make_edges(self, coords: np.ndarray) -> np.ndarray:
+        """좌표 배열로부터 pcolormesh용 edge 배열 생성"""
+        if len(coords) < 2:
+            half = 0.5
+        else:
+            half = (coords[1] - coords[0]) / 2.0
+        edges = np.concatenate([
+            [coords[0] - half],
+            (coords[:-1] + coords[1:]) / 2.0,
+            [coords[-1] + half]
+        ])
+        return edges
+
+    # ===== 렌더링 =====
+
     def _add_colorbar(self, fig, ax, im, label: str):
-        """축 옆에 정렬된 colorbar 추가"""
         divider = make_axes_locatable(ax)
         cax = divider.append_axes("right", size="5%", pad=0.08)
         cb = fig.colorbar(im, cax=cax)
@@ -123,21 +262,20 @@ class DICPlotter:
     def _draw_field(self, ax, field_2d: np.ndarray, title: str, label: str,
                     cmap: str, symmetric: bool = True, fig=None,
                     vmin: float = None, vmax: float = None):
-        """단일 필드를 축에 그리기"""
-        extent = self._grid_info['extent']
+        """단일 필드: 2x 그리드 → bilinear 업샘플 → pcolormesh flat"""
+        b = self._grid_base
 
-        # 배경 이미지
-        if self.ref_image is not None:
-            ax.imshow(self.ref_image, cmap='gray', alpha=0.3,
-                      extent=[0, self.ref_image.shape[1],
-                              self.ref_image.shape[0], 0])
+        # 1) 가중치 기반 bilinear 업샘플링
+        val_up, ux_up, uy_up = self._upsample_field(
+            field_2d, b['unique_x_2x'], b['unique_y_2x']
+        )
 
-        # 값 범위 결정
-        valid_vals = field_2d[~np.isnan(field_2d)]
+        valid_vals = val_up[~np.isnan(val_up)]
         if len(valid_vals) == 0:
             ax.set_title(title)
             return
 
+        # 2) 값 범위
         if vmin is None or vmax is None:
             p1, p99 = np.percentile(valid_vals, [1, 99])
             if symmetric:
@@ -150,14 +288,21 @@ class DICPlotter:
                 if abs(vmax - vmin) < 1e-15:
                     vmin, vmax = vmin - 1e-6, vmax + 1e-6
 
-        # 정규화
         if symmetric:
             norm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
         else:
             norm = Normalize(vmin=vmin, vmax=vmax)
 
-        im = ax.imshow(field_2d, cmap=cmap, norm=norm, extent=extent,
-                       interpolation='bicubic', aspect='equal')
+        # 3) 업샘플된 좌표에 맞는 edge 생성
+        x_edges = self._make_edges(ux_up)
+        y_edges = self._make_edges(uy_up)
+        X_edges, Y_edges = np.meshgrid(x_edges, y_edges)
+
+        # 4) pcolormesh flat
+        im = ax.pcolormesh(X_edges, Y_edges, val_up,
+                           cmap=cmap, norm=norm, shading='flat')
+        ax.set_aspect('equal')
+        ax.invert_yaxis()
 
         ax.set_title(title, fontweight='bold')
         ax.set_xlabel("x (px)")
@@ -169,17 +314,14 @@ class DICPlotter:
     # ===== 공개 API =====
 
     def plot_displacement(self, show: bool = True, save_path: Optional[str] = None):
-        """변위 필드 시각화 (U, V, |D|)"""
         with plt.rc_context(self._style):
             fig, axes = plt.subplots(1, 3, figsize=(16, 5), dpi=self.dpi)
             fig.suptitle("Displacement Field", fontsize=15, fontweight='bold', y=1.02)
 
-            g = self._grid_info
-            u_grid = g['to_grid'](self.result.disp_u)
-            v_grid = g['to_grid'](self.result.disp_v)
-            mag_grid = np.sqrt(np.where(np.isnan(u_grid), 0, u_grid)**2 +
-                               np.where(np.isnan(v_grid), 0, v_grid)**2)
-            mag_grid[np.isnan(u_grid) & np.isnan(v_grid)] = np.nan
+            r = self.result
+            u_grid = self._to_grid_2x(r.disp_u)
+            v_grid = self._to_grid_2x(r.disp_v)
+            mag_grid = self._build_magnitude_grid(u_grid, v_grid)
 
             self._draw_field(axes[0], u_grid, "U (horizontal)", "U (px)",
                              self.CMAPS['displacement'], symmetric=True, fig=fig)
@@ -198,18 +340,15 @@ class DICPlotter:
             else:
                 plt.close(fig)
 
+    def _build_magnitude_grid(self, u_grid: np.ndarray, v_grid: np.ndarray) -> np.ndarray:
+        mag = np.sqrt(np.where(np.isnan(u_grid), 0, u_grid)**2 +
+                      np.where(np.isnan(v_grid), 0, v_grid)**2)
+        mag[np.isnan(u_grid) & np.isnan(v_grid)] = np.nan
+        return mag
+
     def plot_strain(self, method: str = 'pls', window_size: int = 15,
                     poly_order: int = 2, strain_type: str = 'engineering',
                     show: bool = True, save_path: Optional[str] = None):
-        """
-        변형률 필드 시각화
-
-        Args:
-            method: 'pls' (Pointwise Least Squares) 또는 'direct' (IC-GN gradient)
-            window_size: PLS 윈도우 크기
-            poly_order: PLS 다항식 차수
-            strain_type: 'engineering' 또는 'green-lagrange'
-        """
         with plt.rc_context(self._style):
             fig, axes = plt.subplots(2, 3, figsize=(16, 10), dpi=self.dpi)
             fig.suptitle(f"Strain Field ({method.upper()}, {strain_type})",
@@ -220,12 +359,11 @@ class DICPlotter:
                 exx, eyy, exy = strain.exx, strain.eyy, strain.exy
                 e1, e2, von_mises = strain.e1, strain.e2, strain.von_mises
             elif method == 'direct':
-                g = self._grid_info
-                exx = g['to_grid'](self.result.disp_ux)
-                eyy = g['to_grid'](self.result.disp_vy)
-                exy_raw = 0.5 * (g['to_grid'](self.result.disp_uy) +
-                                  g['to_grid'](self.result.disp_vx))
-                exy = exy_raw
+                r = self.result
+                exx = self._to_grid_2x(r.disp_ux)
+                eyy = self._to_grid_2x(r.disp_vy)
+                exy = 0.5 * (self._to_grid_2x(r.disp_uy) +
+                              self._to_grid_2x(r.disp_vx))
                 e_mean = 0.5 * (exx + eyy)
                 R = np.sqrt(((exx - eyy) / 2)**2 + exy**2)
                 e1, e2 = e_mean + R, e_mean - R
@@ -253,20 +391,16 @@ class DICPlotter:
                 plt.close(fig)
 
     def plot_zncc(self, show: bool = True, save_path: Optional[str] = None):
-        """ZNCC 분포 시각화"""
         with plt.rc_context(self._style):
             fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=self.dpi)
             fig.suptitle("ZNCC Quality Map", fontsize=15, fontweight='bold', y=1.02)
 
-            g = self._grid_info
-            zncc_grid = g['to_grid'](self.result.zncc_values)
+            zncc_grid = self._to_grid_2x(self.result.zncc_values)
 
-            # 맵
             self._draw_field(axes[0], zncc_grid, "ZNCC Map", "ZNCC",
                              self.CMAPS['zncc'], symmetric=False, fig=fig,
                              vmin=0.0, vmax=1.0)
 
-            # 히스토그램
             valid_zncc = self.result.zncc_values[self.result.valid_mask]
             axes[1].hist(valid_zncc, bins=50, color='steelblue', edgecolor='white',
                          alpha=0.8)
@@ -289,7 +423,6 @@ class DICPlotter:
     def plot_all(self, method: str = 'pls', window_size: int = 15,
                  poly_order: int = 2, show: bool = True,
                  save_dir: Optional[str] = None):
-        """전체 결과 일괄 시각화"""
         save_dir = Path(save_dir) if save_dir else None
         if save_dir:
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -311,7 +444,6 @@ class DICPlotter:
     def save_all(self, output_dir: str, method: str = 'pls',
                  window_size: int = 15, poly_order: int = 2,
                  fmt: str = 'png'):
-        """전체 결과 파일로 저장 (창 표시 없음)"""
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
@@ -326,17 +458,18 @@ class DICPlotter:
     # ===== 내부 유틸리티 =====
 
     def _compute_pls_strain(self, window_size, poly_order, strain_type):
-        """PLS 변형률 계산"""
         from speckle.core.postprocess.strain_pls import compute_strain_pls
 
-        g = self._grid_info
-        u_grid = g['to_grid'](self.result.disp_u)
-        v_grid = g['to_grid'](self.result.disp_v)
+        b = self._grid_base
+        u_grid = self._to_grid_2x(self.result.disp_u)
+        v_grid = self._to_grid_2x(self.result.disp_v)
+
+        grid_step_2x = b['spacing'] / 2.0
 
         return compute_strain_pls(
             u_grid, v_grid,
             window_size=window_size,
             poly_order=poly_order,
-            grid_step=g['spacing'],
+            grid_step=grid_step_2x,
             strain_type=strain_type
         )

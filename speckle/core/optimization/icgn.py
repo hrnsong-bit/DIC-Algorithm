@@ -342,7 +342,7 @@ def _compute_icgn_numba(
         )
         _logger.info(f"IC-GN 불량 ZNCC 구간: {bin_info}")
 
-       # ── 2단계 재계산: ADSS-DIC 또는 Variable Subset ──────────────
+    # ── 2단계 재계산: ADSS-DIC 또는 Variable Subset ──────────────
     adss_result_obj = None
 
     if enable_adss_subset:
