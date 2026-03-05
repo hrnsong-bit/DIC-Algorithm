@@ -29,6 +29,12 @@ FAILURE_REASON_NAMES = {
 }
 
 # ADSS quarter-subset 상수
+# 삼각형 (대각선 분할)
+ADSS_Q1 = 1  # Upper triangle (상): η ≤ -|ξ|
+ADSS_Q2 = 2  # Lower triangle (하): η ≥  |ξ|
+ADSS_Q3 = 3  # Left triangle  (좌): ξ ≤ -|η|
+ADSS_Q4 = 4  # Right triangle (우): ξ ≥  |η|
+# 사각형 (축 분할)
 ADSS_Q5 = 5  # Upper-left
 ADSS_Q6 = 6  # Upper-right
 ADSS_Q7 = 7  # Lower-left
@@ -64,7 +70,7 @@ class ADSSResult:
     eta_maxs: np.ndarray            # (n_sub,) int32
 
     # --- 1-warp 평가 ZNCC (디버그/분석용) ---
-    # (n_bad_original, 4) — 각 불량 POI의 Q5~Q8 1-warp ZNCC
+    # (n_bad_original, 8) — 각 불량 POI의 Q1~Q8 1-warp ZNCC
     candidate_zncc: Optional[np.ndarray] = None
 
     # --- 통계 ---
@@ -115,6 +121,11 @@ class ADSSResult:
             'n_parent_recovered': self.n_parent_recovered,
             'n_unrecoverable': self.n_unrecoverable,
         }
+    @property
+    def is_triangle_quarter(self) -> np.ndarray:
+        """각 sub-POI가 삼각형 quarter(Q1~Q4)인지 여부"""
+        return self.quarter_types <= 4
+
 
 
 @dataclass
@@ -227,3 +238,4 @@ class ICGNResult:
             if count > 0:
                 summary[name] = count
         return summary
+    

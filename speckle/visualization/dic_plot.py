@@ -43,9 +43,10 @@ class DICPlotter:
     }
 
     CMAPS = {
-        'displacement': 'RdBu_r',
+        'displacement': 'RdBu_r',   # u field용 (빨강=양, 파랑=음) — 기존과 동일
+        'displacement_v': 'RdBu',   # v field용 (파랑=양, 빨강=음) — 새로 추가
         'strain': 'RdBu_r',
-        'magnitude': 'hot',
+        'magnitude': 'jet',          # hot → jet 으로 변경
         'zncc': 'viridis',
         'von_mises': 'inferno',
     }
@@ -148,18 +149,32 @@ class DICPlotter:
         if adss is not None and adss.n_sub > 0:
             sub_values = self._get_adss_sub_values(values, adss)
             if sub_values is not None:
-                qt_to_offset = {5: (0, 0), 6: (0, 1), 7: (1, 0), 8: (1, 1)}
+                # 사각형: quarter → 단일 서브셀
+                qt_to_single = {5: [(0, 0)], 6: [(0, 1)], 7: [(1, 0)], 8: [(1, 1)]}
+                # 삼각형: quarter → 2개 서브셀
+                qt_to_double = {
+                    1: [(0, 0), (0, 1)],   # Q1 상: 좌상 + 우상
+                    2: [(1, 0), (1, 1)],   # Q2 하: 좌하 + 우하
+                    3: [(0, 0), (1, 0)],   # Q3 좌: 좌상 + 좌하
+                    4: [(0, 1), (1, 1)],   # Q4 우: 우상 + 우하
+                }
+
                 for s in range(adss.n_sub):
                     ix = b['x_to_idx'].get(int(adss.points_x[s]))
                     iy = b['y_to_idx'].get(int(adss.points_y[s]))
                     if ix is None or iy is None:
                         continue
                     qt = int(adss.quarter_types[s])
-                    offset = qt_to_offset.get(qt)
-                    if offset is None:
+
+                    if qt in qt_to_double:
+                        cells = qt_to_double[qt]
+                    elif qt in qt_to_single:
+                        cells = qt_to_single[qt]
+                    else:
                         continue
-                    dy, dx = offset
-                    grid[2 * iy + dy, 2 * ix + dx] = sub_values[s]
+
+                    for dy, dx in cells:
+                        grid[2 * iy + dy, 2 * ix + dx] = sub_values[s]
 
         return grid
 
@@ -323,12 +338,30 @@ class DICPlotter:
             v_grid = self._to_grid_2x(r.disp_v)
             mag_grid = self._build_magnitude_grid(u_grid, v_grid)
 
-            self._draw_field(axes[0], u_grid, "U (horizontal)", "U (px)",
-                             self.CMAPS['displacement'], symmetric=True, fig=fig)
-            self._draw_field(axes[1], v_grid, "V (vertical)", "V (px)",
-                             self.CMAPS['displacement'], symmetric=True, fig=fig)
-            self._draw_field(axes[2], mag_grid, "|D| (magnitude)", "|D| (px)",
-                             self.CMAPS['magnitude'], symmetric=False, fig=fig)
+            # --- u field: 최소값이 0이면 symmetric=False 사용 ---
+            u_valid = u_grid[~np.isnan(u_grid)]
+            u_min = np.min(u_valid) if len(u_valid) > 0 else 0
+            u_symmetric = u_min < -1e-6  # 음수가 있으면 symmetric
+
+            self._draw_field(axes[0], u_grid,
+                            f"u field (max |u| = {np.nanmax(np.abs(u_grid)):.2f} px)",
+                            "u (px)",
+                            self.CMAPS['displacement'],
+                            symmetric=u_symmetric, fig=fig)
+
+            # --- v field: RdBu (reverse 없음) → 파랑=양, 빨강=음 ---
+            self._draw_field(axes[1], v_grid,
+                            f"v field (max |v| = {np.nanmax(np.abs(v_grid)):.2f} px)",
+                            "v (px)",
+                            self.CMAPS['displacement_v'],
+                            symmetric=True, fig=fig)
+
+            # --- magnitude: jet, non-symmetric ---
+            self._draw_field(axes[2], mag_grid,
+                            f"Magnitude (max = {np.nanmax(mag_grid):.2f} px)",
+                            "|D| (px)",
+                            self.CMAPS['magnitude'],
+                            symmetric=False, fig=fig)
 
             fig.tight_layout()
             if save_path:
@@ -339,6 +372,7 @@ class DICPlotter:
                 plt.show()
             else:
                 plt.close(fig)
+
 
     def _build_magnitude_grid(self, u_grid: np.ndarray, v_grid: np.ndarray) -> np.ndarray:
         mag = np.sqrt(np.where(np.isnan(u_grid), 0, u_grid)**2 +

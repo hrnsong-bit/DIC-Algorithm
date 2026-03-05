@@ -1,18 +1,21 @@
 """
-ADSS-DIC v2 (Adaptive Subset-Subdivision) 래퍼 모듈
+ADSS-DIC v3 (Adaptive Subset-Subdivision) 래퍼 모듈
 
-사분면(Q5~Q8) 복수 채택 방식:
-    - 각 불량 POI에서 threshold를 넘는 모든 사분면에 IC-GN 수행
+삼각형(Q1~Q4) + 사각형(Q5~Q8) 적응 선택 방식:
+    - 각 불량 POI에서 8개 quarter의 1-warp ZNCC를 평가
+    - 삼각형 세트 vs 사각형 세트 중 유효 quarter 수가 많은 쪽 선택
+    - 선택된 세트에서 threshold를 넘는 quarter에 IC-GN 수행
     - 결과를 ADSSResult로 반환 (sub-POI 복수 저장)
     - 대표값(최대 ZNCC)을 ICGNResult에 반영하여 기존 파이프라인 호환
 
-파이프라인: FFT-CC → IC-GN → ADSS v2 재계산 → PLS 변형률
+파이프라인: FFT-CC → IC-GN → ADSS v3 재계산 → PLS 변형률
 
 References:
     Zhao, J. & Pan, B. "Adaptive subset-subdivision for automatic
     digital image correlation calculation on discontinuous shape
     and deformation." Applied Optics, 2025.
 """
+
 
 import numpy as np
 import time
@@ -22,7 +25,7 @@ from .results import ADSSResult, ICGN_SUCCESS
 from .shape_function_numba import AFFINE, QUADRATIC, get_num_params
 from .variable_subset import _detect_grid_structure
 from .adss_subset_numba import (
-    Q5, Q6, Q7, Q8,
+    Q1, Q2, Q3, Q4, Q5, Q6, Q7, Q8,
     process_bad_pois_adss_multi_parallel,
     allocate_adss_multi_batch_buffers,
 )
@@ -36,27 +39,25 @@ def _build_neighbor_info_adss_v2(
     zncc_threshold, ny, nx, n_params
 ):
     """
-    ADSS-DIC v2용 이웃 정보 구성 — 사분면당 3이웃 후보.
+    ADSS-DIC v3용 이웃 정보 구성 — quarter당 3이웃 후보.
 
-    각 사분면에 대해 인접한 3방향 이웃을 후보로 저장한다.
+    8개 quarter 각각에 대해 인접한 3방향 이웃을 후보로 저장한다.
+      Q1(상):   상, 좌상, 우상
+      Q2(하):   하, 좌하, 우하
+      Q3(좌):   좌, 좌상, 좌하
+      Q4(우):   우, 우상, 우하
       Q5(좌상): 좌상, 상, 좌
       Q6(우상): 우상, 상, 우
       Q7(좌하): 좌하, 하, 좌
       Q8(우하): 우하, 하, 우
-
-    Returns
-    -------
-    all_neighbor_valid  : (n_bad, 4, 3) bool
-    all_neighbor_params : (n_bad, 4, 3, n_params) float64
-    all_neighbor_x      : (n_bad, 4, 3) float64
-    all_neighbor_y      : (n_bad, 4, 3) float64
     """
+
     n_bad = len(bad_indices)
 
-    all_neighbor_valid  = np.zeros((n_bad, 4, 3), dtype=np.bool_)
-    all_neighbor_params = np.zeros((n_bad, 4, 3, n_params), dtype=np.float64)
-    all_neighbor_x      = np.zeros((n_bad, 4, 3), dtype=np.float64)
-    all_neighbor_y      = np.zeros((n_bad, 4, 3), dtype=np.float64)
+    all_neighbor_valid  = np.zeros((n_bad, 8, 3), dtype=np.bool_)
+    all_neighbor_params = np.zeros((n_bad, 8, 3, n_params), dtype=np.float64)
+    all_neighbor_x      = np.zeros((n_bad, 8, 3), dtype=np.float64)
+    all_neighbor_y      = np.zeros((n_bad, 8, 3), dtype=np.float64)
 
     # 8방위 이웃 방향 (dy, dx)
     #   0:좌상  1:상  2:우상
@@ -70,6 +71,12 @@ def _build_neighbor_info_adss_v2(
 
     # 각 사분면에 대한 3이웃 후보 인덱스 (all_dirs 기준)
     quarter_neighbor_indices = [
+        # --- 삼각형 (Q1~Q4) ---
+        [1, 0, 2],  # Q1(상)  ← 상, 좌상, 우상
+        [6, 5, 7],  # Q2(하)  ← 하, 좌하, 우하
+        [3, 0, 5],  # Q3(좌)  ← 좌, 좌상, 좌하
+        [4, 2, 7],  # Q4(우)  ← 우, 우상, 우하
+        # --- 사각형 (Q5~Q8) ---
         [0, 1, 3],  # Q5(좌상) ← 좌상, 상, 좌
         [2, 1, 4],  # Q6(우상) ← 우상, 상, 우
         [5, 6, 3],  # Q7(좌하) ← 좌하, 하, 좌
@@ -81,7 +88,7 @@ def _build_neighbor_info_adss_v2(
         iy = flat_idx // nx
         ix = flat_idx % nx
 
-        for q in range(4):  # 사분면 Q5~Q8
+        for q in range(8):
             for c, dir_idx in enumerate(quarter_neighbor_indices[q]):
                 dy, dx = all_dirs[dir_idx]
                 niy = iy + dy
@@ -201,8 +208,8 @@ def compute_adss_recalc(
     result_qt = np.zeros(max_sub, dtype=np.int32)
     result_parent = np.full(max_sub, -1, dtype=np.int64)
     result_count = np.zeros(n_cand, dtype=np.int32)
-    result_candidate_zncc = np.full((n_cand, 4), -1.0, dtype=np.float64)
-    result_fail_info = np.full((n_cand, 4, 3), -1.0, dtype=np.float64)    # ← 추가
+    result_candidate_zncc = np.full((n_cand, 8), -1.0, dtype=np.float64)
+    result_fail_info = np.full((n_cand, 8, 3), -1.0, dtype=np.float64)
 
     # === 5. 배치 병렬 처리 ===
     process_bad_pois_adss_multi_parallel(
@@ -216,7 +223,7 @@ def compute_adss_recalc(
         zncc_threshold, zncc_pre_threshold,
         result_p, result_zncc, result_iter, result_qt,
         result_parent, result_count, result_candidate_zncc,
-        result_fail_info,                                                   # ← 추가
+        result_fail_info,
         bufs['f'], bufs['dfdx'], bufs['dfdy'],
         bufs['J'], bufs['H'], bufs['H_inv'],
         bufs['p'], bufs['xsi_w'], bufs['eta_w'],
@@ -226,7 +233,7 @@ def compute_adss_recalc(
         bufs['init_params'],
         bufs['out_p'], bufs['out_zncc'], bufs['out_iter'],
         bufs['out_qt'], bufs['out_cand_zncc'],
-        bufs['out_fail_info'],                                              # ← 추가
+        bufs['out_fail_info'],
     )
 
     # === 6. 유효 결과 추출 ===
@@ -249,10 +256,14 @@ def compute_adss_recalc(
     sub_eta_max = np.zeros(n_sub_total, dtype=np.int32)
 
     qt_to_range = {
-        5: (-M, 0, -M, 0),
-        6: (0, M, -M, 0),
-        7: (-M, 0, 0, M),
-        8: (0, M, 0, M),
+        1: (-M, M, -M, 0),    # Q1 bounding box
+        2: (-M, M, 0, M),     # Q2
+        3: (-M, 0, -M, M),    # Q3
+        4: (0, M, -M, M),     # Q4
+        5: (-M, 0, -M, 0),    # Q5
+        6: (0, M, -M, 0),     # Q6
+        7: (-M, 0, 0, M),     # Q7
+        8: (0, M, 0, M),      # Q8
     }
 
     for i in range(n_sub_total):
@@ -269,7 +280,7 @@ def compute_adss_recalc(
     n_unrecoverable = n_bad - n_parent_recovered
 
     # === 8. candidate_zncc를 bad_indices 전체로 매핑 ===
-    all_cand_zncc = np.full((n_bad, 4), -1.0, dtype=np.float64)
+    all_cand_zncc = np.full((n_bad, 8), -1.0, dtype=np.float64)
     for k in range(n_cand):
         orig_k = np.searchsorted(bad_indices, cand_indices[k])
         if orig_k < n_bad:
@@ -278,13 +289,16 @@ def compute_adss_recalc(
     elapsed = time.time() - t_start
 
     # === 9. 로그 출력 (fail_info 포함) ===
-    quarter_names = {5: 'Q5:UL', 6: 'Q6:UR', 7: 'Q7:LL', 8: 'Q8:LR'}
+    quarter_names = {
+        1: 'Q1:UT', 2: 'Q2:LT', 3: 'Q3:LF', 4: 'Q4:RT',
+        5: 'Q5:UL', 6: 'Q6:UR', 7: 'Q7:LL', 8: 'Q8:LR',
+    }
     fail_code_names = {
         -1: 'NOT_TRIED', 0: 'SUCCESS', 1: 'LOW_ZNCC', 2: 'DIVERGED',
         3: 'OUT_OF_BOUNDS', 4: 'SINGULAR_H', 5: 'FLAT_SUBSET',
         6: 'MAX_DISP', 7: 'FLAT_TARGET', 99: 'REF_EXTRACT_FAIL'
     }
-    qn = ['Q5:UL', 'Q6:UR', 'Q7:LL', 'Q8:LR']
+    qn = ['Q1:UT', 'Q2:LT', 'Q3:LF', 'Q4:RT', 'Q5:UL', 'Q6:UR', 'Q7:LL', 'Q8:LR']
 
     for k in range(n_cand):
         fidx = cand_indices[k]
@@ -298,7 +312,7 @@ def compute_adss_recalc(
             rec_qts.append(quarter_names.get(result_qt[offset + j], '?'))
 
         detail_strs = []
-        for i in range(4):
+        for i in range(8):
             if cz[i] < 0:
                 detail_strs.append(f"{qn[i]}:N/A")
             else:

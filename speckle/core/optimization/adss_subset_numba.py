@@ -1,7 +1,6 @@
 import numpy as np
 from numba import jit, float64, prange
 
-from .variable_subset_numba import extract_reference_subset_variable
 from .interpolation_numba import (
     is_inside_batch,
     _interp2d_cubic,
@@ -24,20 +23,26 @@ from .icgn_core_numba import (
 )
 
 """
-ADSS-DIC v2 (Adaptive Subset-Subdivision) Numba 가속 모듈
+ADSS-DIC v3 (Adaptive Subset-Subdivision) Numba 가속 모듈
 
-사분면(Q5~Q8) 복수 채택 방식:
-    1. 각 불량 POI에서 4개 사분면의 1-warp ZNCC를 평가
-    2. pre_threshold를 넘는 모든 사분면에 IC-GN을 수행
-    3. zncc_threshold를 넘는 모든 사분면 결과를 sub-POI로 반환
+삼각형(Q1~Q4) + 사각형(Q5~Q8) 적응 선택 방식:
+    1. 각 불량 POI에서 8개 quarter(삼각4+사각4)의 1-warp ZNCC를 평가
+    2. 삼각형 세트 vs 사각형 세트 중 유효 quarter 수가 많은 쪽 선택
+       (동률 시 ZNCC 합산 비교)
+    3. 선택된 세트에서 pre_threshold를 넘는 quarter에 IC-GN 수행
+    4. zncc_threshold를 넘는 결과를 sub-POI로 반환
 
-Quarter-subset 정의 (사분면만 사용):
-    Q5: Upper-left   ξ ∈ [-M, 0],  η ∈ [-M, 0]   → (M+1)×(M+1) 픽셀
-    Q6: Upper-right  ξ ∈ [0, +M],  η ∈ [-M, 0]   → (M+1)×(M+1) 픽셀
-    Q7: Lower-left   ξ ∈ [-M, 0],  η ∈ [0, +M]   → (M+1)×(M+1) 픽셀
-    Q8: Lower-right  ξ ∈ [0, +M],  η ∈ [0, +M]   → (M+1)×(M+1) 픽셀
-
-여기서 ξ는 x(col) 방향, η는 y(row) 방향이다.
+Quarter-subset 정의:
+    삼각형 (대각선 분할):
+        Q1: Upper   η ≤ -|ξ|  → (M+1)² 픽셀
+        Q2: Lower   η ≥  |ξ|  → (M+1)² 픽셀
+        Q3: Left    ξ ≤ -|η|  → (M+1)² 픽셀
+        Q4: Right   ξ ≥  |η|  → (M+1)² 픽셀
+    사각형 (축 분할):
+        Q5: Upper-left   ξ ∈ [-M, 0],  η ∈ [-M, 0]  → (M+1)² 픽셀
+        Q6: Upper-right  ξ ∈ [0, +M],  η ∈ [-M, 0]  → (M+1)² 픽셀
+        Q7: Lower-left   ξ ∈ [-M, 0],  η ∈ [0, +M]  → (M+1)² 픽셀
+        Q8: Lower-right  ξ ∈ [0, +M],  η ∈ [0, +M]  → (M+1)² 픽셀
 
 Reference:
     Zhao, J., & Pan, B. "Adaptive subset-subdivision for automatic
@@ -45,20 +50,120 @@ Reference:
     and deformation." Applied Optics, 2025.
 """
 
-# === Quarter-subset 상수 ===
+
+# 삼각형 (대각선 분할)
+Q1 = 1  # Upper triangle (상): η ≤ -|ξ|
+Q2 = 2  # Lower triangle (하): η ≥  |ξ|
+Q3 = 3  # Left triangle  (좌): ξ ≤ -|η|
+Q4 = 4  # Right triangle (우): ξ ≥  |η|
+# 사각형 (축 분할)
 Q5 = 5  # Upper-left
 Q6 = 6  # Upper-right
 Q7 = 7  # Lower-left
 Q8 = 8  # Lower-right
 
-# 각 사분면에 대응하는 이웃 방향 (dy, dx)
-QUARTER_TO_NEIGHBOR = {
-    Q5: (-1, -1),  # upper-left  → 좌상 이웃
-    Q6: (-1,  1),  # upper-right → 우상 이웃
-    Q7: ( 1, -1),  # lower-left  → 좌하 이웃
-    Q8: ( 1,  1),  # lower-right → 우하 이웃
-}
+@jit(nopython=True, cache=True)
+def fill_triangle_coords(quarter_type, M, xsi_out, eta_out):
+    """
+    삼각형 quarter-subset의 로컬 좌표를 버퍼에 기록.
 
+    Args:
+        quarter_type: Q1(1)~Q4(4)
+        M: half subset size (subset_size // 2)
+        xsi_out, eta_out: 출력 버퍼 (n_pixels_max,)
+
+    Returns:
+        n_pixels: 실제 기록된 픽셀 수 = (M+1)²
+
+    좌표 정의 (row-major: η 외부, ξ 내부):
+        Q1(상): η ∈ [-M, 0], 각 η에서 ξ ∈ [η, -η]
+        Q2(하): η ∈ [0, +M], 각 η에서 ξ ∈ [-η, η]
+        Q3(좌): η ∈ [-M, +M], 각 η에서 ξ ∈ [-M, -|η|]
+        Q4(우): η ∈ [-M, +M], 각 η에서 ξ ∈ [|η|, M]
+    """
+    idx = 0
+
+    if quarter_type == 1:      # Q1: 상 삼각형
+        for eta in range(-M, 1):
+            for xsi in range(eta, -eta + 1):
+                xsi_out[idx] = float64(xsi)
+                eta_out[idx] = float64(eta)
+                idx += 1
+
+    elif quarter_type == 2:    # Q2: 하 삼각형
+        for eta in range(0, M + 1):
+            for xsi in range(-eta, eta + 1):
+                xsi_out[idx] = float64(xsi)
+                eta_out[idx] = float64(eta)
+                idx += 1
+
+    elif quarter_type == 3:    # Q3: 좌 삼각형
+        for eta in range(-M, M + 1):
+            a = eta if eta >= 0 else -eta
+            for xsi in range(-M, -a + 1):
+                xsi_out[idx] = float64(xsi)
+                eta_out[idx] = float64(eta)
+                idx += 1
+
+    elif quarter_type == 4:    # Q4: 우 삼각형
+        for eta in range(-M, M + 1):
+            a = eta if eta >= 0 else -eta
+            for xsi in range(a, M + 1):
+                xsi_out[idx] = float64(xsi)
+                eta_out[idx] = float64(eta)
+                idx += 1
+
+    return idx
+
+@jit(nopython=True, cache=True)
+def extract_reference_subset_by_coords(
+    ref_image, grad_x, grad_y,
+    cx, cy,
+    xsi_coords, eta_coords, n_pixels,
+    f_out, dfdx_out, dfdy_out
+):
+    """
+    임의 좌표 목록으로 reference subset 추출.
+
+    삼각형/사각형 모두 사용 가능한 범용 함수.
+
+    Args:
+        ref_image, grad_x, grad_y: (H, W) float64
+        cx, cy: POI 중심 좌표 (정수)
+        xsi_coords, eta_coords: 로컬 좌표 배열 (n_pixels_max,)
+        n_pixels: 유효 픽셀 수
+        f_out, dfdx_out, dfdy_out: 출력 벡터 (n_pixels_max,)
+
+    Returns:
+        (f_mean, f_tilde, valid)
+    """
+    h = ref_image.shape[0]
+    w = ref_image.shape[1]
+
+    for i in range(n_pixels):
+        col = cx + int(xsi_coords[i])
+        row = cy + int(eta_coords[i])
+        if row < 0 or row >= h or col < 0 or col >= w:
+            return 0.0, 0.0, False
+        f_out[i] = ref_image[row, col]
+        dfdx_out[i] = grad_x[row, col]
+        dfdy_out[i] = grad_y[row, col]
+
+    f_sum = 0.0
+    for i in range(n_pixels):
+        f_sum += f_out[i]
+    f_mean = f_sum / float64(n_pixels)
+
+    tilde_sq = 0.0
+    for i in range(n_pixels):
+        diff = f_out[i] - f_mean
+        tilde_sq += diff * diff
+    f_tilde = np.sqrt(tilde_sq)
+
+    if f_tilde < 1e-10:
+        return f_mean, f_tilde, False
+
+    return f_mean, f_tilde, True
 
 @jit(nopython=True, cache=True)
 def predict_initial_params(
@@ -120,7 +225,6 @@ def evaluate_quarter_zncc(
     coeffs, order,
     cx, cy,
     init_params,
-    xsi_min, xsi_max, eta_min, eta_max,
     xsi, eta,
     shape_type,
     n_pixels,
@@ -129,15 +233,17 @@ def evaluate_quarter_zncc(
     x_def, y_def,
     g
 ):
+
     """단일 quarter-subset에 대해 1회 warp ZNCC를 계산."""
     img_h = ref_image.shape[0]
     img_w = ref_image.shape[1]
 
-    f_mean, f_tilde, valid = extract_reference_subset_variable(
+    f_mean, f_tilde, valid = extract_reference_subset_by_coords(
         ref_image, grad_x, grad_y, cx, cy,
-        xsi_min, xsi_max, eta_min, eta_max,
+        xsi, eta, n_pixels,
         f, dfdx, dfdy
     )
+
     if not valid:
         return -1.0
 
@@ -187,18 +293,18 @@ def process_poi_adss_multi(
     max_iterations,
     convergence_threshold,
     shape_type,
-    neighbor_valid,       # (4, 3) bool      ← shape 변경
-    neighbor_params,      # (4, 3, n_params)  ← shape 변경
-    neighbor_x,           # (4, 3)            ← shape 변경
-    neighbor_y,           # (4, 3)            ← shape 변경
+    neighbor_valid,       # (8, 3) bool       ← shape 변경 4→8
+    neighbor_params,      # (8, 3, n_params)  ← 4→8
+    neighbor_x,           # (8, 3)            ← 4→8
+    neighbor_y,           # (8, 3)            ← 4→8
     zncc_threshold,
     zncc_pre_threshold,
-    out_p,
-    out_zncc,
-    out_iter,
-    out_qt,
-    out_candidate_zncc,
-    out_fail_info,
+    out_p,                # (4, n_params)     ← 유지 (선택된 세트의 최대 4개)
+    out_zncc,             # (4,)              ← 유지
+    out_iter,             # (4,)              ← 유지
+    out_qt,               # (4,)              ← 유지
+    out_candidate_zncc,   # (8,)              ← 4→8
+    out_fail_info,        # (8, 3)            ← 4→8
     f, dfdx, dfdy,
     J, H, H_inv_buf,
     p, xsi_w, eta_w,
@@ -207,120 +313,175 @@ def process_poi_adss_multi(
     xsi_local, eta_local,
     init_params_buf
 ):
+
     M = subset_size // 2
     n_params = get_num_params(shape_type)
+    qt_codes = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.int32)
 
-    xsi_mins = np.array([-M,  0, -M,  0], dtype=np.int64)
-    xsi_maxs = np.array([ 0,  M,  0,  M], dtype=np.int64)
-    eta_mins = np.array([-M, -M,  0,  0], dtype=np.int64)
-    eta_maxs = np.array([ 0,  0,  M,  M], dtype=np.int64)
-    qt_codes = np.array([5, 6, 7, 8], dtype=np.int32)
+    # 사각형 quarter 좌표 범위 (Q5~Q8, 인덱스 4~7)
+    rect_xsi_mins = np.array([-M,  0, -M,  0], dtype=np.int64)
+    rect_xsi_maxs = np.array([ 0,  M,  0,  M], dtype=np.int64)
+    rect_eta_mins = np.array([-M, -M,  0,  0], dtype=np.int64)
+    rect_eta_maxs = np.array([ 0,  0,  M,  M], dtype=np.int64)
 
-    for i in range(4):
+    # 초기화
+    for i in range(8):
         out_candidate_zncc[i] = -1.0
-        out_zncc[i] = 0.0
-        out_iter[i] = 0
-        out_qt[i] = -1
         out_fail_info[i, 0] = -1.0
         out_fail_info[i, 1] = 0.0
         out_fail_info[i, 2] = -1.0
-
-    # === 임시 버퍼: 각 사분면의 최적 이웃 초기값 저장 ===
-    best_init_params = np.zeros((4, n_params), dtype=np.float64)
-
-    # === Step 1: 각 사분면에 대해 3이웃 후보 평가, 최고 ZNCC 이웃 선택 ===
     for i in range(4):
-        # 사분면 픽셀 좌표 생성
-        idx = 0
-        for row in range(eta_mins[i], eta_maxs[i] + 1):
-            for col in range(xsi_mins[i], xsi_maxs[i] + 1):
-                xsi_local[idx] = float64(col)
-                eta_local[idx] = float64(row)
-                idx += 1
-        n_pix = idx
+        out_zncc[i] = 0.0
+        out_iter[i] = 0
+        out_qt[i] = -1
 
-        best_zncc_for_quarter = -1.0
+    best_init_params = np.zeros((8, n_params), dtype=np.float64)
 
-        for c in range(3):  # 3개 이웃 후보 순회
+    # === Phase 1: 8개 quarter 모두 1-warp ZNCC 평가 ===
+    for i in range(8):
+        # 좌표 생성
+        if i < 4:
+            n_pix = fill_triangle_coords(qt_codes[i], M, xsi_local, eta_local)
+        else:
+            ri = i - 4
+            idx = 0
+            for row in range(rect_eta_mins[ri], rect_eta_maxs[ri] + 1):
+                for col in range(rect_xsi_mins[ri], rect_xsi_maxs[ri] + 1):
+                    xsi_local[idx] = float64(col)
+                    eta_local[idx] = float64(row)
+                    idx += 1
+            n_pix = idx
+
+        # 3이웃 후보 중 best ZNCC 선택
+        best_zncc_for_q = -1.0
+        for c in range(3):
             if not neighbor_valid[i, c]:
                 continue
-
             predict_initial_params(
                 neighbor_x[i, c], neighbor_y[i, c],
                 neighbor_params[i, c],
                 float64(cx), float64(cy),
                 shape_type, init_params_buf
             )
-
             zncc_1warp = evaluate_quarter_zncc(
                 ref_image, grad_x, grad_y,
                 coeffs, order, cx, cy,
                 init_params_buf,
-                xsi_mins[i], xsi_maxs[i], eta_mins[i], eta_maxs[i],
                 xsi_local, eta_local,
                 shape_type, n_pix,
                 f, dfdx, dfdy, xsi_w, eta_w, x_def, y_def, g
             )
-
-            if zncc_1warp > best_zncc_for_quarter:
-                best_zncc_for_quarter = zncc_1warp
+            if zncc_1warp > best_zncc_for_q:
+                best_zncc_for_q = zncc_1warp
                 for k in range(n_params):
                     best_init_params[i, k] = init_params_buf[k]
 
-        out_candidate_zncc[i] = best_zncc_for_quarter
+        out_candidate_zncc[i] = best_zncc_for_q
 
-    # === Step 2: pre_threshold 이상인 사분면 모두 IC-GN ===
+    # === Phase 2: 세트 선택 (1차: 평균 ZNCC, 2차: count) ===
+    count_tri = 0
+    sum_tri = 0.0
+    count_rect = 0
+    sum_rect = 0.0
+
+    for i in range(4):
+        if out_candidate_zncc[i] >= zncc_threshold:
+            count_tri += 1
+            sum_tri += out_candidate_zncc[i]
+    for i in range(4, 8):
+        if out_candidate_zncc[i] >= zncc_threshold:
+            count_rect += 1
+            sum_rect += out_candidate_zncc[i]
+
+    # 평균 ZNCC 계산
+    avg_tri = sum_tri / float64(count_tri) if count_tri > 0 else 0.0
+    avg_rect = sum_rect / float64(count_rect) if count_rect > 0 else 0.0
+
+    # ε: 평균 차이가 이 이하이면 "비슷하다"고 판단
+    epsilon = 0.01
+
+    if count_tri == 0 and count_rect == 0:
+        return 0                          # 복원 불가
+    elif count_rect == 0:
+        selected_offset = 0               # 삼각형만 유효
+    elif count_tri == 0:
+        selected_offset = 4               # 사각형만 유효
+    elif abs(avg_rect - avg_tri) < epsilon:
+        # 평균이 비슷 → count가 많은 쪽 (동률 시 사각형 우선)
+        if count_tri > count_rect:
+            selected_offset = 0
+        else:
+            selected_offset = 4
+    else:
+        # 평균 차이가 유의미 → 평균이 높은 쪽
+        if avg_rect >= avg_tri:
+            selected_offset = 4
+        else:
+            selected_offset = 0
+
+
+    # === Phase 3: 선택된 4개 중 pre_threshold 이상만 IC-GN ===
     n_recovered = 0
     quarter_subset_size = M + 1
 
     for i in range(4):
-        if out_candidate_zncc[i] < zncc_pre_threshold:
+        qi = selected_offset + i
+
+        if out_candidate_zncc[qi] < zncc_threshold:
             continue
 
-        idx = 0
-        for row in range(eta_mins[i], eta_maxs[i] + 1):
-            for col in range(xsi_mins[i], xsi_maxs[i] + 1):
-                xsi_local[idx] = float64(col)
-                eta_local[idx] = float64(row)
-                idx += 1
-        n_pixels = idx
+        # 좌표 재생성
+        if qi < 4:
+            n_pixels = fill_triangle_coords(qt_codes[qi], M, xsi_local, eta_local)
+        else:
+            ri = qi - 4
+            idx = 0
+            for row in range(rect_eta_mins[ri], rect_eta_maxs[ri] + 1):
+                for col in range(rect_xsi_mins[ri], rect_xsi_maxs[ri] + 1):
+                    xsi_local[idx] = float64(col)
+                    eta_local[idx] = float64(row)
+                    idx += 1
+            n_pixels = idx
 
-        # Step 1에서 선택된 최적 이웃의 초기값 사용
+        # 초기값 복원
         for k in range(n_params):
-            init_params_buf[k] = best_init_params[i, k]
+            init_params_buf[k] = best_init_params[qi, k]
 
-        f_mean, f_tilde, valid = extract_reference_subset_variable(
+        # Reference subset 추출
+        f_mean, f_tilde, valid = extract_reference_subset_by_coords(
             ref_image, grad_x, grad_y, cx, cy,
-            xsi_mins[i], xsi_maxs[i], eta_mins[i], eta_maxs[i],
+            xsi_local, eta_local, n_pixels,
             f, dfdx, dfdy
         )
         if not valid:
-            out_fail_info[i, 0] = -2.0
-            out_fail_info[i, 1] = 0.0
-            out_fail_info[i, 2] = 99.0
+            out_fail_info[qi, 0] = -2.0
+            out_fail_info[qi, 1] = 0.0
+            out_fail_info[qi, 2] = 99.0
             continue
 
+        # Steepest Descent + Hessian
         compute_steepest_descent(
             dfdx[:n_pixels], dfdy[:n_pixels],
             xsi_local[:n_pixels], eta_local[:n_pixels],
             J[:n_pixels], shape_type
         )
-
         compute_hessian(J[:n_pixels], H)
         det = np.linalg.det(H)
         if abs(det) < 1e-30:
-            out_fail_info[i, 0] = -3.0
-            out_fail_info[i, 1] = 0.0
-            out_fail_info[i, 2] = 4.0
+            out_fail_info[qi, 0] = -3.0
+            out_fail_info[qi, 1] = 0.0
+            out_fail_info[qi, 2] = 4.0
             continue
         H_inv = np.linalg.inv(H)
         for ii in range(n_params):
             for jj in range(n_params):
                 H_inv_buf[ii, jj] = H_inv[ii, jj]
 
+        # 초기 파라미터 설정
         for k in range(n_params):
             p[k] = init_params_buf[k]
 
+        # IC-GN 반복
         zncc, n_iter, conv, fail_code = icgn_iterate(
             f[:n_pixels], f_mean, f_tilde,
             J[:n_pixels], H_inv_buf,
@@ -336,29 +497,28 @@ def process_poi_adss_multi(
             g[:n_pixels], b, dp, p_new
         )
 
-        out_fail_info[i, 0] = zncc
-        out_fail_info[i, 1] = float64(n_iter)
-        out_fail_info[i, 2] = float64(fail_code)
+        out_fail_info[qi, 0] = zncc
+        out_fail_info[qi, 1] = float64(n_iter)
+        out_fail_info[qi, 2] = float64(fail_code)
 
         if conv and zncc >= zncc_threshold:
             for k in range(n_params):
                 out_p[n_recovered, k] = p[k]
             out_zncc[n_recovered] = zncc
             out_iter[n_recovered] = n_iter
-            out_qt[n_recovered] = qt_codes[i]
+            out_qt[n_recovered] = qt_codes[qi]
             n_recovered += 1
         elif (fail_code == 2
               and n_iter <= 1
-              and out_candidate_zncc[i] >= zncc_threshold):
+              and out_candidate_zncc[qi] >= zncc_threshold):
             for k in range(n_params):
-                out_p[n_recovered, k] = best_init_params[i, k]
-            out_zncc[n_recovered] = out_candidate_zncc[i]
+                out_p[n_recovered, k] = best_init_params[qi, k]
+            out_zncc[n_recovered] = out_candidate_zncc[qi]
             out_iter[n_recovered] = 0
-            out_qt[n_recovered] = qt_codes[i]
+            out_qt[n_recovered] = qt_codes[qi]
             n_recovered += 1
 
     return n_recovered
-
 
 @jit(nopython=True, parallel=True, cache=True)
 def process_bad_pois_adss_multi_parallel(
@@ -438,7 +598,7 @@ def process_bad_pois_adss_multi_parallel(
         )
 
         result_count[k] = n_rec
-        for d in range(4):
+        for d in range(8):
             result_candidate_zncc[k, d] = buf_out_cand_zncc[k, d]
             result_fail_info[k, d, 0] = buf_out_fail_info[k, d, 0]
             result_fail_info[k, d, 1] = buf_out_fail_info[k, d, 1]
@@ -481,6 +641,7 @@ def allocate_adss_multi_batch_buffers(n_bad, n_pixels_max, n_params):
         'out_zncc': np.zeros((n_bad, 4), dtype=np.float64),
         'out_iter': np.zeros((n_bad, 4), dtype=np.int32),
         'out_qt': np.zeros((n_bad, 4), dtype=np.int32),
-        'out_cand_zncc': np.zeros((n_bad, 4), dtype=np.float64),
-        'out_fail_info': np.full((n_bad, 4, 3), -1.0, dtype=np.float64),
+        'out_cand_zncc': np.zeros((n_bad, 8), dtype=np.float64),
+        'out_fail_info': np.full((n_bad, 8, 3), -1.0, dtype=np.float64),
+
     }

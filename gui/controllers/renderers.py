@@ -396,9 +396,15 @@ class FieldRenderer:
         if adss is not None and adss.n_sub > 0:
             sub_values = self._get_adss_sub_values(result, values, adss)
             if sub_values is not None:
-                # quarter_type → 2×2 내 (dy, dx) 매핑
-                # Q5(좌상)→(0,0), Q6(우상)→(0,1), Q7(좌하)→(1,0), Q8(우하)→(1,1)
-                qt_to_offset = {5: (0, 0), 6: (0, 1), 7: (1, 0), 8: (1, 1)}
+                # 사각형: quarter → 단일 서브셀
+                qt_to_single = {5: [(0, 0)], 6: [(0, 1)], 7: [(1, 0)], 8: [(1, 1)]}
+                # 삼각형: quarter → 2개 서브셀 (영역이 2×2의 절반을 차지)
+                qt_to_double = {
+                    1: [(0, 0), (0, 1)],   # Q1 상: 좌상 + 우상
+                    2: [(1, 0), (1, 1)],   # Q2 하: 좌하 + 우하
+                    3: [(0, 0), (1, 0)],   # Q3 좌: 좌상 + 좌하
+                    4: [(0, 1), (1, 1)],   # Q4 우: 우상 + 우하
+                }
 
                 for s in range(adss.n_sub):
                     px_val = int(adss.points_x[s])
@@ -409,12 +415,18 @@ class FieldRenderer:
                         continue
 
                     qt = int(adss.quarter_types[s])
-                    offset = qt_to_offset.get(qt)
-                    if offset is None:
+                    
+                    # 삼각형 또는 사각형에 따라 서브셀 결정
+                    if qt in qt_to_double:
+                        cells = qt_to_double[qt]
+                    elif qt in qt_to_single:
+                        cells = qt_to_single[qt]
+                    else:
                         continue
 
-                    dy, dx = offset
-                    grid[2 * iy + dy, 2 * ix + dx] = sub_values[s]
+                    for dy, dx in cells:
+                        grid[2 * iy + dy, 2 * ix + dx] = sub_values[s]
+
 
         return grid, unique_x_2x, unique_y_2x
     
@@ -639,7 +651,6 @@ class FieldRenderer:
         grid, ux, uy = self._to_grid(result, mag)
 
         # ADSS magnitude는 _to_grid에서 자동 처리 안 됨 (파생값)
-        # 별도로 ADSS sub-POI magnitude를 추가
         adss = getattr(result, 'adss_result', None)
         if adss is not None and adss.n_sub > 0:
             sub_u = adss.parameters[:, 0]
@@ -651,7 +662,14 @@ class FieldRenderer:
             all_unique_y = np.unique(result.points_y)
             x_to_idx = {int(x): i for i, x in enumerate(all_unique_x)}
             y_to_idx = {int(y): i for i, y in enumerate(all_unique_y)}
-            qt_to_offset = {5: (0, 0), 6: (0, 1), 7: (1, 0), 8: (1, 1)}
+            
+            qt_to_single = {5: [(0, 0)], 6: [(0, 1)], 7: [(1, 0)], 8: [(1, 1)]}
+            qt_to_double = {
+                1: [(0, 0), (0, 1)],
+                2: [(1, 0), (1, 1)],
+                3: [(0, 0), (1, 0)],
+                4: [(0, 1), (1, 1)],
+            }
 
             for s in range(adss.n_sub):
                 ix = x_to_idx.get(int(adss.points_x[s]))
@@ -659,11 +677,17 @@ class FieldRenderer:
                 if ix is None or iy is None:
                     continue
                 qt = int(adss.quarter_types[s])
-                offset = qt_to_offset.get(qt)
-                if offset is None:
+                
+                if qt in qt_to_double:
+                    cells = qt_to_double[qt]
+                elif qt in qt_to_single:
+                    cells = qt_to_single[qt]
+                else:
                     continue
-                dy, dx = offset
-                grid[2 * iy + dy, 2 * ix + dx] = sub_mag[s]
+
+                for dy, dx in cells:
+                    grid[2 * iy + dy, 2 * ix + dx] = sub_mag[s]
+
 
         if grid.size == 0 or len(ux) < 3 or len(uy) < 3:
             return img
@@ -718,6 +742,8 @@ class FieldRenderer:
         
         - 초록점:    IC-GN 유효 (valid)
         - 파란 사분면: ADSS 복원 성공 (quarter별 영역 표시)
+          - Q1~Q4: 삼각형 (대각선 분할) — 채워진 삼각형
+          - Q5~Q8: 사각형 (축 분할) — 채워진 사각형
         - 빨간 ×:    복원 불가 (IC-GN 실패 + ADSS 실패 또는 미시도)
         - 표시 안 함:  FFT-CC 실패 (텍스처 없음)
         """
@@ -732,7 +758,7 @@ class FieldRenderer:
         # ADSS 정보 수집
         adss = getattr(result, 'adss_result', None)
         adss_parent_set = set()
-        adss_parent_quarters = {}  # parent_idx → [quarter_type, ...]
+        adss_parent_quarters = {}
         if adss is not None and adss.n_sub > 0:
             adss_parent_set = set(adss.unique_parents.tolist())
             for s in range(adss.n_sub):
@@ -742,21 +768,24 @@ class FieldRenderer:
                     adss_parent_quarters[pi] = []
                 adss_parent_quarters[pi].append(qt)
 
-        # spacing 추정
+        # spacing & subset 크기
         valid = result.valid_mask
         px_valid = result.points_x[valid]
         unique_x = np.unique(px_valid) if np.any(valid) else np.unique(result.points_x)
         spacing = int(round(np.median(np.diff(unique_x)))) if len(unique_x) > 1 else 11
         half_sp = spacing // 2
 
-        # quarter → 영역 오프셋 (cx, cy 기준 상대 사각형)
-        # (x1_off, x2_off, y1_off, y2_off)
+        # 사각형 quarter → 영역 오프셋
         qt_offsets = {
-            5: (-half_sp, 0,        -half_sp, 0),         # Q5: 좌상
-            6: (1,         half_sp+1, -half_sp, 0),        # Q6: 우상
-            7: (-half_sp, 0,         1,         half_sp+1), # Q7: 좌하
-            8: (1,         half_sp+1, 1,         half_sp+1), # Q8: 우하
+            5: (-half_sp, 0,         -half_sp, 0),
+            6: (1,         half_sp+1, -half_sp, 0),
+            7: (-half_sp, 0,          1,        half_sp+1),
+            8: (1,         half_sp+1,  1,        half_sp+1),
         }
+
+        # 삼각형 quarter 색상 (BGR)
+        tri_color  = (255, 180, 0)   # 파란 계열 (사각형과 동일)
+        rect_color = (255, 180, 0)
 
         img_h, img_w = img.shape[:2]
 
@@ -767,35 +796,65 @@ class FieldRenderer:
                 continue
 
             if result.valid_mask[idx]:
-                # 정상 POI → 초록점
                 cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
 
             elif idx in adss_parent_set:
-                # ADSS 복원된 POI → 파란색 사분면 영역
                 quarters = adss_parent_quarters.get(idx, [])
                 for qt in quarters:
-                    offsets = qt_offsets.get(qt)
-                    if offsets is None:
-                        continue
-                    x1_off, x2_off, y1_off, y2_off = offsets
-                    x1 = max(0, x + x1_off)
-                    x2 = min(img_w, x + x2_off)
-                    y1 = max(0, y + y1_off)
-                    y2 = min(img_h, y + y2_off)
-                    if x2 > x1 and y2 > y1:
-                        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 180, 0), -1)
+                    if 5 <= qt <= 8:
+                        # === 사각형 quarter ===
+                        offsets = qt_offsets.get(qt)
+                        if offsets is None:
+                            continue
+                        x1_off, x2_off, y1_off, y2_off = offsets
+                        x1 = max(0, x + x1_off)
+                        x2 = min(img_w, x + x2_off)
+                        y1 = max(0, y + y1_off)
+                        y2 = min(img_h, y + y2_off)
+                        if x2 > x1 and y2 > y1:
+                            cv2.rectangle(img, (x1, y1), (x2, y2),
+                                          rect_color, -1)
 
-                # 중심에 작은 파란점
+                    elif 1 <= qt <= 4:
+                        M = half_sp
+                        if qt == 1:    # Q1: 상 삼각형 — 상단 변 + 두 대각선
+                            pts = np.array([
+                                [x - M, y - M],   # 좌상 모서리
+                                [x + M, y - M],   # 우상 모서리
+                                [x,     y]        # 중심
+                            ], dtype=np.int32)
+                        elif qt == 2:  # Q2: 하 삼각형
+                            pts = np.array([
+                                [x - M, y + M],   # 좌하 모서리
+                                [x + M, y + M],   # 우하 모서리
+                                [x,     y]        # 중심
+                            ], dtype=np.int32)
+                        elif qt == 3:  # Q3: 좌 삼각형
+                            pts = np.array([
+                                [x - M, y - M],   # 좌상 모서리
+                                [x - M, y + M],   # 좌하 모서리
+                                [x,     y]        # 중심
+                            ], dtype=np.int32)
+                        elif qt == 4:  # Q4: 우 삼각형
+                            pts = np.array([
+                                [x + M, y - M],   # 우상 모서리
+                                [x + M, y + M],   # 우하 모서리
+                                [x,     y]        # 중심
+                            ], dtype=np.int32)
+
+                        pts[:, 0] = np.clip(pts[:, 0], 0, img_w - 1)
+                        pts[:, 1] = np.clip(pts[:, 1], 0, img_h - 1)
+                        cv2.fillPoly(img, [pts], tri_color)
+
+                # 중심 마커
                 cv2.circle(img, (x, y), 3, (255, 100, 0), -1)
 
             else:
                 if has_fft_mask and not result.fft_valid_mask[idx]:
-                    # FFT-CC 실패 → 표시 안 함
                     pass
                 else:
-                    # 복원 불가 → 빨간 ×
                     cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
                     cv2.drawMarker(img, (x, y), (0, 0, 255),
-                                cv2.MARKER_CROSS, 10, 2)
+                                   cv2.MARKER_CROSS, 10, 2)
 
         return img
