@@ -298,7 +298,6 @@ def process_poi_adss_multi(
     neighbor_x,           # (8, 3)            ← 4→8
     neighbor_y,           # (8, 3)            ← 4→8
     zncc_threshold,
-    zncc_pre_threshold,
     out_p,                # (4, n_params)     ← 유지 (선택된 세트의 최대 4개)
     out_zncc,             # (4,)              ← 유지
     out_iter,             # (4,)              ← 유지
@@ -508,15 +507,6 @@ def process_poi_adss_multi(
             out_iter[n_recovered] = n_iter
             out_qt[n_recovered] = qt_codes[qi]
             n_recovered += 1
-        elif (fail_code == 2
-              and n_iter <= 1
-              and out_candidate_zncc[qi] >= zncc_threshold):
-            for k in range(n_params):
-                out_p[n_recovered, k] = best_init_params[qi, k]
-            out_zncc[n_recovered] = out_candidate_zncc[qi]
-            out_iter[n_recovered] = 0
-            out_qt[n_recovered] = qt_codes[qi]
-            n_recovered += 1
 
     return n_recovered
 
@@ -535,7 +525,6 @@ def process_bad_pois_adss_multi_parallel(
     all_neighbor_x,
     all_neighbor_y,
     zncc_threshold,
-    zncc_pre_threshold,
     result_p,
     result_zncc,
     result_iter,
@@ -581,7 +570,6 @@ def process_bad_pois_adss_multi_parallel(
             all_neighbor_x[k],
             all_neighbor_y[k],
             zncc_threshold,
-            zncc_pre_threshold,
             buf_out_p[k],
             buf_out_zncc[k],
             buf_out_iter[k],

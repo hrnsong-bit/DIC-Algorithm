@@ -108,7 +108,7 @@ def compute_icgn(
     subset_size: int = 21,
     max_iterations: int = 50,
     convergence_threshold: float = 0.001,
-    zncc_threshold: float = 0.85,
+    zncc_threshold: float = 0.90,
     interpolation_order: int = 5,
     shape_function: str = 'affine',
     gaussian_blur: Optional[int] = None,
@@ -364,7 +364,6 @@ def _compute_icgn_numba(
             convergence_threshold=convergence_threshold,
             shape_function=shape_function,
             zncc_threshold=zncc_threshold,
-            zncc_pre_threshold=0.5,
         )
 
         if adss_result_obj.n_parent_recovered > 0:

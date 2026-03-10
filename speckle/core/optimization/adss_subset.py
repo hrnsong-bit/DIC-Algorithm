@@ -116,7 +116,6 @@ def compute_adss_recalc(
     convergence_threshold=0.001,
     shape_function='affine',
     zncc_threshold=0.9,
-    zncc_pre_threshold=0.5,
 ):
     """
     ADSS-DIC v2 재계산 — 사분면 복수 채택 + fail_info 디버깅 로그.
@@ -220,7 +219,7 @@ def compute_adss_recalc(
         shape_type,
         cand_indices,
         cand_nv, cand_np_, cand_nx_, cand_ny_,
-        zncc_threshold, zncc_pre_threshold,
+        zncc_threshold,
         result_p, result_zncc, result_iter, result_qt,
         result_parent, result_count, result_candidate_zncc,
         result_fail_info,
