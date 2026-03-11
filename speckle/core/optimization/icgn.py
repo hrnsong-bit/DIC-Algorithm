@@ -99,6 +99,65 @@ def prepare_ref_cache(
     }
 
 
+def _validate_ref_cache(
+    ref_cache: dict,
+    subset_size: int,
+    interpolation_order: int,
+    shape_function: str,
+) -> Tuple[bool, str]:
+    """
+    ref_cache가 현재 compute_icgn 호출 파라미터와 호환되는지 검증.
+
+    Returns:
+        (is_valid, reason_if_invalid)
+    """
+    required_keys = (
+        'ref_gray', 'grad_x', 'grad_y',
+        'xsi', 'eta',
+        'subset_size', 'interpolation_order', 'shape_function',
+    )
+    missing = [k for k in required_keys if k not in ref_cache]
+    if missing:
+        return False, f"missing keys: {missing}"
+
+    cache_subset = int(ref_cache.get('subset_size'))
+    cache_order = int(ref_cache.get('interpolation_order'))
+    cache_shape = str(ref_cache.get('shape_function'))
+
+    if cache_subset != int(subset_size):
+        return False, (
+            f"subset_size mismatch (cache={cache_subset}, call={subset_size})"
+        )
+    if cache_order != int(interpolation_order):
+        return False, (
+            f"interpolation_order mismatch (cache={cache_order}, call={interpolation_order})"
+        )
+    if cache_shape != str(shape_function):
+        return False, (
+            f"shape_function mismatch (cache={cache_shape}, call={shape_function})"
+        )
+
+    ref_gray = ref_cache.get('ref_gray')
+    grad_x = ref_cache.get('grad_x')
+    grad_y = ref_cache.get('grad_y')
+    xsi = ref_cache.get('xsi')
+    eta = ref_cache.get('eta')
+
+    if not all(isinstance(arr, np.ndarray) for arr in (ref_gray, grad_x, grad_y, xsi, eta)):
+        return False, "cache arrays are not all numpy.ndarray"
+
+    if ref_gray.shape != grad_x.shape or ref_gray.shape != grad_y.shape:
+        return False, "ref_gray/grad_x/grad_y shape mismatch"
+
+    expected_pixels = int(subset_size) * int(subset_size)
+    if len(xsi) != expected_pixels or len(eta) != expected_pixels:
+        return False, (
+            f"local-coord length mismatch (xsi={len(xsi)}, eta={len(eta)}, expected={expected_pixels})"
+        )
+
+    return True, ""
+
+
 # ===== 메인 함수 =====
 
 def compute_icgn(
@@ -177,7 +236,17 @@ def _compute_icgn_numba(
     n_params = get_num_params(shape_function)
 
     # 참조 전처리 (캐시 사용 가능 시 건너뜀)
+    use_ref_cache = False
     if ref_cache is not None:
+        cache_ok, reason = _validate_ref_cache(
+            ref_cache, subset_size, interpolation_order, shape_function
+        )
+        if cache_ok:
+            use_ref_cache = True
+        else:
+            _logger.warning("Invalid ref_cache detected, fallback to fresh preprocessing: %s", reason)
+
+    if use_ref_cache:
         ref_gray = ref_cache['ref_gray']
         grad_x   = ref_cache['grad_x']
         grad_y   = ref_cache['grad_y']
@@ -226,8 +295,8 @@ def _compute_icgn_numba(
 
     _logger.info(
         f"FFT-CC valid: {n_valid}/{n_points} "
-        f"({n_valid/n_points*100:.1f}%) — "
-        f"{len(invalid_idx)}개 POI IC-GN 스킵 (텍스처 없음)"
+        f"({n_valid/n_points*100:.1f}%) - "
+        f"{len(invalid_idx)} skipped POIs (no texture)"
     )
 
     # 전체 크기 결과 배열 (FFT 실패분 포함)
@@ -367,6 +436,41 @@ def _compute_icgn_numba(
         )
 
         if adss_result_obj.n_parent_recovered > 0:
+            # ADSS sub-POI 중 parent별 최고 ZNCC 대표값을 본 결과 배열에 반영한다.
+            # (시각화뿐 아니라 통계/후처리도 복원 효과를 일관되게 사용)
+            # NOTE:
+            # - 이 반영은 parent-grid 기반 기존 파이프라인(PLS, 요약 통계, CSV 포맷) 호환을 위한 절충안이다.
+            # - quarter별 sub-POI를 모두 그대로 쓰는 strain/통계를 원하면,
+            #   정규 격자 전제가 없는 "불규칙 샘플 기반 local weighted LS" 경로를 별도로 추가해야 한다.
+            best_sub_by_parent = {}
+            for s_idx, parent_idx in enumerate(adss_result_obj.parent_indices):
+                p_idx = int(parent_idx)
+                if p_idx < 0 or p_idx >= n_points:
+                    continue
+
+                prev = best_sub_by_parent.get(p_idx)
+                if prev is None:
+                    best_sub_by_parent[p_idx] = s_idx
+                    continue
+
+                if adss_result_obj.zncc_values[s_idx] > adss_result_obj.zncc_values[prev]:
+                    best_sub_by_parent[p_idx] = s_idx
+
+            n_reflected = 0
+            for p_idx, s_idx in best_sub_by_parent.items():
+                result_p[p_idx, :n_params] = adss_result_obj.parameters[s_idx, :n_params]
+                result_zncc[p_idx] = adss_result_obj.zncc_values[s_idx]
+                result_iter[p_idx] = adss_result_obj.iterations[s_idx]
+                result_conv[p_idx] = True
+
+                if result_zncc[p_idx] >= zncc_threshold:
+                    icgn_valid[p_idx] = True
+                    result_fail[p_idx] = ICGN_SUCCESS
+                    n_reflected += 1
+                else:
+                    icgn_valid[p_idx] = False
+                    result_fail[p_idx] = ICGN_FAIL_LOW_ZNCC
+
             n_final_valid = int(np.sum(icgn_valid))
             n_conv = int(np.sum(result_conv))
             mean_zncc = (float(np.mean(result_zncc[icgn_valid]))
@@ -377,6 +481,7 @@ def _compute_icgn_numba(
                 f"최종 valid: {n_final_valid}/{n_points}, "
                 f"mean_zncc={mean_zncc:.4f}, "
                 f"sub-POI: {adss_result_obj.n_sub_total}개, "
+                f"reflected parent: {n_reflected}개, "
                 f"{processing_time:.3f}s"
             )
 

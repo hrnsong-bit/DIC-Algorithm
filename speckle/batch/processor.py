@@ -108,7 +108,7 @@ class BatchProcessor:
             )
         
         individual_reports = {}
-        max_recommended_size = 11
+        max_recommended_size = int(self.assessor_params.get('subset_size', 21))
         worst_file = ""
         passed = 0
         failed = 0
@@ -139,10 +139,15 @@ class BatchProcessor:
                 max_recommended_size = report.recommended_subset_size
                 worst_file = filename
         
-        global_size_found = all(
-            r.subset_size_found for r in individual_reports.values()
-            if r is not None
-        )
+        # 로드 실패/평가 실패가 하나라도 있으면 전역 size-found를 보수적으로 False 처리
+        # (기존에는 individual_reports에 없는 실패 파일이 누락되어 과대평가 가능)
+        if failed > 0:
+            global_size_found = False
+        else:
+            global_size_found = all(
+                r.subset_size_found for r in individual_reports.values()
+                if r is not None
+            )
         
         # MIG/SSSIG 통계
         mig_values = [r.mig for r in individual_reports.values()]

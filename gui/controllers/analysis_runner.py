@@ -73,6 +73,7 @@ class AnalysisRunner:
                     spacing=params['spacing'],
                     zncc_threshold=params['zncc_threshold'],
                     roi=self.state.roi,
+                    progress_callback=fftcc_progress,
                 )
 
                 if self.state.should_stop:

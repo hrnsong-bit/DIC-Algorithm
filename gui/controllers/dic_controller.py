@@ -204,6 +204,7 @@ class DICController:
                 self.result_handler.update_result_ui(result)
             else:
                 self.state.fft_cc_result = None
+                self.state.icgn_result = None
                 self._refresh_display()
 
     # ===== 동기화 =====
