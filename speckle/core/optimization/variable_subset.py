@@ -200,6 +200,7 @@ def compute_variable_subset_recalc(
     else:
         shape_type = QUADRATIC
     n_params = get_num_params(shape_type)
+    v_param_idx = 3 if shape_type == AFFINE else 6
 
     # === 1. 불량 POI 식별 ===
     bad_mask = ~valid_mask | (zncc_values < zncc_threshold)
@@ -316,8 +317,8 @@ def compute_variable_subset_recalc(
                             nf = niy * nx + nix
                             if valid_mask[nf] and zncc_values[nf] >= zncc_threshold:
                                 sum_u += parameters[nf, 0]
-                                if n_params >= 6:
-                                    sum_v += parameters[nf, 3]
+                                if n_params > v_param_idx:
+                                    sum_v += parameters[nf, v_param_idx]
                                 cnt += 1
                 if cnt > 0:
                     initial_u[fidx] = sum_u / cnt
