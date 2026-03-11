@@ -18,6 +18,23 @@ class ResultExporter:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    @staticmethod
+    def _normalize_quality_grade(grade: str) -> str:
+        """
+        다양한 quality_grade 표현을 PASS/WARNING/FAIL 3단계로 정규화.
+        """
+        if not grade:
+            return "FAIL"
+
+        text = str(grade).strip().lower()
+        if text == "pass":
+            return "PASS"
+        if "warning" in text or "needs_larger_subset" in text or "large subset" in text:
+            return "WARNING"
+        if text.startswith("fail"):
+            return "FAIL"
+        return "FAIL"
     
     def export_csv(self, 
                    reports: Dict[str, QualityReport],
@@ -214,9 +231,13 @@ class ResultExporter:
         
         # 통계
         total = len(reports)
-        passed = sum(1 for r in reports.values() if r.quality_grade == "PASS")
-        warning = sum(1 for r in reports.values() if r.quality_grade == "NEEDS_LARGER_SUBSET")
-        failed = sum(1 for r in reports.values() if r.quality_grade == "FAIL")
+        normalized = [
+            self._normalize_quality_grade(r.quality_grade)
+            for r in reports.values()
+        ]
+        passed = sum(1 for g in normalized if g == "PASS")
+        warning = sum(1 for g in normalized if g == "WARNING")
+        failed = sum(1 for g in normalized if g == "FAIL")
         
         mig_values = [r.mig for r in reports.values()]
         max_subset = max((r.recommended_subset_size for r in reports.values()), default=21)
@@ -263,8 +284,9 @@ class ResultExporter:
         
         # 개별 결과
         for fname, report in sorted(reports.items()):
-            grade_symbol = {"PASS": "✓", "NEEDS_LARGER_SUBSET": "△", "FAIL": "✗"}.get(
-                report.quality_grade, "?"
+            normalized_grade = self._normalize_quality_grade(report.quality_grade)
+            grade_symbol = {"PASS": "✓", "WARNING": "△", "FAIL": "✗"}.get(
+                normalized_grade, "?"
             )
             lines.append(
                 f"{grade_symbol} {fname}: MIG={report.mig:.2f}, "

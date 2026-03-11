@@ -279,6 +279,11 @@ def compute_strain_pls_from_icgn(
     Returns:
         PLSStrainResult (grid_x, grid_y 포함)
     """
+    # TODO(ADSS-subPOI):
+    # 현재 경로는 parent POI 정규 격자(u,v 2D grid)를 전제로 한다.
+    # ADSS에서 parent당 복수 quarter sub-POI를 "모두" strain에 반영하려면,
+    # grid 재구성 대신 불규칙 샘플(가변 개수 이웃) 기반 local weighted LS
+    # (비정규 PLS 일반화) 경로를 별도로 도입해야 한다.
     valid = icgn_result.valid_mask
     px = icgn_result.points_x
     py = icgn_result.points_y

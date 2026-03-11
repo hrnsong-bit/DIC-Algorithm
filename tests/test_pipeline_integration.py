@@ -19,7 +19,7 @@ from speckle.core.optimization.icgn import compute_icgn
 
 # === 테스트 1: 크랙 없는 이미지 ===
 print("=" * 60)
-print("테스트 1: 크랙 없는 이미지 — Variable Subset 스킵 확인")
+print("테스트 1: 크랙 없는 이미지 - Variable Subset 스킵 확인")
 print("=" * 60)
 
 np.random.seed(42)
@@ -41,7 +41,7 @@ print(f"테스트 1: {'OK' if t1_ok else 'FAIL'}")
 
 # === 테스트 2: 인위적 크랙 이미지 ===
 print("\n" + "=" * 60)
-print("테스트 2: 인위적 크랙 — Variable Subset 복원 확인")
+print("테스트 2: 인위적 크랙 - Variable Subset 복원 확인")
 print("=" * 60)
 
 ref_crack = ref_clean.copy()
