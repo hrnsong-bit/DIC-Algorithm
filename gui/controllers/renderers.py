@@ -114,41 +114,79 @@ class FieldRenderer:
         return int(getattr(result, 'spacing', 10))
 
     @staticmethod
-    def _fill_adss_quarter(mask: np.ndarray, x: int, y: int,
-                           quarter_type: int, half_sp: int):
-        """Fill one ADSS quarter polygon/rectangle into a binary mask."""
+    def _axis_bounds(center: int, spacing: int, limit: int) -> tuple[int, int]:
+        """Return half-open pixel bounds for one cell axis."""
+        left = spacing // 2
+        right = spacing - left
+        start = max(0, center - left)
+        end = min(limit, center + right)
+        return start, end
+
+    @classmethod
+    def _cell_bounds(cls, x: int, y: int, spacing: int,
+                     width: int, height: int) -> tuple[int, int, int, int]:
+        """Return half-open pixel bounds for a POI parent cell."""
+        x0, x1 = cls._axis_bounds(x, spacing, width)
+        y0, y1 = cls._axis_bounds(y, spacing, height)
+        return x0, x1, y0, y1
+
+    @staticmethod
+    def _triangle_mask(x0: int, x1: int, y0: int, y1: int,
+                       vertices: np.ndarray) -> np.ndarray:
+        """Rasterize a triangle using pixel-center sampling within half-open bounds."""
+        xs = np.arange(x0, x1, dtype=np.float32) + 0.5
+        ys = np.arange(y0, y1, dtype=np.float32) + 0.5
+        xx, yy = np.meshgrid(xs, ys)
+
+        ax, ay = vertices[0]
+        bx, by = vertices[1]
+        cx, cy = vertices[2]
+
+        d1 = (xx - bx) * (ay - by) - (ax - bx) * (yy - by)
+        d2 = (xx - cx) * (by - cy) - (bx - cx) * (yy - cy)
+        d3 = (xx - ax) * (cy - ay) - (cx - ax) * (yy - ay)
+
+        has_neg = (d1 < 0) | (d2 < 0) | (d3 < 0)
+        has_pos = (d1 > 0) | (d2 > 0) | (d3 > 0)
+        return ~(has_neg & has_pos)
+
+    @classmethod
+    def _fill_adss_quarter(cls, mask: np.ndarray, x: int, y: int,
+                           quarter_type: int, spacing: int):
+        """Fill one ADSS quarter into a binary mask using the same cell bounds as raw fields."""
         h, w = mask.shape[:2]
-        if 5 <= quarter_type <= 8:
-            qt_offsets = {
-                5: (-half_sp, 0, -half_sp, 0),
-                6: (1, half_sp + 1, -half_sp, 0),
-                7: (-half_sp, 0, 1, half_sp + 1),
-                8: (1, half_sp + 1, 1, half_sp + 1),
-            }
-            x1_off, x2_off, y1_off, y2_off = qt_offsets[quarter_type]
-            x1 = max(0, x + x1_off)
-            x2 = min(w, x + x2_off)
-            y1 = max(0, y + y1_off)
-            y2 = min(h, y + y2_off)
-            if x2 > x1 and y2 > y1:
-                cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+        x0, x1, y0, y1 = cls._cell_bounds(x, y, spacing, w, h)
+        if x1 <= x0 or y1 <= y0:
             return
 
-        m = half_sp
+        x_mid = min(max(x, x0), x1)
+        y_mid = min(max(y, y0), y1)
+
+        if 5 <= quarter_type <= 8:
+            rect_bounds = {
+                5: (x0, x_mid, y0, y_mid),
+                6: (x_mid, x1, y0, y_mid),
+                7: (x0, x_mid, y_mid, y1),
+                8: (x_mid, x1, y_mid, y1),
+            }
+            rx0, rx1, ry0, ry1 = rect_bounds[quarter_type]
+            if rx1 > rx0 and ry1 > ry0:
+                mask[ry0:ry1, rx0:rx1] = 255
+            return
+
         if quarter_type == 1:
-            pts = np.array([[x - m, y - m], [x + m, y - m], [x, y]], dtype=np.int32)
+            vertices = np.array([[x0, y0], [x1, y0], [x, y]], dtype=np.float32)
         elif quarter_type == 2:
-            pts = np.array([[x - m, y + m], [x + m, y + m], [x, y]], dtype=np.int32)
+            vertices = np.array([[x0, y1], [x1, y1], [x, y]], dtype=np.float32)
         elif quarter_type == 3:
-            pts = np.array([[x - m, y - m], [x - m, y + m], [x, y]], dtype=np.int32)
+            vertices = np.array([[x0, y0], [x0, y1], [x, y]], dtype=np.float32)
         elif quarter_type == 4:
-            pts = np.array([[x + m, y - m], [x + m, y + m], [x, y]], dtype=np.int32)
+            vertices = np.array([[x1, y0], [x1, y1], [x, y]], dtype=np.float32)
         else:
             return
 
-        pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
-        pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
-        cv2.fillPoly(mask, [pts], 255)
+        tri_mask = cls._triangle_mask(x0, x1, y0, y1, vertices)
+        mask[y0:y1, x0:x1][tri_mask] = 255
 
     def _apply_adss_display_mask(self, base_img: np.ndarray,
                                  rendered_img: np.ndarray, result) -> np.ndarray:
@@ -160,23 +198,20 @@ class FieldRenderer:
         h, w = rendered_img.shape[:2]
         parent_mask = np.zeros((h, w), dtype=np.uint8)
         keep_mask = np.zeros((h, w), dtype=np.uint8)
-        half_sp = self._estimate_spacing(result) // 2
+        spacing = self._estimate_spacing(result)
 
         for parent_idx in adss.unique_parents.tolist():
             x = int(result.points_x[parent_idx])
             y = int(result.points_y[parent_idx])
-            x1 = max(0, x - half_sp)
-            x2 = min(w, x + half_sp + 1)
-            y1 = max(0, y - half_sp)
-            y2 = min(h, y + half_sp + 1)
-            if x2 > x1 and y2 > y1:
-                cv2.rectangle(parent_mask, (x1, y1), (x2, y2), 255, -1)
+            x0, x1, y0, y1 = self._cell_bounds(x, y, spacing, w, h)
+            if x1 > x0 and y1 > y0:
+                parent_mask[y0:y1, x0:x1] = 255
 
         for s in range(adss.n_sub):
             x = int(adss.points_x[s])
             y = int(adss.points_y[s])
             quarter_type = int(adss.quarter_types[s])
-            self._fill_adss_quarter(keep_mask, x, y, quarter_type, half_sp)
+            self._fill_adss_quarter(keep_mask, x, y, quarter_type, spacing)
 
         erase_mask = (parent_mask > 0) & (keep_mask == 0)
         if not np.any(erase_mask):
@@ -234,7 +269,7 @@ class FieldRenderer:
                     vmin, vmax = vmin - 1e-6, vmax + 1e-6
 
         # === spacing 추정 ===
-        half_sp = self._estimate_spacing(result) // 2
+        spacing = self._estimate_spacing(result)
 
         # === ADSS quarter-type 배열 ===
         adss_parent_set = set()
@@ -266,6 +301,7 @@ class FieldRenderer:
             cx = int(result.points_x[idx])
             cy = int(result.points_y[idx])
             color_bgr = color_for_value(float(values[idx]))
+            half_sp = spacing // 2
 
             # quarter-type에 따른 영역 결정
             x1 = max(0, cx - half_sp)
@@ -324,6 +360,7 @@ class FieldRenderer:
                 y1 = max(0, cy - half_sp)
                 y2 = min(img_h, cy + half_sp + 1)
 
+            x1, x2, y1, y2 = self._cell_bounds(cx, cy, spacing, img_w, img_h)
             if x2 <= x1 or y2 <= y1:
                 continue
 
@@ -339,6 +376,7 @@ class FieldRenderer:
                 x2 = min(img_w, cx + half_sp + 1)
                 y1 = max(0, cy - half_sp)
                 y2 = min(img_h, cy + half_sp + 1)
+                x1, x2, y1, y2 = self._cell_bounds(cx, cy, spacing, img_w, img_h)
                 if x2 > x1 and y2 > y1:
                     overlay[y1:y2, x1:x2] = dim_bg[y1:y2, x1:x2]
 
@@ -347,7 +385,7 @@ class FieldRenderer:
                 cy = int(adss.points_y[s])
                 color_bgr = color_for_value(float(adss_values[s]))
                 poly_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                self._fill_adss_quarter(poly_mask, cx, cy, int(adss.quarter_types[s]), half_sp)
+                self._fill_adss_quarter(poly_mask, cx, cy, int(adss.quarter_types[s]), spacing)
                 blend_mask(poly_mask > 0, color_bgr)
 
         result_img = np.clip(overlay, 0, 255).astype(np.uint8)
@@ -926,9 +964,7 @@ class FieldRenderer:
 
         # spacing & subset 크기
         valid = result.valid_mask
-        px_valid = result.points_x[valid]
-        unique_x = np.unique(px_valid) if np.any(valid) else np.unique(result.points_x)
-        spacing = int(round(np.median(np.diff(unique_x)))) if len(unique_x) > 1 else 11
+        spacing = self._estimate_spacing(result)
         half_sp = spacing // 2
 
         # 사각형 quarter → 영역 오프셋
@@ -954,6 +990,13 @@ class FieldRenderer:
             if idx in adss_parent_set:
                 quarters = adss_parent_quarters.get(idx, [])
                 for qt in quarters:
+                    poly_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                    self._fill_adss_quarter(poly_mask, x, y, qt, spacing)
+                    mask = poly_mask > 0
+                    if np.any(mask):
+                        img[mask] = rect_color if 5 <= qt <= 8 else tri_color
+                    continue
+
                     if 5 <= qt <= 8:
                         # === 사각형 quarter ===
                         offsets = qt_offsets.get(qt)
