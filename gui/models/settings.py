@@ -23,6 +23,7 @@ class SettingsManager:
         'gaussian_blur_enabled': False,
         'conv_threshold': 0.002,
         'max_iter': 20,
+        'display_source': 'auto',
         
         # 품질평가 파라미터
         'quality_subset_size': 21,
@@ -79,7 +80,8 @@ class SettingsManager:
         """DIC 파라미터만 반환"""
         keys = ['subset_size', 'spacing', 'search_range', 'zncc_threshold',
                 'shape_function', 'interpolation', 'gaussian_blur', 
-                'gaussian_blur_enabled', 'conv_threshold', 'max_iter']
+                'gaussian_blur_enabled', 'conv_threshold', 'max_iter',
+                'display_source']
         return {k: self.settings.get(k) for k in keys}
     
     def get_quality_params(self) -> Dict[str, Any]:

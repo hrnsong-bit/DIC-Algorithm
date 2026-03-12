@@ -24,6 +24,22 @@ class FieldRenderer:
     def view(self):
         return self.ctrl.view
 
+    def _resolve_display_source(self, mode: str) -> str:
+        """Resolve the active display source for the current render mode."""
+        source_var = getattr(self.view, 'display_source_var', None)
+        source = source_var.get() if source_var is not None else 'auto'
+        if source not in {'auto', 'raw', 'processed'}:
+            source = 'auto'
+
+        if source != 'auto':
+            return source
+
+        if mode in {'u_field', 'v_field', 'magnitude'}:
+            return 'raw'
+        if mode in {'exx', 'eyy', 'exy', 'e1', 'von_mises'}:
+            return 'processed'
+        return 'raw'
+
     def create_overlay_image(self, base_img: np.ndarray, result, mode: str = None) -> np.ndarray:
         """표시 모드에 따라 오버레이 이미지 생성"""
         if result is None:
@@ -57,11 +73,126 @@ class FieldRenderer:
 
         return display_img
 
+    @staticmethod
+    def _get_adss_sub_cells(quarter_type: int):
+        """Map one ADSS quarter type to the 2x2 sub-cell indices it occupies."""
+        if quarter_type == 1:
+            return ((0, 0), (0, 1))
+        if quarter_type == 2:
+            return ((1, 0), (1, 1))
+        if quarter_type == 3:
+            return ((0, 0), (1, 0))
+        if quarter_type == 4:
+            return ((0, 1), (1, 1))
+        if quarter_type == 5:
+            return ((0, 0),)
+        if quarter_type == 6:
+            return ((0, 1),)
+        if quarter_type == 7:
+            return ((1, 0),)
+        if quarter_type == 8:
+            return ((1, 1),)
+        return ()
+
+    @staticmethod
+    def _make_dim_background(img: np.ndarray) -> np.ndarray:
+        """Match the dim grayscale background used by field renderers."""
+        if len(img.shape) == 3:
+            gray_bg = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_bg = img.copy()
+        overlay = (gray_bg.astype(np.float32) * 0.3).astype(np.uint8)
+        return cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+
+    @staticmethod
+    def _estimate_spacing(result) -> int:
+        unique_x = np.unique(result.points_x)
+        diffs = np.diff(unique_x)
+        diffs = diffs[diffs > 0]
+        if len(diffs) > 0:
+            return int(round(np.median(diffs)))
+        return int(getattr(result, 'spacing', 10))
+
+    @staticmethod
+    def _fill_adss_quarter(mask: np.ndarray, x: int, y: int,
+                           quarter_type: int, half_sp: int):
+        """Fill one ADSS quarter polygon/rectangle into a binary mask."""
+        h, w = mask.shape[:2]
+        if 5 <= quarter_type <= 8:
+            qt_offsets = {
+                5: (-half_sp, 0, -half_sp, 0),
+                6: (1, half_sp + 1, -half_sp, 0),
+                7: (-half_sp, 0, 1, half_sp + 1),
+                8: (1, half_sp + 1, 1, half_sp + 1),
+            }
+            x1_off, x2_off, y1_off, y2_off = qt_offsets[quarter_type]
+            x1 = max(0, x + x1_off)
+            x2 = min(w, x + x2_off)
+            y1 = max(0, y + y1_off)
+            y2 = min(h, y + y2_off)
+            if x2 > x1 and y2 > y1:
+                cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            return
+
+        m = half_sp
+        if quarter_type == 1:
+            pts = np.array([[x - m, y - m], [x + m, y - m], [x, y]], dtype=np.int32)
+        elif quarter_type == 2:
+            pts = np.array([[x - m, y + m], [x + m, y + m], [x, y]], dtype=np.int32)
+        elif quarter_type == 3:
+            pts = np.array([[x - m, y - m], [x - m, y + m], [x, y]], dtype=np.int32)
+        elif quarter_type == 4:
+            pts = np.array([[x + m, y - m], [x + m, y + m], [x, y]], dtype=np.int32)
+        else:
+            return
+
+        pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+        cv2.fillPoly(mask, [pts], 255)
+
+    def _apply_adss_display_mask(self, base_img: np.ndarray,
+                                 rendered_img: np.ndarray, result) -> np.ndarray:
+        """Clip ADSS parent cells so only recovered quarter polygons remain visible."""
+        adss = getattr(result, 'adss_result', None)
+        if adss is None or adss.n_sub == 0:
+            return rendered_img
+
+        h, w = rendered_img.shape[:2]
+        parent_mask = np.zeros((h, w), dtype=np.uint8)
+        keep_mask = np.zeros((h, w), dtype=np.uint8)
+        half_sp = self._estimate_spacing(result) // 2
+
+        for parent_idx in adss.unique_parents.tolist():
+            x = int(result.points_x[parent_idx])
+            y = int(result.points_y[parent_idx])
+            x1 = max(0, x - half_sp)
+            x2 = min(w, x + half_sp + 1)
+            y1 = max(0, y - half_sp)
+            y2 = min(h, y + half_sp + 1)
+            if x2 > x1 and y2 > y1:
+                cv2.rectangle(parent_mask, (x1, y1), (x2, y2), 255, -1)
+
+        for s in range(adss.n_sub):
+            x = int(adss.points_x[s])
+            y = int(adss.points_y[s])
+            quarter_type = int(adss.quarter_types[s])
+            self._fill_adss_quarter(keep_mask, x, y, quarter_type, half_sp)
+
+        erase_mask = (parent_mask > 0) & (keep_mask == 0)
+        if not np.any(erase_mask):
+            return rendered_img
+
+        output = rendered_img.copy()
+        dim_bg = self._make_dim_background(base_img)
+        output[erase_mask] = dim_bg[erase_mask]
+        return output
+
     # ===== 새 렌더러: 서브셋 영역 직접 채색 =====
 
     def _render_field_subset(self, img: np.ndarray, result,
                               values: np.ndarray, label: str,
-                              symmetric: bool) -> np.ndarray:
+                              symmetric: bool,
+                              adss_values: np.ndarray = None) -> np.ndarray:
         """각 POI의 값을 서브셋 영역에 직접 칠하는 렌더러
 
         보간 없음. ADSS 복구 POI는 quarter-type에 따라 절반만 채색.
@@ -73,6 +204,14 @@ class FieldRenderer:
 
         valid = result.valid_mask
         valid_values = values[valid]
+        adss = getattr(result, 'adss_result', None)
+        if adss_values is None and adss is not None and adss.n_sub > 0:
+            adss_values = self._get_adss_sub_values(result, values, adss)
+        if adss_values is not None and len(adss_values) > 0:
+            valid_values = np.concatenate([
+                valid_values,
+                np.asarray(adss_values, dtype=np.float64)
+            ])
         if len(valid_values) == 0:
             return img
 
@@ -95,46 +234,45 @@ class FieldRenderer:
                     vmin, vmax = vmin - 1e-6, vmax + 1e-6
 
         # === spacing 추정 ===
-        px_valid = result.points_x[valid]
-        unique_x = np.unique(px_valid)
-        spacing = int(round(np.median(np.diff(unique_x)))) if len(unique_x) > 1 else 20
-        half_sp = spacing // 2
+        half_sp = self._estimate_spacing(result) // 2
 
         # === ADSS quarter-type 배열 ===
-        has_qt = (hasattr(result, 'adss_quarter_type')
-                  and result.adss_quarter_type is not None)
+        adss_parent_set = set()
+        if adss is not None and adss.n_sub > 0:
+            adss_parent_set = set(adss.unique_parents.tolist())
 
         # === 배경 이미지 ===
-        if len(img.shape) == 3:
-            gray_bg = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            gray_bg = img.copy()
-        overlay = (gray_bg.astype(np.float32) * 0.3)
-        overlay = cv2.cvtColor(overlay.astype(np.uint8), cv2.COLOR_GRAY2BGR).astype(np.float32)
+        dim_bg = self._make_dim_background(img)
+        overlay = dim_bg.astype(np.float32)
 
         img_h, img_w = img.shape[:2]
         cmap = plt.get_cmap('turbo')
         alpha = 0.9
 
+        def blend_mask(mask: np.ndarray, color_bgr: np.ndarray):
+            if np.any(mask):
+                overlay[mask] = overlay[mask] * (1 - alpha) + color_bgr * alpha
+
+        def color_for_value(val: float) -> np.ndarray:
+            norm_val = np.clip((val - vmin) / (vmax - vmin + 1e-15), 0, 1)
+            r, g, b, _ = cmap(norm_val)
+            return np.array([b * 255, g * 255, r * 255], dtype=np.float32)
+
         # === 각 POI 서브셋 영역 채색 ===
         for idx in range(result.n_points):
-            if not valid[idx]:
+            if not valid[idx] or idx in adss_parent_set:
                 continue
 
             cx = int(result.points_x[idx])
             cy = int(result.points_y[idx])
-            val = values[idx]
-
-            norm_val = np.clip((val - vmin) / (vmax - vmin + 1e-15), 0, 1)
-            r, g, b, _ = cmap(norm_val)
-            color_bgr = np.array([b * 255, g * 255, r * 255], dtype=np.float32)
+            color_bgr = color_for_value(float(values[idx]))
 
             # quarter-type에 따른 영역 결정
-            qt = 0
-            if has_qt:
-                qt = int(result.adss_quarter_type[idx])
-
-            if qt == 0:
+            x1 = max(0, cx - half_sp)
+            x2 = min(img_w, cx + half_sp + 1)
+            y1 = max(0, cy - half_sp)
+            y2 = min(img_h, cy + half_sp + 1)
+            if True:
                 # 일반 POI: 전체 spacing × spacing
                 x1 = max(0, cx - half_sp)
                 x2 = min(img_w, cx + half_sp + 1)
@@ -192,6 +330,25 @@ class FieldRenderer:
             overlay[y1:y2, x1:x2] = (
                 overlay[y1:y2, x1:x2] * (1 - alpha) + color_bgr * alpha
             )
+
+        if adss is not None and adss.n_sub > 0 and adss_values is not None:
+            for parent_idx in adss.unique_parents.tolist():
+                cx = int(result.points_x[parent_idx])
+                cy = int(result.points_y[parent_idx])
+                x1 = max(0, cx - half_sp)
+                x2 = min(img_w, cx + half_sp + 1)
+                y1 = max(0, cy - half_sp)
+                y2 = min(img_h, cy + half_sp + 1)
+                if x2 > x1 and y2 > y1:
+                    overlay[y1:y2, x1:x2] = dim_bg[y1:y2, x1:x2]
+
+            for s in range(adss.n_sub):
+                cx = int(adss.points_x[s])
+                cy = int(adss.points_y[s])
+                color_bgr = color_for_value(float(adss_values[s]))
+                poly_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                self._fill_adss_quarter(poly_mask, cx, cy, int(adss.quarter_types[s]), half_sp)
+                blend_mask(poly_mask > 0, color_bgr)
 
         result_img = np.clip(overlay, 0, 255).astype(np.uint8)
         self.view.update_colorbar(vmin, vmax, label, 'turbo')
@@ -365,11 +522,8 @@ class FieldRenderer:
         for i, y in enumerate(all_unique_y):
             y_to_idx[int(y)] = i
 
-        # ADSS로 복원된 부모 POI 인덱스 집합
+        # ADSS로 복원된 sub-POI 정보
         adss = getattr(result, 'adss_result', None)
-        adss_parent_set = set()
-        if adss is not None and adss.n_sub > 0:
-            adss_parent_set = set(adss.unique_parents.tolist())
 
         # === 정상 POI: 4개 서브셀 모두 같은 값 ===
         valid = result.valid_mask
@@ -417,11 +571,8 @@ class FieldRenderer:
                     qt = int(adss.quarter_types[s])
                     
                     # 삼각형 또는 사각형에 따라 서브셀 결정
-                    if qt in qt_to_double:
-                        cells = qt_to_double[qt]
-                    elif qt in qt_to_single:
-                        cells = qt_to_single[qt]
-                    else:
+                    cells = self._get_adss_sub_cells(qt)
+                    if not cells:
                         continue
 
                     for dy, dx in cells:
@@ -457,6 +608,8 @@ class FieldRenderer:
         if result.n_points == 0:
             return img
 
+        mode = {'u': 'u_field', 'v': 'v_field'}.get(field_type, 'magnitude')
+
         if field_type == 'u':
             values, label = result.disp_u, "U (px)"
         elif field_type == 'v':
@@ -465,11 +618,14 @@ class FieldRenderer:
             values = np.sqrt(result.disp_u**2 + result.disp_v**2)
             label = "|D| (px)"
 
+        symmetric = field_type in ('u', 'v')
+        if self._resolve_display_source(mode) == 'raw':
+            return self._render_field_subset(img, result, values, label, symmetric)
+
         grid, ux, uy = self._to_grid(result, values)
         if grid.size == 0 or len(ux) < 3 or len(uy) < 3:
             return img
 
-        symmetric = field_type in ('u', 'v')
         return self._render_field_matplotlib(img, grid, ux, uy, label, symmetric)
 
     def _get_strain_cache_key(self, result):
@@ -517,6 +673,9 @@ class FieldRenderer:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return img
 
+        if self._resolve_display_source(strain_type) == 'raw':
+            return self._draw_strain_field_points(img, result, strain_type)
+
         valid = result.valid_mask
         px_valid = result.points_x[valid]
         unique_x = np.unique(px_valid)
@@ -563,8 +722,9 @@ class FieldRenderer:
             unique_y_2x[2 * i]     = all_unique_y[i] - half
             unique_y_2x[2 * i + 1] = all_unique_y[i] + half
 
-        return self._render_field_matplotlib(img, strain_2d, unique_x_2x, unique_y_2x,
-                                              label, symmetric)
+        return self._render_field_matplotlib(
+            img, strain_2d, unique_x_2x, unique_y_2x, label, symmetric
+        )
 
 
     def _draw_strain_field_points(self, img, result, strain_type):
@@ -648,41 +808,37 @@ class FieldRenderer:
             return img
 
         mag = np.sqrt(result.disp_u**2 + result.disp_v**2)
-        grid, ux, uy = self._to_grid(result, mag)
-
-        # ADSS magnitude는 _to_grid에서 자동 처리 안 됨 (파생값)
         adss = getattr(result, 'adss_result', None)
+        sub_mag = None
         if adss is not None and adss.n_sub > 0:
             sub_u = adss.parameters[:, 0]
             n_params = adss.parameters.shape[1]
             sub_v = adss.parameters[:, 3] if n_params <= 6 else adss.parameters[:, 6]
             sub_mag = np.sqrt(sub_u**2 + sub_v**2)
 
+        if self._resolve_display_source('magnitude') == 'raw':
+            return self._render_field_subset(
+                img, result, mag, "|D| (px)", False, adss_values=sub_mag
+            )
+
+        grid, ux, uy = self._to_grid(result, mag)
+
+        # ADSS magnitude는 _to_grid에서 자동 처리 안 됨 (파생값)
+        if adss is not None and adss.n_sub > 0:
             all_unique_x = np.unique(result.points_x)
             all_unique_y = np.unique(result.points_y)
             x_to_idx = {int(x): i for i, x in enumerate(all_unique_x)}
             y_to_idx = {int(y): i for i, y in enumerate(all_unique_y)}
             
-            qt_to_single = {5: [(0, 0)], 6: [(0, 1)], 7: [(1, 0)], 8: [(1, 1)]}
-            qt_to_double = {
-                1: [(0, 0), (0, 1)],
-                2: [(1, 0), (1, 1)],
-                3: [(0, 0), (1, 0)],
-                4: [(0, 1), (1, 1)],
-            }
-
             for s in range(adss.n_sub):
                 ix = x_to_idx.get(int(adss.points_x[s]))
                 iy = y_to_idx.get(int(adss.points_y[s]))
                 if ix is None or iy is None:
                     continue
                 qt = int(adss.quarter_types[s])
-                
-                if qt in qt_to_double:
-                    cells = qt_to_double[qt]
-                elif qt in qt_to_single:
-                    cells = qt_to_single[qt]
-                else:
+
+                cells = self._get_adss_sub_cells(qt)
+                if not cells:
                     continue
 
                 for dy, dx in cells:
@@ -795,10 +951,7 @@ class FieldRenderer:
             if x < 0 or x >= img_w or y < 0 or y >= img_h:
                 continue
 
-            if result.valid_mask[idx]:
-                cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
-
-            elif idx in adss_parent_set:
+            if idx in adss_parent_set:
                 quarters = adss_parent_quarters.get(idx, [])
                 for qt in quarters:
                     if 5 <= qt <= 8:
@@ -848,6 +1001,9 @@ class FieldRenderer:
 
                 # 중심 마커
                 cv2.circle(img, (x, y), 3, (255, 100, 0), -1)
+
+            elif result.valid_mask[idx]:
+                cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
 
             else:
                 if has_fft_mask and not result.fft_valid_mask[idx]:
