@@ -307,6 +307,7 @@ class DICTab(ttk.Frame):
         display_frame.pack(fill=tk.X, padx=5, pady=5)
         
         self.display_mode_var = tk.StringVar(value="invalid")
+        self.display_source_var = tk.StringVar(value="auto")
         
         # 변위 섹션
         ttk.Label(display_frame, text="변위:", font=("", 8, "bold")).pack(anchor=tk.W)
@@ -351,6 +352,15 @@ class DICTab(ttk.Frame):
         colorbar_frame.pack(fill=tk.X, padx=5, pady=5)
         
         # 컬러바 캔버스
+        ttk.Label(display_frame, text="소스:", font=("", 8, "bold")).pack(anchor=tk.W, pady=(5, 0))
+        source_frame = ttk.Frame(display_frame)
+        source_frame.pack(fill=tk.X)
+
+        for text, value in [("자동", "auto"), ("원시", "raw"), ("후처리", "processed")]:
+            ttk.Radiobutton(source_frame, text=text, value=value,
+                        variable=self.display_source_var,
+                        command=self._update_display).pack(side=tk.LEFT)
+
         self.colorbar_canvas = tk.Canvas(colorbar_frame, width=200, height=25, bg='gray20', highlightthickness=0)
         self.colorbar_canvas.pack(fill=tk.X, pady=(0, 5))
         
@@ -570,6 +580,7 @@ class DICTab(ttk.Frame):
             'enable_variable_subset': self.variable_subset_var.get(),
             'enable_adss_subset': self.adss_subset_var.get(),
             'max_recovery_passes': self.recovery_passes_var.get(),
+            'display_source': self.display_source_var.get(),
         }
 
     def set_parameters(self, params: Dict[str, Any]):
@@ -599,6 +610,8 @@ class DICTab(ttk.Frame):
                 self.adss_subset_var.set(params['enable_adss_subset'])
             if 'max_recovery_passes' in params:
                 self.recovery_passes_var.set(params['max_recovery_passes'])
+            if params.get('display_source') is not None:
+                self.display_source_var.set(params['display_source'])
             if params.get('gaussian_blur_enabled'):
                 self.gaussian_blur_var.set(True)
                 self._toggle_gaussian_blur()
