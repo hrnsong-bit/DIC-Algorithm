@@ -188,6 +188,18 @@ class FieldRenderer:
         tri_mask = cls._triangle_mask(x0, x1, y0, y1, vertices)
         mask[y0:y1, x0:x1][tri_mask] = 255
 
+    @staticmethod
+    def _outline_mask(mask: np.ndarray) -> np.ndarray:
+        """Return a 1px outline for a filled binary mask."""
+        if mask.size == 0:
+            return mask
+
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        inner = cv2.erode(mask, kernel, iterations=1)
+        outline = mask.copy()
+        outline[inner > 0] = 0
+        return outline
+
     def _apply_adss_display_mask(self, base_img: np.ndarray,
                                  rendered_img: np.ndarray, result) -> np.ndarray:
         """Clip ADSS parent cells so only recovered quarter polygons remain visible."""
@@ -369,6 +381,8 @@ class FieldRenderer:
             )
 
         if adss is not None and adss.n_sub > 0 and adss_values is not None:
+            recovery_passes = adss.get_recovery_passes()
+            pass2_outline_color = np.array([255, 0, 0], dtype=np.float32)
             for parent_idx in adss.unique_parents.tolist():
                 cx = int(result.points_x[parent_idx])
                 cy = int(result.points_y[parent_idx])
@@ -387,6 +401,9 @@ class FieldRenderer:
                 poly_mask = np.zeros((img_h, img_w), dtype=np.uint8)
                 self._fill_adss_quarter(poly_mask, cx, cy, int(adss.quarter_types[s]), spacing)
                 blend_mask(poly_mask > 0, color_bgr)
+                if int(recovery_passes[s]) == 2:
+                    outline_mask = self._outline_mask(poly_mask) > 0
+                    overlay[outline_mask] = pass2_outline_color
 
         result_img = np.clip(overlay, 0, 255).astype(np.uint8)
         self.view.update_colorbar(vmin, vmax, label, 'turbo')
@@ -954,13 +971,14 @@ class FieldRenderer:
         adss_parent_set = set()
         adss_parent_quarters = {}
         if adss is not None and adss.n_sub > 0:
+            recovery_passes = adss.get_recovery_passes()
             adss_parent_set = set(adss.unique_parents.tolist())
             for s in range(adss.n_sub):
                 pi = int(adss.parent_indices[s])
                 qt = int(adss.quarter_types[s])
                 if pi not in adss_parent_quarters:
                     adss_parent_quarters[pi] = []
-                adss_parent_quarters[pi].append(qt)
+                adss_parent_quarters[pi].append((qt, int(recovery_passes[s])))
 
         # spacing & subset 크기
         valid = result.valid_mask
@@ -978,6 +996,7 @@ class FieldRenderer:
         # 삼각형 quarter 색상 (BGR)
         tri_color  = (255, 180, 0)   # 파란 계열 (사각형과 동일)
         rect_color = (255, 180, 0)
+        pass2_outline_color = (255, 0, 0)
 
         img_h, img_w = img.shape[:2]
 
@@ -989,12 +1008,15 @@ class FieldRenderer:
 
             if idx in adss_parent_set:
                 quarters = adss_parent_quarters.get(idx, [])
-                for qt in quarters:
+                for qt, recovery_pass in quarters:
                     poly_mask = np.zeros((img_h, img_w), dtype=np.uint8)
                     self._fill_adss_quarter(poly_mask, x, y, qt, spacing)
                     mask = poly_mask > 0
                     if np.any(mask):
                         img[mask] = rect_color if 5 <= qt <= 8 else tri_color
+                        if recovery_pass == 2:
+                            outline_mask = self._outline_mask(poly_mask) > 0
+                            img[outline_mask] = pass2_outline_color
                     continue
 
                     if 5 <= qt <= 8:

@@ -93,6 +93,19 @@ class DICController:
         self.view.canvas_view.on_pan = self._handle_pan
         self.view.canvas_view.on_roi_draw = self._handle_roi_draw
 
+    @staticmethod
+    def get_default_deformed_index(file_count: int, reference_index: int) -> Optional[int]:
+        """Choose the default deformed index for a synced quality sequence."""
+        if file_count <= 1:
+            return None
+
+        ref_index = max(0, min(reference_index, file_count - 1))
+        if ref_index + 1 < file_count:
+            return ref_index + 1
+        if ref_index - 1 >= 0:
+            return ref_index - 1
+        return None
+
     def _handle_zoom(self, factor: float):
         new_zoom = max(0.1, min(5.0, self.state.zoom_level * factor))
         self.state.zoom_level = new_zoom
@@ -228,22 +241,48 @@ class DICController:
             self.state.sequence_files = self.app_state.file_paths
             self.state.sequence_folder = self.app_state.folder_path
 
-            if self.app_state.file_list:
-                ref_name = self.app_state.file_list[0]
-                ref_img = self.app_state.get_image(ref_name)
-                if ref_img is not None:
-                    self.state.ref_image = ref_img
-                    self.state.ref_path = self.app_state.file_paths[0] if self.app_state.file_paths else None
-                    self.view.update_reference_label(ref_name)
+            ref_name = self.app_state.get_reference_name()
+            ref_path = self.app_state.get_reference_path()
+            ref_img = self.app_state.get_reference_image()
+            if ref_img is None and ref_path is not None:
+                ref_img = load_image(ref_path)
 
-            if len(self.app_state.file_list) > 1:
-                def_name = self.app_state.file_list[1]
+            if ref_name is not None and ref_img is not None:
+                self.state.ref_image = ref_img
+                self.state.ref_path = ref_path
+                self.view.update_reference_label(ref_name)
+            else:
+                self.state.ref_image = None
+                self.state.ref_path = None
+                self.view.reset_reference_label()
+
+            default_def_index = self.get_default_deformed_index(
+                len(self.app_state.file_list),
+                self.app_state.reference_index,
+            )
+
+            if default_def_index is not None:
+                def_name = self.app_state.file_list[default_def_index]
+                def_path = self.app_state.file_paths[default_def_index]
                 def_img = self.app_state.get_image(def_name)
+                if def_img is None and def_path is not None:
+                    def_img = load_image(def_path)
+
                 if def_img is not None:
                     self.state.def_image = def_img
-                    self.state.def_path = self.app_state.file_paths[1] if len(self.app_state.file_paths) > 1 else None
-                    self.state.current_index = 1
+                    self.state.def_path = def_path
+                    self.state.current_index = default_def_index
                     self.view.update_deformed_label(def_name)
+                else:
+                    self.state.def_image = None
+                    self.state.def_path = None
+                    self.state.current_index = self.app_state.reference_index
+                    self.view.reset_deformed_label()
+            else:
+                self.state.def_image = None
+                self.state.def_path = None
+                self.state.current_index = self.app_state.reference_index
+                self.view.reset_deformed_label()
 
             self.state.roi = self.app_state.roi
 

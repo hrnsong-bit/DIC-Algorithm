@@ -200,11 +200,19 @@ class SpeckleQualityAssessor:
             )
 
         # ====== Stage 2: SSSIG ======
-        sssig_result = None
+        current_sssig_result = compute_sssig_map(
+            roi_gray,
+            subset_size=self.subset_size,
+            spacing=self.poi_spacing,
+            noise_variance=noise_variance,
+            desired_accuracy=self.desired_accuracy,
+        )
+        sssig_result = current_sssig_result
+        recommended_sssig_result = current_sssig_result
         predicted_accuracy = None
 
         if self.auto_find_size:
-            optimal_size, size_found, sssig_result, info = find_optimal_subset_size(
+            optimal_size, size_found, recommended_sssig_result, info = find_optimal_subset_size(
                 roi_gray,
                 spacing=self.poi_spacing,
                 desired_accuracy=self.desired_accuracy,
@@ -214,8 +222,8 @@ class SpeckleQualityAssessor:
             )
             recommended_size = optimal_size
 
-            if sssig_result is None:
-                sssig_result = compute_sssig_map(
+            if recommended_sssig_result is None:
+                recommended_sssig_result = compute_sssig_map(
                     roi_gray,
                     subset_size=recommended_size,
                     spacing=self.poi_spacing,
@@ -223,26 +231,22 @@ class SpeckleQualityAssessor:
                     desired_accuracy=self.desired_accuracy,
                 )
         else:
-            sssig_result = compute_sssig_map(
-                roi_gray,
-                subset_size=self.subset_size,
-                spacing=self.poi_spacing,
-                noise_variance=noise_variance,
-                desired_accuracy=self.desired_accuracy,
-            )
             recommended_size = self.subset_size
-            size_found = len(sssig_result.bad_points) == 0 if sssig_result else False
+            size_found = len(current_sssig_result.bad_points) == 0 if current_sssig_result else False
 
-        predicted_accuracy = (sssig_result.predicted_accuracy
-                              if sssig_result else None)
+        predicted_accuracy = (current_sssig_result.predicted_accuracy
+                              if current_sssig_result else None)
 
-        if sssig_result and len(sssig_result.points_y) == 0:
+        if current_sssig_result and len(current_sssig_result.points_y) == 0:
             warnings.append("유효한 POI가 없음 - ROI 확인 필요")
 
-        sssig_pass = (sssig_result.n_bad_points == 0
-                      if sssig_result else False)
+        current_sssig_pass = (current_sssig_result.n_bad_points == 0
+                              if current_sssig_result else False)
+        sssig_pass = (recommended_sssig_result.n_bad_points == 0
+                      if recommended_sssig_result else False)
 
-        if not sssig_pass and sssig_result and sssig_result.n_bad_points > 0:
+        if (not current_sssig_pass and current_sssig_result
+                and current_sssig_result.n_bad_points > 0):
             warnings.append(
                 f"불량 POI {sssig_result.n_bad_points}개 "
                 f"(min: {sssig_result.min:.2e})")
