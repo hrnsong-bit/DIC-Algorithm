@@ -138,3 +138,29 @@ def test_raw_magnitude_draws_adss_subsets():
 
     assert np.any(rendered[6, 10] != np.array([0, 0, 0], dtype=np.uint8))
     np.testing.assert_array_equal(rendered[14, 10], np.array([0, 0, 0], dtype=np.uint8))
+
+
+def test_raw_scalar_field_q6_uses_right_half_without_left_shift():
+    renderer = _make_renderer()
+    adss_result = _make_adss_result([6], [111.0])
+    result = _make_result(adss_result)
+    img = np.zeros((32, 32, 3), dtype=np.uint8)
+
+    rendered = renderer._draw_scalar_field(img, result, "u")
+
+    assert np.any(rendered[7, 12] != np.array([0, 0, 0], dtype=np.uint8))
+    np.testing.assert_array_equal(rendered[7, 8], np.array([0, 0, 0], dtype=np.uint8))
+    np.testing.assert_array_equal(rendered[13, 13], np.array([0, 0, 0], dtype=np.uint8))
+
+
+def test_invalid_overlay_q6_uses_same_bounds_as_raw_field():
+    renderer = _make_renderer()
+    adss_result = _make_adss_result([6], [111.0])
+    result = _make_result(adss_result)
+    img = np.zeros((32, 32, 3), dtype=np.uint8)
+
+    rendered = renderer._draw_invalid_points(img, result)
+
+    np.testing.assert_array_equal(rendered[7, 12], np.array([255, 180, 0], dtype=np.uint8))
+    np.testing.assert_array_equal(rendered[7, 8], np.array([0, 0, 0], dtype=np.uint8))
+    np.testing.assert_array_equal(rendered[13, 13], np.array([0, 0, 0], dtype=np.uint8))

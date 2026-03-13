@@ -42,6 +42,7 @@ class AppState:
     file_list: List[str] = field(default_factory=list)
     file_paths: List[Path] = field(default_factory=list)  # 추가: 전체 경로 목록
     current_index: int = 0
+    reference_index: int = 0
     
     # 이미지 로딩 상태 (추가)
     loading_state: ImageLoadingState = field(default_factory=ImageLoadingState)
@@ -79,6 +80,37 @@ class AppState:
     def get_image_by_path(self, path: Path) -> Optional[np.ndarray]:
         """경로로 이미지 가져오기"""
         return self.get_image(path.name)
+
+    def set_reference_index(self, index: int):
+        """Reference index setter."""
+        if not self.file_list:
+            self.reference_index = 0
+            return
+
+        self.reference_index = max(0, min(index, len(self.file_list) - 1))
+
+    def get_reference_name(self) -> Optional[str]:
+        """Return the current reference filename."""
+        if not self.file_list:
+            return None
+
+        ref_index = max(0, min(self.reference_index, len(self.file_list) - 1))
+        return self.file_list[ref_index]
+
+    def get_reference_path(self) -> Optional[Path]:
+        """Return the current reference path."""
+        if not self.file_paths:
+            return None
+
+        ref_index = max(0, min(self.reference_index, len(self.file_paths) - 1))
+        return self.file_paths[ref_index]
+
+    def get_reference_image(self) -> Optional[np.ndarray]:
+        """Return the current reference image."""
+        ref_name = self.get_reference_name()
+        if ref_name is None:
+            return None
+        return self.get_image(ref_name)
     
     def set_image(self, filename: str, image: np.ndarray):
         """이미지 캐시에 저장 (스레드 안전)"""
@@ -173,6 +205,7 @@ class AppState:
         self.file_list.clear()
         self.file_paths.clear()
         self.current_index = 0
+        self.reference_index = 0
         self.clear_all_reports()
         self.roi = None
         self.reset_view()

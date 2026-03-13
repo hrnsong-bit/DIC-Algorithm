@@ -625,9 +625,15 @@ class DICTab(ttk.Frame):
     
     def update_reference_label(self, text: str):
         self.ref_label.configure(text=text[:20], foreground="black")
+
+    def reset_reference_label(self):
+        self.ref_label.configure(text="Not selected", foreground="gray")
     
     def update_deformed_label(self, text: str):
         self.def_label.configure(text=text[:20], foreground="black")
+
+    def reset_deformed_label(self):
+        self.def_label.configure(text="Not selected", foreground="gray")
     
     def update_sequence_label(self, text: str):
         self.seq_label.configure(text=text[:20], foreground="black")

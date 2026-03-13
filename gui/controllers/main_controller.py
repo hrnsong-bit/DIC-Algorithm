@@ -195,6 +195,7 @@ class MainController:
                 self.state.file_list = [self.state.current_file]
                 self.state.file_paths = [Path(path)]
                 self.state.current_index = 0
+                self.state.set_reference_index(0)
 
                 if self.canvas_view:
                     zoom = self.canvas_view.fit_to_canvas(image.shape[:2])
@@ -225,6 +226,7 @@ class MainController:
 
         self.state.file_paths = file_paths
         self.state.file_list = [p.name for p in file_paths]
+        self.state.set_reference_index(0)
         self.state.loading_state.total_files = len(file_paths)
         self.state.loading_state.is_loading = True
 
@@ -430,6 +432,14 @@ class MainController:
     def navigate_to(self, index: int):
         if self.state.navigate_to(index):
             self._notify_state_changed()
+
+    def set_current_as_reference(self):
+        if self.state.current_image is None or not self.state.current_file:
+            return
+
+        self.state.set_reference_index(self.state.current_index)
+        logger.info(f"Reference image set from quality tab: {self.state.current_file}")
+        self._notify_state_changed()
 
     def reset_roi(self):
         self.state.reset_roi()

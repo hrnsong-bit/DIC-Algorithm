@@ -1,14 +1,19 @@
 """
-ADSS-DIC v3 (Adaptive Subset-Subdivision) 래퍼 모듈
+ADSS-DIC v3.1 (Adaptive Subset-Subdivision) 래퍼 모듈
+
+v3.0 대비 변경:
+    - 2-pass rescue 지원: result_fail_info shape (n_cand, 8, 3) → (n_cand, 8, 4).
+    - 로그에 pass 번호(P1/P2) 반영.
 
 삼각형(Q1~Q4) + 사각형(Q5~Q8) 적응 선택 방식:
     - 각 불량 POI에서 8개 quarter의 1-warp ZNCC를 평가
     - 삼각형 세트 vs 사각형 세트 중 유효 quarter 수가 많은 쪽 선택
-    - 선택된 세트에서 threshold를 넘는 quarter에 IC-GN 수행
+    - 선택된 세트에서 threshold를 넘는 quarter에 IC-GN 수행 (pass 1)
+    - 외부 seed 부재로 미평가된 quarter를 내부 seed로 재평가 (pass 2)
     - 결과를 ADSSResult로 반환 (sub-POI 복수 저장)
     - 대표값(최대 ZNCC)을 ICGNResult에 반영하여 기존 파이프라인 호환
 
-파이프라인: FFT-CC → IC-GN → ADSS v3 재계산 → PLS 변형률
+파이프라인: FFT-CC → IC-GN → ADSS v3.1 재계산 → PLS 변형률
 
 References:
     Zhao, J. & Pan, B. "Adaptive subset-subdivision for automatic
@@ -118,7 +123,7 @@ def compute_adss_recalc(
     zncc_threshold=0.9,
 ):
     """
-    ADSS-DIC v2 재계산 — 사분면 복수 채택 + fail_info 디버깅 로그.
+    ADSS-DIC v3.1 재계산 — 사분면 복수 채택 + 2-pass rescue + fail_info 디버깅 로그.
     """
     t_start = time.time()
     n_poi = len(points_x)
@@ -158,15 +163,15 @@ def compute_adss_recalc(
     n_bad = len(bad_indices)
 
     if n_bad == 0:
-        logger.info("ADSS-DIC v2: 불량 POI 없음 — 스킵 (%.3fs)", time.time() - t_start)
+        logger.info("ADSS-DIC v3.1: 불량 POI 없음 — 스킵 (%.3fs)", time.time() - t_start)
         return _empty_adss(0, time.time() - t_start)
 
-    logger.info("ADSS-DIC v2: %d개 불량 POI 감지, 사분면 복수 채택 시작...", n_bad)
+    logger.info("ADSS-DIC v3.1: %d개 불량 POI 감지, 2-pass 사분면 복수 채택 시작...", n_bad)
 
     # === 2. 격자 구조 감지 ===
     grid_info = _detect_grid_structure(points_x, points_y)
     if grid_info is None:
-        logger.warning("ADSS-DIC v2: 격자 구조 감지 실패 — 스킵")
+        logger.warning("ADSS-DIC v3.1: 격자 구조 감지 실패 — 스킵")
         return _empty_adss(n_bad, time.time() - t_start)
 
     ny, nx, spacing = grid_info
@@ -182,19 +187,22 @@ def compute_adss_recalc(
     has_candidate = np.any(all_nv.reshape(n_bad, -1), axis=1)
     n_candidates = int(np.sum(has_candidate))
 
-    if n_candidates == 0:
-        logger.info("ADSS-DIC v2: 시도 가능한 후보 없음")
-        return _empty_adss(n_bad, time.time() - t_start)
-
-    candidate_mask = has_candidate
-    cand_indices = bad_indices[candidate_mask]
-    cand_nv = all_nv[candidate_mask]
-    cand_np_ = all_np[candidate_mask]
-    cand_nx_ = all_nx[candidate_mask]
-    cand_ny_ = all_ny[candidate_mask]
+    # 2-pass에서는 외부 이웃이 전혀 없는 POI도 내부 seed로 복원 가능하므로
+    # 모든 불량 POI를 candidate로 포함시킨다.
+    # (기존: has_candidate가 False인 POI는 제외했음)
+    # 단, 최소한 해당 POI의 8개 quarter 중 어느 것도 외부 이웃이 없는 경우에도
+    # prange 루프에는 포함시키되, process_poi_adss_multi 내부에서
+    # Phase 2 세트 선택 시 count_tri == 0 && count_rect == 0 이면 즉시 return 0.
+    # 따라서 전부 포함해도 안전하다.
+    cand_indices = bad_indices
+    cand_nv = all_nv
+    cand_np_ = all_np
+    cand_nx_ = all_nx
+    cand_ny_ = all_ny
     n_cand = len(cand_indices)
 
-    logger.info("  시도 가능 후보: %d / %d", n_cand, n_bad)
+    logger.info("  시도 후보: %d (외부이웃有: %d, 외부이웃無: %d)",
+                n_cand, n_candidates, n_cand - n_candidates)
 
     # === 4. 버퍼 할당 ===
     n_pixels_max = (M + 1) * (M + 1)
@@ -208,7 +216,7 @@ def compute_adss_recalc(
     result_parent = np.full(max_sub, -1, dtype=np.int64)
     result_count = np.zeros(n_cand, dtype=np.int32)
     result_candidate_zncc = np.full((n_cand, 8), -1.0, dtype=np.float64)
-    result_fail_info = np.full((n_cand, 8, 3), -1.0, dtype=np.float64)
+    result_fail_info = np.full((n_cand, 8, 4), -1.0, dtype=np.float64)
 
     # === 5. 배치 병렬 처리 ===
     process_bad_pois_adss_multi_parallel(
@@ -240,7 +248,7 @@ def compute_adss_recalc(
     n_sub_total = int(np.sum(valid_sub_mask))
 
     if n_sub_total == 0:
-        logger.info("ADSS-DIC v2: 복원된 sub-POI 없음")
+        logger.info("ADSS-DIC v3.1: 복원된 sub-POI 없음")
         return _empty_adss(n_bad, time.time() - t_start)
 
     sub_parent = result_parent[valid_sub_mask]
@@ -248,6 +256,15 @@ def compute_adss_recalc(
     sub_p = result_p[valid_sub_mask]
     sub_zncc = result_zncc[valid_sub_mask]
     sub_iter = result_iter[valid_sub_mask]
+    sub_slots = np.flatnonzero(valid_sub_mask)
+    sub_recovery_passes = np.ones(n_sub_total, dtype=np.int32)
+
+    for i, slot in enumerate(sub_slots):
+        cand_k = int(slot // 4)
+        qt = int(result_qt[slot])
+        if 0 <= cand_k < n_cand and 1 <= qt <= 8:
+            pass_num = int(result_fail_info[cand_k, qt - 1, 3])
+            sub_recovery_passes[i] = pass_num if pass_num > 0 else 1
 
     sub_xsi_min = np.zeros(n_sub_total, dtype=np.int32)
     sub_xsi_max = np.zeros(n_sub_total, dtype=np.int32)
@@ -287,7 +304,7 @@ def compute_adss_recalc(
 
     elapsed = time.time() - t_start
 
-    # === 9. 로그 출력 (fail_info 포함) ===
+    # === 9. 로그 출력 (fail_info + pass 번호 포함) ===
     quarter_names = {
         1: 'Q1:UT', 2: 'Q2:LT', 3: 'Q3:LF', 4: 'Q4:RT',
         5: 'Q5:UL', 6: 'Q6:UR', 7: 'Q7:LL', 8: 'Q8:LR',
@@ -298,6 +315,9 @@ def compute_adss_recalc(
         6: 'MAX_DISP', 7: 'FLAT_TARGET', 99: 'REF_EXTRACT_FAIL'
     }
     qn = ['Q1:UT', 'Q2:LT', 'Q3:LF', 'Q4:RT', 'Q5:UL', 'Q6:UR', 'Q7:LL', 'Q8:LR']
+
+    n_pass2_tried = 0
+    n_pass2_ok = 0
 
     for k in range(n_cand):
         fidx = cand_indices[k]
@@ -312,20 +332,31 @@ def compute_adss_recalc(
 
         detail_strs = []
         for i in range(8):
-            if cz[i] < 0:
+            pass_num = int(fi[i, 3])
+            pass_tag = f"P{pass_num}" if pass_num > 0 else ""
+
+            if cz[i] < 0 and pass_num < 2:
                 detail_strs.append(f"{qn[i]}:N/A")
             else:
                 fc = int(fi[i, 2])
                 fc_name = fail_code_names.get(fc, f'CODE_{fc}')
                 final_z = fi[i, 0]
                 n_it = int(fi[i, 1])
+
+                if pass_num == 2:
+                    n_pass2_tried += 1
+
                 if fc == 0:
+                    if pass_num == 2:
+                        n_pass2_ok += 1
+                    seed_tag = "ext" if pass_num == 1 else "int"
                     detail_strs.append(
-                        f"{qn[i]}:1w={cz[i]:.4f}→OK(z={final_z:.4f},{n_it}it)"
+                        f"{qn[i]}:{pass_tag}1w={cz[i]:.4f}→OK({seed_tag},z={final_z:.4f},{n_it}it)"
                     )
                 else:
+                    seed_tag = "ext" if pass_num == 1 else "int"
                     detail_strs.append(
-                        f"{qn[i]}:1w={cz[i]:.4f}→FAIL({fc_name},z={final_z:.4f},{n_it}it)"
+                        f"{qn[i]}:{pass_tag}1w={cz[i]:.4f}→FAIL({seed_tag},{fc_name},z={final_z:.4f},{n_it}it)"
                     )
 
         logger.info(
@@ -336,9 +367,10 @@ def compute_adss_recalc(
         )
 
     logger.info(
-        "ADSS-DIC v2 완료: %d개 불량 → %d개 부모 복원 (%d sub-POI), "
-        "%d개 복원불가 (%.3fs)",
-        n_bad, n_parent_recovered, n_sub_total, n_unrecoverable, elapsed
+        "ADSS-DIC v3.1 완료: %d개 불량 → %d개 부모 복원 (%d sub-POI), "
+        "%d개 복원불가, pass2 시도=%d 성공=%d (%.3fs)",
+        n_bad, n_parent_recovered, n_sub_total, n_unrecoverable,
+        n_pass2_tried, n_pass2_ok, elapsed
     )
 
     return ADSSResult(
@@ -349,6 +381,7 @@ def compute_adss_recalc(
         parameters=sub_p,
         zncc_values=sub_zncc,
         iterations=sub_iter,
+        recovery_passes=sub_recovery_passes,
         xsi_mins=sub_xsi_min,
         xsi_maxs=sub_xsi_max,
         eta_mins=sub_eta_min,

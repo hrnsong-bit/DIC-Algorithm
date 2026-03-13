@@ -245,6 +245,7 @@ class SpeckleQualityGUI:
         left_panel.pack_propagate(False)
 
         self._create_file_buttons(left_panel)
+        self._create_reference_panel(left_panel)
         self.param_panel = ParamPanel(left_panel)
         self._create_roi_panel(left_panel)
         self._create_eval_buttons(left_panel)
@@ -274,6 +275,23 @@ class SpeckleQualityGUI:
         ttk.Button(btn_row, text="폴더 열기",
                    command=lambda: self.controller.open_folder()
                    ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+
+    def _create_reference_panel(self, parent):
+        """Quality tab reference selector."""
+        frame = ttk.LabelFrame(parent, text="Reference")
+        frame.pack(fill=tk.X, pady=5)
+
+        self.reference_label = ttk.Label(
+            frame, text="Reference: None", foreground='gray')
+        self.reference_label.pack(fill=tk.X, padx=5, pady=(4, 2))
+
+        self.reference_btn = ttk.Button(
+            frame,
+            text="Set Current as Reference",
+            command=lambda: self.controller.set_current_as_reference(),
+            state='disabled'
+        )
+        self.reference_btn.pack(fill=tk.X, padx=5, pady=(2, 4))
 
     def _create_roi_panel(self, parent):
         """ROI 패널"""
@@ -505,6 +523,7 @@ class SpeckleQualityGUI:
         """모든 UI 업데이트"""
         self._update_file_list()
         self._update_nav_label()
+        self._update_reference_panel_state()
         self._update_roi_label()
         self._update_zoom_label()
         self._update_display()
@@ -585,6 +604,19 @@ class SpeckleQualityGUI:
             text=f"{self.state.current_position} / {self.state.total_images}"
         )
 
+    def _update_reference_panel_state(self):
+        """Reference label/button update."""
+        ref_name = self.state.get_reference_name()
+        if ref_name:
+            self.reference_label.config(
+                text=f"Reference: {ref_name}", foreground='black')
+        else:
+            self.reference_label.config(
+                text="Reference: None", foreground='gray')
+
+        btn_state = 'normal' if self.state.current_image is not None else 'disabled'
+        self.reference_btn.config(state=btn_state)
+
     def _update_roi_label(self):
         """ROI 레이블 업데이트"""
         if self.state.roi:
@@ -621,7 +653,7 @@ class SpeckleQualityGUI:
         if report.sssig_result:
             sr = report.sssig_result
             sssig_status = "✓" if report.sssig_pass else "✗"
-            text += f"[SSSIG] size={sr.subset_size}, spacing={sr.spacing}\n"
+            text += f"[SSSIG - Current] size={sr.subset_size}, spacing={sr.spacing}\n"
             text += f"  POI 수: {len(sr.points_y)}개\n"
             text += f"  Mean: {sr.mean:.2e}\n"
             text += f"  Min:  {sr.min:.2e}\n"
@@ -635,7 +667,7 @@ class SpeckleQualityGUI:
             text += "  ⚠ Subset 크기 증가 필요!\n"
 
         # 예상 정확도
-        if report.predicted_accuracy:
+        if report.sssig_result and report.sssig_result.predicted_accuracy:
             text += f"[예상 정확도] {report.predicted_accuracy:.4f} px\n"
 
         # 결과

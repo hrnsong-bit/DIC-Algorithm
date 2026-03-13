@@ -290,7 +290,7 @@ class ResultExporter:
             )
             lines.append(
                 f"{grade_symbol} {fname}: MIG={report.mig:.2f}, "
-                f"Subset={report.recommended_subset_size}px, "
+                f"Subset={report.current_subset_size}px, "
                 f"{report.quality_grade}"
             )
         
@@ -356,7 +356,7 @@ class ResultExporter:
         # 정보 텍스트 추가
         info_text = [
             f"MIG: {report.mig:.2f} ({'PASS' if report.mig_pass else 'FAIL'})",
-            f"Subset: {report.recommended_subset_size}px",
+            f"Subset: {report.current_subset_size}px",
             f"Grade: {report.quality_grade}"
         ]
         
